@@ -732,7 +732,7 @@ function LedgerTable({ rows, sort, onSort, onExport }) {
 
 /* ---------------- app ---------------- */
 
-export default function ProjectLedger() {
+export default function ProjectLedger({ user, onSignOut }) {
   const [store, setStore] = useState(() => snapshotState());
   const [sourceLabel, setSourceLabel] = useState(SNAPSHOT_LABEL);
   const [imported, setImported] = useState(false);
@@ -862,6 +862,17 @@ export default function ProjectLedger() {
           <div className="text-right text-[11px] leading-relaxed" style={{ fontFamily: MONO, color: T.inkSoft }}>
             {records.length} projects loaded<br />
             master from QMB Projects + QM Licenses
+            {user && (
+              <div className="mt-1.5 flex items-center justify-end gap-2">
+                <span style={{ color: T.inkFaint }}>{user.email}</span>
+                <button onClick={onSignOut} className="px-2 py-0.5"
+                        style={{ fontFamily: DISPLAY, fontWeight: 600, fontSize: 10, letterSpacing: ".1em",
+                                 textTransform: "uppercase", color: T.ink, background: T.paper2,
+                                 border: `1px solid ${T.rule}`, cursor: "pointer" }}>
+                  Sign out
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
