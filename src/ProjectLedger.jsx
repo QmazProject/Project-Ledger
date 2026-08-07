@@ -1092,13 +1092,14 @@ function TargetAnalysis({ rows }) {
   /* action items first; targets already met on time are listed underneath as a
      record of what has landed, and never carry a priority weight */
   const actionItems = tracked.filter((t) => t.rank <= 2).slice(0, 10);
+  const onTrack = tracked.filter((t) => t.bucket === "On track").slice(0, 8);
   const achieved = tracked.filter((t) => t.bucket === "Delivered on time")
     .sort((a, b) => (b.bal || 0) - (a.bal || 0)).slice(0, 8);
-  const priority = [...actionItems, ...achieved];
+  const priority = [...actionItems, ...onTrack, ...achieved];
   /* normalise the bar inside each bucket — otherwise one huge overdue project
      flattens every critical bar to a sliver */
   const bucketMax = {};
-  actionItems.forEach((p) => { bucketMax[p.bucket] = Math.max(bucketMax[p.bucket] || 1, p.score); });
+  priority.forEach((p) => { bucketMax[p.bucket] = Math.max(bucketMax[p.bucket] || 1, p.score); });
 
   return (
     <Panel title="Target tracking and priority" right={
@@ -1140,7 +1141,7 @@ function TargetAnalysis({ rows }) {
       {/* the ranked worklist */}
       <div className="mb-1.5 text-[10px] uppercase tracking-widest"
            style={{ fontFamily: DISPLAY, fontWeight: 600, color: T.inkSoft }}>
-        Work these first — targets already achieved on time are listed underneath
+        Work these first — on-track and completed projects are listed underneath
       </div>
       <div className="overflow-x-auto">
         <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 11.5 }}>
@@ -1208,11 +1209,9 @@ function TargetAnalysis({ rows }) {
         </table>
       </div>
       <div className="mt-2 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint, lineHeight: 1.6 }}>
-        On track means the work is still finishable: daily rate achieved since the start date, multiplied by the days
-        left, covers the quantity outstanding. Pace shows that rate against the rate now required — under 1.00× the
-        remaining days cannot absorb the remaining target. Without a start date the rate is unknown and the deadline
-        alone decides. Overdue ranks first by the full balance still to collect; below that, priority weighs the
-        outstanding share of target against that balance, by urgency and by how far the rate falls short.
+        On track means the target completion date is more than three days away and the target has not yet been reached.
+        Critical means the deadline is within three days; overdue means the deadline has passed. A project is delivered
+        on time when Actual output reaches Target qty. Priority ranks overdue and critical projects first.
       </div>
     </Panel>
   );
