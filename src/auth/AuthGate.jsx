@@ -8,6 +8,13 @@ export default function AuthGate({ children }) {
   const [session, setSession] = useState(null);
   const [checking, setChecking] = useState(isConfigured); // nothing to check when unconfigured
 
+  const setRoute = (nextSession) => {
+    const route = nextSession ? "/project-ledger" : "/login";
+    if (window.location.pathname !== route) {
+      window.history.replaceState({}, "", route);
+    }
+  };
+
   useEffect(() => {
     if (!isConfigured) return;
 
@@ -15,7 +22,9 @@ export default function AuthGate({ children }) {
 
     supabase.auth.getSession().then(({ data }) => {
       if (!alive) return;
-      setSession(data.session ?? null);
+      const nextSession = data.session ?? null;
+      setSession(nextSession);
+      setRoute(nextSession);
       setChecking(false);
     });
 
@@ -23,6 +32,7 @@ export default function AuthGate({ children }) {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
       if (!alive) return;
       setSession(next);
+      setRoute(next);
       setChecking(false);
     });
 

@@ -1,5 +1,6 @@
-import React, { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
+import { supabase, isConfigured } from "./lib/supabase";
 
 /* ==================================================================
    Project Ledger — QM Builders
@@ -23,7 +24,7 @@ const KEY = (v) => NORM(v);
 function toNum(v) {
   if (v === null || v === undefined || v === "") return null;
   if (typeof v === "number") return isFinite(v) ? v : null;
-  const s = String(v).replace(/[()]/g, "").replace(/[^0-9.\-]/g, "");
+  const s = String(v).replace(/[()]/g, "").replace(/[^0-9.-]/g, "");
   if (!s || s === "-" || s === ".") return null;
   const n = parseFloat(s);
   if (!isFinite(n)) return null;
@@ -230,23 +231,48 @@ function snapshotState() {
    columns and leaves everything below untouched.
 ------------------------------------------------- */
 
-const MANUAL_KEY = "projectledger:manual:v1";
-const MANUAL_FIELDS = ["target", "unit", "start", "due", "actual", "note"];
-
 async function loadManual() {
-  try {
-    const res = await window.storage.get(MANUAL_KEY);
-    return res && res.value ? JSON.parse(res.value) : {};
-  } catch (e) {
-    return {};
-  }
+  if (!isConfigured || !supabase) return {};
+  const { data, error } = await supabase.from("project_manual_updates")
+    .select("project_id, target_qty, unit, start_date, target_completion, actual_output, remarks");
+  if (error) throw error;
+  return Object.fromEntries((data || []).map((row) => [row.project_id, {
+    target: row.target_qty, unit: row.unit, start: row.start_date,
+    due: row.target_completion, actual: row.actual_output, note: row.remarks,
+  }]));
 }
-async function saveManual(obj) {
-  try {
-    await window.storage.set(MANUAL_KEY, JSON.stringify(obj));
-    return true;
-  } catch (e) {
-    return false;
+async function saveManualRow(id, values, oldValues, userId, username) {
+  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
+  const { error } = await supabase.from("project_manual_updates").upsert({
+    project_id: id,
+    target_qty: values.target === "" || values.target === null ? null : toNum(values.target),
+    unit: values.unit || null,
+    start_date: values.start || null,
+    target_completion: values.due || null,
+    actual_output: values.actual === "" || values.actual === null ? null : toNum(values.actual),
+    remarks: values.note || null,
+    updated_by: userId,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "project_id" });
+  if (error) throw error;
+
+  const auditFields = [
+    ["target", "Target qty"], ["unit", "Unit"], ["start", "Start date"],
+    ["due", "Target completion"], ["actual", "Actual output"], ["note", "Remarks"],
+  ];
+  const changes = auditFields
+    .filter(([field]) => String(oldValues?.[field] ?? "") !== String(values?.[field] ?? ""))
+    .map(([field, label]) => ({
+      project_id: id,
+      column_name: label,
+      old_value: oldValues?.[field] ?? null,
+      new_value: values?.[field] ?? null,
+      changed_by: userId,
+      changed_by_username: username || "Unknown user",
+    }));
+  if (changes.length) {
+    const { error: auditError } = await supabase.from("project_manual_update_audit").insert(changes);
+    if (auditError) throw auditError;
   }
 }
 
@@ -328,6 +354,8 @@ const COLS = [
   { k: "actual", label: "Actual output", edit: "qty", w: 88 },
   { k: "note", label: "Remarks", edit: "text", w: 190 },
 ];
+
+const AUDIT_FIELD_LABELS = Object.fromEntries(COLS.filter((c) => c.edit).map((c) => [c.k, c.label]));
 
 /* the table hides the long project name; the export still carries it */
 const EXPORT_COLS = [
@@ -719,22 +747,19 @@ function StatusChart({ rows }) {
 
 /* ---------------- table ---------------- */
 
-function EditCell({ value, type, onCommit }) {
-  const [v, setV] = useState(value ?? "");
+function EditCell({ value, type, onChange }) {
   const [focus, setFocus] = useState(false);
-  useEffect(() => { if (!focus) setV(value ?? ""); }, [value, focus]);
-
-  const commit = () => { setFocus(false); if ((v ?? "") !== (value ?? "")) onCommit(v === "" ? null : v); };
+  const v = value ?? "";
 
   return (
     <input
       value={v}
       type={type === "date" ? "date" : "text"}
       inputMode={type === "qty" ? "decimal" : undefined}
-      onChange={(e) => setV(e.target.value)}
+      onChange={(e) => onChange(e.target.value)}
       onFocus={() => setFocus(true)}
-      onBlur={commit}
-      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") { setV(value ?? ""); e.target.blur(); } }}
+      onBlur={() => setFocus(false)}
+      onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
       style={{
         width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
         background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
@@ -745,9 +770,76 @@ function EditCell({ value, type, onCommit }) {
   );
 }
 
+function AuditModal({ target, onClose }) {
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    supabase.from("project_manual_update_audit")
+      .select("id, column_name, old_value, new_value, changed_by_username, changed_at")
+      .eq("project_id", target.projectId)
+      .eq("column_name", AUDIT_FIELD_LABELS[target.field])
+      .order("changed_at", { ascending: false })
+      .then(({ data, error: queryError }) => {
+        if (!alive) return;
+        if (queryError) setError(queryError.message);
+        else setLogs(data || []);
+        setLoading(false);
+      });
+    return () => { alive = false; };
+  }, [target]);
+
+  return (
+    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+         style={{ position: "fixed", inset: 0, zIndex: 20, background: "rgba(22,33,28,.35)",
+                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="audit-title"
+           style={{ width: "min(680px, 100%)", maxHeight: "80vh", overflow: "auto", background: T.panel,
+                    border: `1px solid ${T.ink}`, borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.25)" }}>
+        <div className="flex items-center justify-between gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
+          <div>
+            <h2 id="audit-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 700, textTransform: "uppercase" }}>
+              Audit trail · {AUDIT_FIELD_LABELS[target.field]}
+            </h2>
+            <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>Project ID: {target.projectId}</div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close audit trail"
+                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink, padding: "3px 8px", cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ padding: 16 }}>
+          {loading && <div style={{ color: T.inkFaint, fontSize: 12 }}>Loading audit history…</div>}
+          {error && <div style={{ color: T.bad, fontSize: 12 }}>Could not load audit history: {error}</div>}
+          {!loading && !error && !logs.length && <div style={{ color: T.inkFaint, fontSize: 12 }}>No saved changes for this cell yet.</div>}
+          {!loading && !error && logs.length > 0 && (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead><tr>
+                {[["When", "left"], ["User", "left"], ["Previous value", "left"], ["New value", "left"]].map(([label, align]) => (
+                  <th key={label} style={{ padding: "6px 7px", textAlign: align, borderBottom: `2px solid ${T.ink}`,
+                                            fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{label}</th>
+                ))}
+              </tr></thead>
+              <tbody>{logs.map((log) => (
+                <tr key={log.id}>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap", fontFamily: MONO, fontSize: 10.5 }}>
+                    {new Date(log.changed_at).toLocaleString()}
+                  </td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}` }}>{log.changed_by_username}</td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{log.old_value ?? "—"}</td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{log.new_value ?? "—"}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 
-function LedgerTable({ rows, sort, onSort, onExport, onEdit }) {
+function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell, dirtyIds, dirtyCount, savingIds }) {
   const [showCollection, setShowCollection] = useState(false);
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
@@ -785,6 +877,14 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit }) {
                          boxShadow: showCollection ? "none" : `0 0 0 2px ${T.collected}22` }}>
           {showCollection ? "▾ Hide" : "▸ Show"} collection detail ({groupCount})
         </button>
+        <button onClick={onSaveAll} disabled={!dirtyCount || savingIds.size > 0}
+                className="rounded-sm px-2.5 py-1 text-xs"
+                style={{ border: `1px solid ${dirtyCount ? T.collected : T.rule}`,
+                         background: dirtyCount ? T.collected : T.paper2,
+                         color: dirtyCount ? T.paper2 : T.inkFaint,
+                         fontFamily: DISPLAY, fontWeight: 700, cursor: dirtyCount ? "pointer" : "default" }}>
+          {savingIds.size ? "Saving…" : `Save changes${dirtyCount ? ` (${dirtyCount})` : ""}`}
+        </button>
         <button onClick={() => onExport(data)} className="rounded-sm px-2.5 py-1 text-xs"
                 style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft }}>Export filtered CSV</button>
       </div>
@@ -800,10 +900,12 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit }) {
                   <th key={c.k} onClick={() => onSort(c.k)}
                       style={{ ...th, ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w,
                                                  whiteSpace: c.stick ? "nowrap" : "normal" } : {}),
+                               color: c.edit ? "#C28A00" : T.ink,
                                ...(c.stick ? { ...stick, background: T.paper2, zIndex: 4 } : {}) }}>
-                    {c.label} <span style={{ fontFamily: MONO, color: T.inkFaint }}>{sort.key === c.k ? (sort.dir > 0 ? "▲" : "▼") : "↕"}</span>
+                    {c.label}{c.edit && <span aria-hidden="true" style={{ color: T.bad, marginLeft: 3, fontWeight: 800 }}>*</span>} <span style={{ fontFamily: MONO, color: T.inkFaint }}>{sort.key === c.k ? (sort.dir > 0 ? "▲" : "▼") : "↕"}</span>
                   </th>
                 ))}
+                <th style={{ ...th, cursor: "default", width: 68, minWidth: 68 }}>Save</th>
               </tr>
             </thead>
             <tbody>
@@ -815,8 +917,15 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit }) {
                     const wStyle = c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w, overflow: "hidden" } : {};
                     if (c.group) base.background = "#F2F6F1";
                     if (c.edit) return (
-                      <td key={c.k} style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA" }}>
-                        <EditCell value={v} type={c.edit} onCommit={(nv) => onEdit(r.id, c.k, nv)} />
+                      <td key={c.k} onContextMenu={(e) => {
+                        e.preventDefault();
+                        onAuditCell({ projectId: r.id, field: c.k, value: v });
+                      }} onClick={(e) => {
+                        if (e.target.tagName !== "INPUT") e.currentTarget.querySelector("input")?.focus();
+                      }}
+                          style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA", cursor: "text" }}>
+                        <EditCell value={v} type={c.edit} onChange={(nv) => onEdit(r.id, c.k, nv)}
+                        />
                       </td>
                     );
                     if (c.money) return <td key={c.k} style={{ ...base, ...wStyle, fontFamily: MONO, textAlign: "right", whiteSpace: "nowrap" }}>
@@ -830,6 +939,16 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit }) {
                       ...(c.stick ? { ...stick, fontFamily: MONO, fontWeight: 600, whiteSpace: "nowrap", padding: "6px 8px", fontSize: 11.5 } : {}),
                       ...(c.wide ? { maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } : {}) }}>{v}</td>;
                   })}
+                  <td style={{ padding: "3px 5px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center" }}>
+                    <button type="button" title={`Save changes for ${r.id}`} aria-label={`Save changes for ${r.id}`}
+                            onClick={() => onSaveRow(r.id)} disabled={!dirtyIds.has(r.id) || savingIds.has(r.id)}
+                            style={{ border: `1px solid ${dirtyIds.has(r.id) ? T.collected : T.rule}`,
+                                     background: dirtyIds.has(r.id) ? "#E4EFEC" : T.paper2,
+                                     color: dirtyIds.has(r.id) ? T.collected : T.inkFaint, borderRadius: 2,
+                                     padding: "2px 6px", cursor: dirtyIds.has(r.id) ? "pointer" : "default", fontSize: 13 }}>
+                      {savingIds.has(r.id) ? "…" : "▣"}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -855,6 +974,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit }) {
                     {data.filter((r) => r.target !== null && r.target !== undefined && r.target !== "").length}</td>;
                   return <td key={c.k} style={base} />;
                 })}
+                <td style={{ position: "sticky", bottom: 0, background: T.paper2, borderTop: `2px solid ${T.ink}` }} />
               </tr>
             </tfoot>
           </table>
@@ -974,8 +1094,6 @@ function TargetAnalysis({ rows }) {
   const atRisk = tracked.filter((t) => ["Overdue", "Critical", "Behind target"].includes(t.bucket));
   const notAchieved = tracked.filter((t) => !t.done);
   const atRiskMoney = sum(atRisk, "bal");
-  const delivered = counts["Delivered on time"].length + counts["Delivered late"].length;
-  const compliance = delivered ? (counts["Delivered on time"].length / delivered) * 100 : null;
   /* action items first; targets already met on time are listed underneath as a
      record of what has landed, and never carry a priority weight */
   const actionItems = tracked.filter((t) => t.rank <= 2).slice(0, 10);
@@ -1107,7 +1225,7 @@ function TargetAnalysis({ rows }) {
 
 /* ---------------- app ---------------- */
 
-export default function ProjectLedger({ onSignOut }) {
+export default function ProjectLedger({ user, onSignOut }) {
   const [store, setStore] = useState(() => snapshotState());
   const [sourceLabel, setSourceLabel] = useState(SNAPSHOT_LABEL);
   const [imported, setImported] = useState(false);
@@ -1116,31 +1234,60 @@ export default function ProjectLedger({ onSignOut }) {
 
   const [manual, setManual] = useState({});
   const [manualReady, setManualReady] = useState(false);
-  const [persist, setPersist] = useState(true);
-  const saveTimer = useRef(null);
+  const [drafts, setDrafts] = useState({});
+  const [savingIds, setSavingIds] = useState(new Set());
+  const [saveMessage, setSaveMessage] = useState("");
+  const [username, setUsername] = useState(user?.user_metadata?.username || user?.email || "Unknown user");
+  const [auditTarget, setAuditTarget] = useState(null);
 
   useEffect(() => {
     let alive = true;
-    loadManual().then((m) => { if (alive) { setManual(m); setManualReady(true); } });
+    loadManual().then((m) => {
+      if (alive) { setManual(m); setManualReady(true); }
+    }).catch((error) => {
+      if (alive) { setManualReady(true); setSaveMessage(`Could not load saved project updates: ${error.message}`); }
+    });
+    if (isConfigured && supabase && user?.id) {
+      supabase.from("profiles").select("username").eq("id", user.id).maybeSingle()
+        .then(({ data }) => { if (alive && data?.username) setUsername(data.username); });
+    }
     return () => { alive = false; };
-  }, []);
-
-  /* debounced so a burst of typing writes once */
-  useEffect(() => {
-    if (!manualReady) return;
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => { saveManual(manual).then((ok) => setPersist(ok)); }, 700);
-    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [manual, manualReady]);
+  }, [user]);
 
   const editManual = (id, field, value) =>
-    setManual((prev) => {
+    setDrafts((prev) => {
       const row = { ...(prev[id] || {}) };
-      if (value === null || value === "") delete row[field]; else row[field] = value;
+      row[field] = value;
       const next = { ...prev };
-      if (Object.keys(row).length) next[id] = row; else delete next[id];
+      next[id] = row;
       return next;
     });
+
+  const dirtyIds = useMemo(() => new Set(Object.keys(drafts)), [drafts]);
+  const dirtyCount = useMemo(() => Object.values(drafts)
+    .reduce((count, row) => count + Object.keys(row).length, 0), [drafts]);
+
+  const saveRow = async (id) => {
+    if (!drafts[id] || savingIds.has(id)) return;
+    const values = { ...(manual[id] || {}), ...drafts[id] };
+    setSavingIds((prev) => new Set(prev).add(id));
+    setSaveMessage("");
+    try {
+      await saveManualRow(id, values, manual[id], user?.id, username);
+      setManual((prev) => ({ ...prev, [id]: values }));
+      setDrafts((prev) => { const next = { ...prev }; delete next[id]; return next; });
+      setSaveMessage(`Saved changes for ${id}.`);
+    } catch (error) {
+      setSaveMessage(`Could not save ${id}: ${error.message}`);
+    } finally {
+      setSavingIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    }
+  };
+
+  const saveAll = async () => {
+    const ids = [...dirtyIds];
+    for (const id of ids) await saveRow(id);
+  };
 
   const [filters, setFilters] = useState(() => { const o = {}; DIMS.forEach((d) => (o[d.k] = new Set())); return o; });
   const [q, setQ] = useState("");
@@ -1152,12 +1299,13 @@ export default function ProjectLedger({ onSignOut }) {
      import rebuilds `importedRows` and never touches `manual` */
   const records = useMemo(() => importedRows.map((r) => {
     const m = manual[r.id];
-    const merged = m ? { ...r, ...m } : { ...r };
+    const draft = drafts[r.id];
+    const merged = m || draft ? { ...r, ...(m || {}), ...(draft || {}) } : { ...r };
     const set = (x) => x !== undefined && x !== null && x !== "";
     merged.hasTarget = set(merged.target) || set(merged.due) ? "With target" : "No target";
-    if (m && m.note) merged._hay = r._hay + " " + m.note.toLowerCase();
+    if ((m?.note || draft?.note)) merged._hay = r._hay + " " + (merged.note || "").toLowerCase();
     return merged;
-  }), [importedRows, manual]);
+  }), [importedRows, manual, drafts]);
 
   const handleFiles = async (files) => {
     setBusy(true);
@@ -1218,7 +1366,7 @@ export default function ProjectLedger({ onSignOut }) {
     if (query && !r._hay.includes(query)) return false;
     return true;
   };
-  const rows = useMemo(() => records.filter((r) => passes(r, null)), [records, filters, query]);
+  const rows = records.filter((r) => passes(r, null));
 
   const countsFor = (dimKey) => {
     const m = new Map();
@@ -1365,9 +1513,21 @@ export default function ProjectLedger({ onSignOut }) {
               <GroupChart rows={rows} groupBy={groupBy} onGroupBy={setGroupBy} />
             </div>
 
-            <LedgerTable rows={rows} sort={sort} onSort={onSort} onExport={exportCsv} onEdit={editManual} />
+            {(!manualReady || saveMessage) && (
+              <div className="mb-2 px-3 py-2 text-xs" role={saveMessage.startsWith("Could") ? "alert" : undefined}
+                   style={{ color: saveMessage.startsWith("Could") ? T.bad : T.inkSoft,
+                            background: saveMessage.startsWith("Could") ? "#FBEEEC" : T.paper2,
+                            border: `1px solid ${saveMessage.startsWith("Could") ? T.bad + "55" : T.rule}` }}>
+                {manualReady ? saveMessage : "Loading saved project updates…"}
+              </div>
+            )}
+            <LedgerTable rows={rows} sort={sort} onSort={onSort} onExport={exportCsv} onEdit={editManual}
+                         onSaveRow={saveRow} onSaveAll={saveAll} dirtyIds={dirtyIds} dirtyCount={dirtyCount}
+                         savingIds={savingIds} onAuditCell={setAuditTarget} />
 
             <TargetAnalysis rows={rows} />
+            {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
+                                        onClose={() => setAuditTarget(null)} />}
         </div>
       </div>
     </div>

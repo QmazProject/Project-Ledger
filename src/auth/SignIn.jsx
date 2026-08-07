@@ -70,11 +70,39 @@ export default function SignIn() {
       backgroundSize: "28px 28px", backgroundPosition: "-1px -1px",
       display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
     }}>
-      <div style={{
+      <div className="login-panel" style={{
         width: "100%", maxWidth: 400, background: T.panel,
-        border: `1px solid ${T.rule}`, borderTop: `3px solid ${T.ink}`,
-        boxShadow: "0 24px 50px -30px rgba(22,33,28,.75)", borderRadius: 2,
+        border: `1px solid ${T.rule}`,
+        boxShadow: `0 0 0 1px ${T.ink}66, 0 0 8px ${T.ink}55, 0 24px 50px -30px rgba(22,33,28,.75)`, borderRadius: 2,
+        position: "relative", overflow: "visible", isolation: "isolate",
       }}>
+        <style>{`
+          .login-border-runner {
+            position: absolute;
+            inset: -8px;
+            width: calc(100% + 16px);
+            height: calc(100% + 16px);
+            pointer-events: none;
+            z-index: 2;
+          }
+          .login-border-runner rect {
+            stroke-dasharray: 260 740;
+            animation: login-border-runner 3s linear infinite;
+            filter: drop-shadow(0 0 3px rgba(215, 53, 47, .95));
+          }
+          .login-panel > div,
+          .login-panel > form {
+            position: relative;
+            z-index: 1;
+          }
+          @keyframes login-border-runner {
+            to { stroke-dashoffset: -1000; }
+          }
+        `}</style>
+        <svg className="login-border-runner" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <rect className="runner-one" x="1" y="1" width="98" height="98" rx="2" pathLength="1000"
+                fill="none" stroke="#d7352f" strokeWidth="1" />
+        </svg>
         <div style={{ padding: "20px 22px 14px", borderBottom: `1px solid ${T.rule}` }}>
           <h1 style={{ fontFamily: DISPLAY, fontWeight: 800, fontSize: 20, letterSpacing: ".045em", textTransform: "uppercase" }}>
             Project Ledger
@@ -83,7 +111,6 @@ export default function SignIn() {
             QM Builders — sign in to continue
           </div>
         </div>
-
         {!isConfigured ? (
           <div style={{ padding: 22, fontSize: 13, color: T.inkSoft, lineHeight: 1.55 }}>
             <b style={{ color: T.bad }}>Not configured.</b> Add <code style={{ fontFamily: MONO }}>VITE_SUPABASE_URL</code> and{" "}
@@ -138,7 +165,7 @@ export default function SignIn() {
             </button>
 
             <div style={{ marginTop: 14, fontSize: 11, lineHeight: 1.5, color: T.inkFaint }}>
-              Accounts are created by the administrator in Supabase. There is no self sign-up.
+              Please use your Acumatica username and password to proceed.
             </div>
           </form>
         )}
