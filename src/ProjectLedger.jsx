@@ -1107,7 +1107,7 @@ function TargetAnalysis({ rows }) {
 
 /* ---------------- app ---------------- */
 
-export default function ProjectLedger() {
+export default function ProjectLedger({ onSignOut }) {
   const [store, setStore] = useState(() => snapshotState());
   const [sourceLabel, setSourceLabel] = useState(SNAPSHOT_LABEL);
   const [imported, setImported] = useState(false);
@@ -1272,9 +1272,29 @@ export default function ProjectLedger() {
               balance for collection, balance works and status.
             </div>
           </div>
-          <div className="text-right text-[11px] leading-relaxed" style={{ fontFamily: MONO, color: T.inkSoft }}>
-            {records.length} projects loaded<br />
-            master from QMB Projects + QM Licenses
+          <div className="flex items-end gap-4 text-right text-[11px] leading-relaxed" style={{ fontFamily: MONO, color: T.inkSoft }}>
+            <div>
+              {records.length} projects loaded<br />
+              master from QMB Projects + QM Licenses
+            </div>
+            {onSignOut && (
+              <button
+                type="button"
+                onClick={onSignOut}
+                className="px-2 py-1 uppercase"
+                style={{
+                  color: T.ink,
+                  background: T.paper2,
+                  border: `1px solid ${T.rule}`,
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  letterSpacing: ".08em",
+                  cursor: "pointer",
+                }}
+              >
+                Sign out
+              </button>
+            )}
           </div>
         </header>
 
