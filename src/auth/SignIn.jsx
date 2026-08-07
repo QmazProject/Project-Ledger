@@ -5,7 +5,7 @@ import { T, DISPLAY, BODY, MONO } from "../theme";
 /* Supabase returns terse messages — say something a person can act on */
 function readable(err) {
   const m = String(err?.message || err || "").toLowerCase();
-  if (m.includes("invalid login credentials")) return "That email and password don't match an account.";
+  if (m.includes("invalid login credentials")) return "That username and password don't match an account.";
   if (m.includes("email not confirmed")) return "This account hasn't been confirmed yet. Ask the administrator to confirm it in Supabase.";
   if (m.includes("too many requests") || m.includes("rate limit")) return "Too many attempts. Wait a moment and try again.";
   if (m.includes("failed to fetch") || m.includes("network")) return "Can't reach the server. Check your internet connection.";
@@ -13,7 +13,7 @@ function readable(err) {
 }
 
 export default function SignIn() {
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -24,16 +24,26 @@ export default function SignIn() {
     if (busy) return;
     setError("");
 
-    if (!email.trim() || !password) {
-      setError("Enter your email and password.");
+    if (!username.trim() || !password) {
+      setError("Enter your username and password.");
       return;
     }
 
     setBusy(true);
-    const { error } = await supabase.auth.signInWithPassword({
-      email: email.trim(),
-      password,
-    });
+    const normalizedUsername = username.trim().toLowerCase();
+    const { data: email, error: lookupError } = await supabase.rpc(
+      "get_login_email",
+      { p_username: normalizedUsername },
+    );
+
+    if (lookupError || !email) {
+      setBusy(false);
+      setError("Invalid username or password.");
+      setPassword("");
+      return;
+    }
+
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
     setBusy(false);
 
     // on success the auth listener in AuthGate swaps this screen out
@@ -83,10 +93,10 @@ export default function SignIn() {
         ) : (
           <form onSubmit={submit} style={{ padding: 22 }}>
             <div style={{ marginBottom: 14 }}>
-              <label htmlFor="email" style={label}>Email</label>
-              <input id="email" type="email" value={email} autoFocus
+              <label htmlFor="username" style={label}>Username</label>
+              <input id="username" type="text" value={username} autoFocus
                      autoComplete="username" disabled={busy} style={field}
-                     onChange={(e) => setEmail(e.target.value)}
+                     onChange={(e) => setUsername(e.target.value)}
                      onFocus={(e) => (e.target.style.borderColor = T.ink)}
                      onBlur={(e) => (e.target.style.borderColor = T.rule)} />
             </div>
