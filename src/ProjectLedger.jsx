@@ -1015,21 +1015,16 @@ function assessTargets(rows) {
     const pace = capacity !== null && needRate ? capacity / needRate : null;   // 1.0 = exactly enough
 
     let bucket, rank;
-    if (done && days !== null && days >= 0) { bucket = "Delivered on time"; rank = 5; }
-    else if (done) { bucket = "Delivered late"; rank = 4; }
+    /* Standing is intentionally based on the values the user entered. The
+       previous capacity calculation could call a row On track merely because
+       its historical daily rate projected well, even when its visible target,
+       output, and deadline indicated otherwise. */
+    /* There is no separate actual-completion-date input, so reaching the
+       target is treated as delivered on time. */
+    if (done) { bucket = "Delivered on time"; rank = 5; }
     else if (days !== null && days < 0) { bucket = "Overdue"; rank = 0; }
-    else if (remaining !== null && remaining > 0) {
-      if (canDeliver !== null) {
-        /* feasible at the current rate */
-        if (canDeliver >= remaining) { bucket = "On track"; rank = 3; }
-        else if (days !== null && days <= 30) { bucket = "Critical"; rank = 1; }
-        else { bucket = "Behind target"; rank = 2; }
-      } else {
-        /* no start date yet, so capacity is unknown — fall back to the deadline */
-        if (days !== null && days <= 30) { bucket = "Critical"; rank = 1; }
-        else { bucket = "Behind target"; rank = 2; }
-      }
-    } else { bucket = "On track"; rank = 3; }
+    else if (days !== null && days <= 3) { bucket = "Critical"; rank = 1; }
+    else { bucket = "On track"; rank = 3; }
 
     /* Overdue outranks everything, and within it the whole balance still to
        collect is the weight — a deadline already missed puts the full amount at
