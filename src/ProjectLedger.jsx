@@ -1158,9 +1158,9 @@ function TargetAnalysis({ rows }) {
           </thead>
           <tbody>
             {priority.map((p, i) => (
-              <tr key={p.id} style={p.done ? { background: "#F7FAF6" } : undefined}>
+              <tr key={p.id} style={p.done || p.bucket === "On track" ? { background: "#F7FAF6" } : undefined}>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, color: T.inkFaint }}>
-                  {p.done ? "\u2713" : i + 1}</td>
+                  {p.done ? "\u2713" : p.bucket === "On track" ? "—" : i + 1}</td>
                 <td title={p.name} style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, fontWeight: 600, whiteSpace: "nowrap" }}>{p.id}</td>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {p.district} · <span style={{ color: T.inkSoft }}>{p.engineer}</span>
@@ -1195,7 +1195,7 @@ function TargetAnalysis({ rows }) {
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, textAlign: "right", whiteSpace: "nowrap" }}>
                   {money(p.bal || 0)}</td>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, width: 90 }}>
-                  {p.done ? (
+                  {p.done || p.bucket === "On track" ? (
                     <span style={{ fontFamily: MONO, fontSize: 10, color: T.inkFaint }}>—</span>
                   ) : (
                     <span className="block h-2" style={{ background: T.paper2, border: `1px solid ${T.ruleSoft}` }}>
