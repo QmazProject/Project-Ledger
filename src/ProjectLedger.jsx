@@ -1222,28 +1222,42 @@ function PasswordChangePanel({ onDone }) {
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [success, setSuccess] = useState(false);
   const submit = async (e) => {
     e.preventDefault(); setError("");
-    if (password.length < 2 || password.length > 8) return setError("Password must be between 2 and 8 characters.");
+    if (password.length < 6 || password.length > 8) return setError("Password must be between 6 and 8 characters.");
     if (password !== confirm) return setError("Passwords do not match.");
     setBusy(true);
     const { error: passwordError } = await supabase.auth.updateUser({ password });
     if (!passwordError) {
       const { error: profileError } = await supabase.rpc("complete_password_change");
-      if (profileError) setError(profileError.message); else onDone();
+      if (profileError) setError(profileError.message);
+      else {
+        setSuccess(true);
+        window.setTimeout(onDone, 1800);
+      }
     } else setError(passwordError.message);
     setBusy(false);
   };
   const field = { width: "100%", padding: "9px 11px", fontFamily: MONO, fontSize: 13, color: T.ink,
     background: T.paper2, border: `1px solid ${T.rule}`, borderRadius: 2, outline: "none" };
   return <div style={{ position: "fixed", inset: 0, zIndex: 30, background: "rgba(22,33,28,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+    <style>{`@keyframes password-success-pop { 0% { transform: scale(.35); opacity: 0; } 70% { transform: scale(1.12); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }`}</style>
     <form onSubmit={submit} style={{ width: "min(420px,100%)", background: T.panel, padding: 22, border: `1px solid ${T.ink}` }}>
-      <h2 style={{ fontFamily: DISPLAY, fontSize: 14, textTransform: "uppercase" }}>Change temporary password</h2>
-      <p style={{ fontSize: 12, color: T.inkSoft }}>An administrator assigned a temporary password. Choose a private password to continue.</p>
-      <input aria-label="New password" type="password" maxLength={8} placeholder="New password (2–8 characters)" value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...field, marginTop: 12 }} />
-      <input aria-label="Confirm password" type="password" maxLength={8} placeholder="Confirm password" value={confirm} onChange={(e) => setConfirm(e.target.value)} style={{ ...field, marginTop: 8 }} />
-      {error && <div role="alert" style={{ marginTop: 10, color: T.bad, fontSize: 12 }}>{error}</div>}
-      <button type="submit" disabled={busy} style={{ width: "100%", marginTop: 14, padding: 10, border: 0, background: T.ink, color: T.paper2, fontFamily: DISPLAY, fontWeight: 700 }}>{busy ? "Saving…" : "Change password"}</button>
+      {success ? <div role="status" style={{ textAlign: "center", padding: "18px 8px 10px" }}>
+        <div aria-hidden="true" style={{ width: 58, height: 58, margin: "0 auto 14px", borderRadius: "50%", background: T.collected, color: T.paper2,
+                                            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 34, fontWeight: 700,
+                                            animation: "password-success-pop .55s ease-out both" }}>✓</div>
+        <h2 style={{ fontFamily: DISPLAY, fontSize: 15, textTransform: "uppercase", color: T.collected }}>Password changed successfully</h2>
+        <p style={{ fontSize: 12, color: T.inkSoft }}>Returning to Project Ledger…</p>
+      </div> : <>
+        <h2 style={{ fontFamily: DISPLAY, fontSize: 14, textTransform: "uppercase" }}>Change temporary password</h2>
+        <p style={{ fontSize: 12, color: T.inkSoft }}>An administrator assigned a temporary password. Choose a private password to continue.</p>
+        <input aria-label="New password" type="password" minLength={6} maxLength={8} placeholder="New password (6–8 characters)" value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...field, marginTop: 12 }} />
+        <input aria-label="Confirm password" type="password" minLength={6} maxLength={8} placeholder="Confirm password" value={confirm} onChange={(e) => setConfirm(e.target.value)} style={{ ...field, marginTop: 8 }} />
+        {error && <div role="alert" style={{ marginTop: 10, color: T.bad, fontSize: 12 }}>{error}</div>}
+        <button type="submit" disabled={busy} style={{ width: "100%", marginTop: 14, padding: 10, border: 0, background: T.ink, color: T.paper2, fontFamily: DISPLAY, fontWeight: 700 }}>{busy ? "Saving…" : "Change password"}</button>
+      </>}
     </form>
   </div>;
 }
@@ -1274,7 +1288,7 @@ function AdminPanel({ onClose }) {
   }, []);
   const resetPassword = async (id) => {
     const value = temporary[id] || "";
-    if (value.length < 2 || value.length > 8) { setMessage("Enter a temporary password between 2 and 8 characters."); return; }
+    if (value.length < 6 || value.length > 8) { setMessage("Enter a temporary password between 6 and 8 characters."); return; }
     const data = await call({ action: "reset-password", user_id: id, temporary_password: value });
     if (data) { setMessage(`Temporary password created for ${users.find((u) => u.id === id)?.username || "the selected user"}.`); setResetSuccess((p) => ({ ...p, [id]: true })); setTemporary((p) => ({ ...p, [id]: "" })); await load(); }
   };
@@ -1294,7 +1308,7 @@ function AdminPanel({ onClose }) {
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.email || "—"}</td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.role}</td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, color: u.banned_until ? T.bad : T.collected }}>{u.banned_until ? "Blocked" : "Active"}</td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}><input type="password" maxLength={8} placeholder="2–8 characters" value={temporary[u.id] || ""} onChange={(e) => setTemporary((p) => ({ ...p, [u.id]: e.target.value }))} style={{ width: 150, padding: "4px 6px", border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 11 }} /></td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}><input type="password" minLength={6} maxLength={8} placeholder="6–8 characters" value={temporary[u.id] || ""} onChange={(e) => setTemporary((p) => ({ ...p, [u.id]: e.target.value }))} style={{ width: 150, padding: "4px 6px", border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 11 }} /></td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}><button type="button" disabled={busy} onClick={() => resetPassword(u.id)} style={{ marginRight: 6, padding: "4px 7px", border: `1px solid ${T.rule}`, background: resetSuccess[u.id] ? "#E4EFEC" : T.paper2, color: resetSuccess[u.id] ? T.collected : T.ink, fontSize: 11 }}>{resetSuccess[u.id] ? "Created ✓" : "Reset"}</button><button type="button" disabled={busy} onClick={() => toggleBan(u)} style={{ padding: "4px 7px", border: `1px solid ${u.banned_until ? T.collected : T.bad}`, background: T.paper2, color: u.banned_until ? T.collected : T.bad, fontSize: 11 }}>{u.banned_until ? "Unblock" : "Block"}</button></td>
           </tr>)}</tbody>
         </table></div>
