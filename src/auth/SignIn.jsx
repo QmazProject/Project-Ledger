@@ -18,19 +18,31 @@ export default function SignIn() {
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [forgot, setForgot] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
     if (busy) return;
     setError("");
+    setNotice("");
 
-    if (!username.trim() || !password) {
-      setError("Enter your username and password.");
+    if (!username.trim() || (!forgot && !password)) {
+      setError(forgot ? "Enter your username." : "Enter your username and password.");
       return;
     }
 
     setBusy(true);
     const normalizedUsername = username.trim().toLowerCase();
+    if (forgot) {
+      await supabase.functions.invoke("password-recovery", {
+        body: { username: normalizedUsername },
+      });
+      setBusy(false);
+      setNotice("If the username exists, a recovery link has been sent. Please check the registered email.");
+      return;
+    }
+
     const { data: email, error: lookupError } = await supabase.rpc(
       "get_login_email",
       { p_username: normalizedUsername },
@@ -128,7 +140,7 @@ export default function SignIn() {
                      onBlur={(e) => (e.target.style.borderColor = T.rule)} />
             </div>
 
-            <div style={{ marginBottom: 16 }}>
+            {!forgot && <div style={{ marginBottom: 16 }}>
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
                 <label htmlFor="password" style={label}>Password</label>
                 <button type="button" onClick={() => setShow((s) => !s)}
@@ -142,7 +154,7 @@ export default function SignIn() {
                      onChange={(e) => setPassword(e.target.value)}
                      onFocus={(e) => (e.target.style.borderColor = T.ink)}
                      onBlur={(e) => (e.target.style.borderColor = T.rule)} />
-            </div>
+            </div>}
 
             {error && (
               <div role="alert" style={{
@@ -153,6 +165,11 @@ export default function SignIn() {
               </div>
             )}
 
+            {notice && <div role="status" style={{ marginBottom: 14, padding: "8px 10px", fontSize: 12,
+                                                     color: T.collected, background: "#E4EFEC", border: `1px solid ${T.collected}55` }}>
+              {notice}
+            </div>}
+
             <button type="submit" disabled={busy}
                     style={{
                       width: "100%", padding: "10px 12px", border: "none", borderRadius: 2,
@@ -161,11 +178,18 @@ export default function SignIn() {
                       letterSpacing: ".12em", textTransform: "uppercase",
                       cursor: busy ? "default" : "pointer",
                     }}>
-              {busy ? "Signing in…" : "Sign in"}
+              {busy ? (forgot ? "Sending…" : "Signing in…") : (forgot ? "Send recovery link" : "Sign in")}
+            </button>
+
+            <button type="button" onClick={() => { setForgot((v) => !v); setError(""); setNotice(""); }}
+                    style={{ width: "100%", marginTop: 10, padding: "7px 12px", border: `1px solid ${T.rule}`,
+                             background: T.paper2, color: T.inkSoft, fontFamily: MONO, fontSize: 11, cursor: "pointer" }}>
+              {forgot ? "Back to sign in" : "Forgot password?"}
             </button>
 
             <div style={{ marginTop: 14, fontSize: 11, lineHeight: 1.5, color: T.inkFaint }}>
-              Please use your Acumatica username and password to proceed.
+              {forgot ? "Users without an active email must contact an administrator for a temporary password." :
+                "Please use your Acumatica username and password to proceed."}
             </div>
           </form>
         )}

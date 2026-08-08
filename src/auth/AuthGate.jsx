@@ -2,14 +2,16 @@ import { useEffect, useState } from "react";
 import { supabase, isConfigured } from "../lib/supabase";
 import { T, DISPLAY, BODY } from "../theme";
 import SignIn from "./SignIn";
+import ResetPassword from "./ResetPassword";
 
 /* Renders children(user, signOut) only for a signed-in session. */
 export default function AuthGate({ children }) {
   const [session, setSession] = useState(null);
   const [checking, setChecking] = useState(isConfigured); // nothing to check when unconfigured
+  const [recovery, setRecovery] = useState(false);
 
-  const setRoute = (nextSession) => {
-    const route = nextSession ? "/project-ledger" : "/login";
+  const setRoute = (nextSession, isRecovery = false) => {
+    const route = isRecovery ? "/reset-password" : nextSession ? "/project-ledger" : "/login";
     if (window.location.pathname !== route) {
       window.history.replaceState({}, "", route);
     }
@@ -24,15 +26,17 @@ export default function AuthGate({ children }) {
       if (!alive) return;
       const nextSession = data.session ?? null;
       setSession(nextSession);
-      setRoute(nextSession);
+      setRoute(nextSession, window.location.pathname === "/reset-password");
       setChecking(false);
     });
 
     // covers sign-in, sign-out, token refresh and expiry
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
       if (!alive) return;
+      const isRecovery = event === "PASSWORD_RECOVERY";
+      setRecovery(isRecovery);
       setSession(next);
-      setRoute(next);
+      setRoute(next, isRecovery);
       setChecking(false);
     });
 
@@ -52,6 +56,7 @@ export default function AuthGate({ children }) {
     );
   }
 
+  if (recovery || window.location.pathname === "/reset-password") return session ? <ResetPassword /> : <SignIn />;
   if (!session) return <SignIn />;
 
   const signOut = () => supabase.auth.signOut();

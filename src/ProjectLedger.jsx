@@ -1217,6 +1217,91 @@ function TargetAnalysis({ rows }) {
   );
 }
 
+function PasswordChangePanel({ onDone }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault(); setError("");
+    if (password.length < 8) return setError("Password must be at least 8 characters.");
+    if (password !== confirm) return setError("Passwords do not match.");
+    setBusy(true);
+    const { error: passwordError } = await supabase.auth.updateUser({ password });
+    if (!passwordError) {
+      const { error: profileError } = await supabase.rpc("complete_password_change");
+      if (profileError) setError(profileError.message); else onDone();
+    } else setError(passwordError.message);
+    setBusy(false);
+  };
+  const field = { width: "100%", padding: "9px 11px", fontFamily: MONO, fontSize: 13, color: T.ink,
+    background: T.paper2, border: `1px solid ${T.rule}`, borderRadius: 2, outline: "none" };
+  return <div style={{ position: "fixed", inset: 0, zIndex: 30, background: "rgba(22,33,28,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+    <form onSubmit={submit} style={{ width: "min(420px,100%)", background: T.panel, padding: 22, border: `1px solid ${T.ink}` }}>
+      <h2 style={{ fontFamily: DISPLAY, fontSize: 14, textTransform: "uppercase" }}>Change temporary password</h2>
+      <p style={{ fontSize: 12, color: T.inkSoft }}>An administrator assigned a temporary password. Choose a private password to continue.</p>
+      <input aria-label="New password" type="password" placeholder="New password" value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...field, marginTop: 12 }} />
+      <input aria-label="Confirm password" type="password" placeholder="Confirm password" value={confirm} onChange={(e) => setConfirm(e.target.value)} style={{ ...field, marginTop: 8 }} />
+      {error && <div role="alert" style={{ marginTop: 10, color: T.bad, fontSize: 12 }}>{error}</div>}
+      <button type="submit" disabled={busy} style={{ width: "100%", marginTop: 14, padding: 10, border: 0, background: T.ink, color: T.paper2, fontFamily: DISPLAY, fontWeight: 700 }}>{busy ? "Saving…" : "Change password"}</button>
+    </form>
+  </div>;
+}
+
+function AdminPanel({ onClose }) {
+  const [users, setUsers] = useState([]);
+  const [temporary, setTemporary] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const call = async (body) => {
+    setBusy(true); setMessage("");
+    const { data, error } = await supabase.functions.invoke("admin-users", { body });
+    setBusy(false);
+    if (error || data?.error) { setMessage(error?.message || data.error); return null; }
+    return data;
+  };
+  const load = async () => { const data = await call({ action: "list" }); if (data) setUsers(data.users || []); };
+  useEffect(() => {
+    let alive = true;
+    supabase.functions.invoke("admin-users", { body: { action: "list" } }).then(({ data, error }) => {
+      if (!alive) return;
+      setBusy(false);
+      if (error || data?.error) setMessage(error?.message || data.error);
+      else setUsers(data?.users || []);
+    });
+    return () => { alive = false; };
+  }, []);
+  const resetPassword = async (id) => {
+    const value = temporary[id] || "";
+    if (value.length < 8) { setMessage("Enter a temporary password with at least 8 characters."); return; }
+    const data = await call({ action: "reset-password", user_id: id, temporary_password: value });
+    if (data) { setMessage("Temporary password assigned. The user must change it after login."); setTemporary((p) => ({ ...p, [id]: "" })); await load(); }
+  };
+  const toggleBan = async (u) => { const data = await call({ action: u.banned_until ? "unban" : "ban", user_id: u.id }); if (data) await load(); };
+  return <div style={{ position: "fixed", inset: 0, zIndex: 25, background: "rgba(22,33,28,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+    <div style={{ width: "min(1000px,100%)", maxHeight: "85vh", overflow: "auto", background: T.panel, border: `1px solid ${T.ink}` }}>
+      <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
+        <h2 style={{ fontFamily: DISPLAY, fontSize: 14, textTransform: "uppercase" }}>User management</h2>
+        <button type="button" onClick={onClose} style={{ border: `1px solid ${T.rule}`, background: T.paper2, padding: "3px 8px" }}>×</button>
+      </div>
+      <div style={{ padding: 16 }}>
+        {message && <div role="status" style={{ marginBottom: 10, color: message.includes("error") || message.includes("required") ? T.bad : T.inkSoft, fontSize: 12 }}>{message}</div>}
+        <div className="overflow-auto"><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <thead><tr>{["Username", "Email", "Role", "Status", "Temporary password", "Actions"].map((h) => <th key={h} style={{ textAlign: "left", padding: "6px 7px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{h}</th>)}</tr></thead>
+          <tbody>{users.map((u) => <tr key={u.id}>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO }}>{u.username || "—"}</td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.email || "—"}</td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.role}</td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, color: u.banned_until ? T.bad : T.collected }}>{u.banned_until ? "Blocked" : "Active"}</td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}><input type="password" placeholder="8+ characters" value={temporary[u.id] || ""} onChange={(e) => setTemporary((p) => ({ ...p, [u.id]: e.target.value }))} style={{ width: 150, padding: "4px 6px", border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 11 }} /></td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}><button type="button" disabled={busy} onClick={() => resetPassword(u.id)} style={{ marginRight: 6, padding: "4px 7px", border: `1px solid ${T.rule}`, background: T.paper2, fontSize: 11 }}>Reset</button><button type="button" disabled={busy} onClick={() => toggleBan(u)} style={{ padding: "4px 7px", border: `1px solid ${u.banned_until ? T.collected : T.bad}`, background: T.paper2, color: u.banned_until ? T.collected : T.bad, fontSize: 11 }}>{u.banned_until ? "Unblock" : "Block"}</button></td>
+          </tr>)}</tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>;
+}
+
 /* ---------------- app ---------------- */
 
 export default function ProjectLedger({ user, onSignOut }) {
@@ -1232,6 +1317,9 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [savingIds, setSavingIds] = useState(new Set());
   const [saveMessage, setSaveMessage] = useState("");
   const [username, setUsername] = useState(user?.user_metadata?.username || user?.email || "Unknown user");
+  const [role, setRole] = useState("user");
+  const [forcePasswordChange, setForcePasswordChange] = useState(false);
+  const [adminOpen, setAdminOpen] = useState(false);
   const [auditTarget, setAuditTarget] = useState(null);
 
   useEffect(() => {
@@ -1242,8 +1330,8 @@ export default function ProjectLedger({ user, onSignOut }) {
       if (alive) { setManualReady(true); setSaveMessage(`Could not load saved project updates: ${error.message}`); }
     });
     if (isConfigured && supabase && user?.id) {
-      supabase.from("profiles").select("username").eq("id", user.id).maybeSingle()
-        .then(({ data }) => { if (alive && data?.username) setUsername(data.username); });
+      supabase.from("profiles").select("username, role, force_password_change").eq("id", user.id).maybeSingle()
+        .then(({ data }) => { if (!alive || !data) return; if (data.username) setUsername(data.username); setRole(data.role || "user"); setForcePasswordChange(Boolean(data.force_password_change)); });
     }
     return () => { alive = false; };
   }, [user]);
@@ -1419,6 +1507,10 @@ export default function ProjectLedger({ user, onSignOut }) {
               {records.length} projects loaded<br />
               master from QMB Projects + QM Licenses
             </div>
+            {role === "admin" && <button type="button" onClick={() => setAdminOpen(true)}
+              style={{ color: T.ink, background: T.paper2, border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 10, padding: "5px 7px", cursor: "pointer" }}>
+              User management
+            </button>}
             {onSignOut && (
               <button
                 type="button"
@@ -1522,6 +1614,8 @@ export default function ProjectLedger({ user, onSignOut }) {
             <TargetAnalysis rows={rows} />
             {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
                                         onClose={() => setAuditTarget(null)} />}
+            {adminOpen && <AdminPanel onClose={() => setAdminOpen(false)} />}
+            {forcePasswordChange && <PasswordChangePanel onDone={() => setForcePasswordChange(false)} />}
         </div>
       </div>
     </div>
