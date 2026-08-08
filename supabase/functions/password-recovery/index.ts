@@ -14,10 +14,10 @@ Deno.serve(async (request) => {
   if (request.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    const { username } = await request.json();
+    const { username, captcha_token } = await request.json();
     const normalizedUsername = String(username || "").trim().toLowerCase();
     const genericResponse = { ok: true };
-    if (!normalizedUsername) return json(genericResponse);
+    if (!normalizedUsername || !captcha_token) return json(genericResponse);
 
     const url = Deno.env.get("SUPABASE_URL")!;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -34,7 +34,7 @@ Deno.serve(async (request) => {
     await fetch(`${url}/auth/v1/recover`, {
       method: "POST",
       headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ email: data.email, redirect_to: `${siteUrl}/reset-password` }),
+      body: JSON.stringify({ email: data.email, redirect_to: `${siteUrl}/reset-password`, captcha_token }),
     });
     return json(genericResponse);
   } catch (_error) {

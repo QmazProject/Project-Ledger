@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import HCaptcha from "@hcaptcha/react-hcaptcha";
 import { supabase, isConfigured } from "../lib/supabase";
 import { T, DISPLAY, BODY, MONO } from "../theme";
 
@@ -20,6 +21,9 @@ export default function SignIn() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [forgot, setForgot] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState("");
+  const captchaRef = useRef(null);
+  const captchaSiteKey = import.meta.env.VITE_HCAPTCHA_SITE_KEY || import.meta.env.VITE_CAPTCHA_SITE_KEY;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -32,12 +36,19 @@ export default function SignIn() {
       return;
     }
 
+    if (!captchaToken) {
+      setError("Complete the CAPTCHA challenge first.");
+      return;
+    }
+
     setBusy(true);
     const normalizedUsername = username.trim().toLowerCase();
     if (forgot) {
       await supabase.functions.invoke("password-recovery", {
-        body: { username: normalizedUsername },
+        body: { username: normalizedUsername, captcha_token: captchaToken },
       });
+      captchaRef.current?.resetCaptcha();
+      setCaptchaToken("");
       setBusy(false);
       setNotice("If the username exists, a recovery link has been sent. Please check the registered email.");
       return;
@@ -55,7 +66,9 @@ export default function SignIn() {
       return;
     }
 
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    const { error } = await supabase.auth.signInWithPassword({ email, password, options: { captchaToken } });
+    captchaRef.current?.resetCaptcha();
+    setCaptchaToken("");
     setBusy(false);
 
     // on success the auth listener in AuthGate swaps this screen out
@@ -168,6 +181,13 @@ export default function SignIn() {
             {notice && <div role="status" style={{ marginBottom: 14, padding: "8px 10px", fontSize: 12,
                                                      color: T.collected, background: "#E4EFEC", border: `1px solid ${T.collected}55` }}>
               {notice}
+            </div>}
+
+            {captchaSiteKey ? <div style={{ marginBottom: 14, display: "flex", justifyContent: "center" }}>
+              <HCaptcha ref={captchaRef} sitekey={captchaSiteKey} onVerify={setCaptchaToken}
+                        onExpire={() => setCaptchaToken("")} onError={() => setCaptchaToken("")} />
+            </div> : <div role="alert" style={{ marginBottom: 14, color: T.bad, fontSize: 12 }}>
+              CAPTCHA site key is not configured.
             </div>}
 
             <button type="submit" disabled={busy}
