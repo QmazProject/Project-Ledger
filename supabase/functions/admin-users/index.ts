@@ -53,7 +53,7 @@ Deno.serve(async (request) => {
 
     if (action === "reset-password") {
       const temporaryPassword = String(body.temporary_password || "");
-      if (temporaryPassword.length < 8) return json({ error: "Temporary password must be at least 8 characters." }, 400);
+      if (temporaryPassword.length < 2) return json({ error: "Temporary password must be at least 2 characters." }, 400);
       const { error } = await admin.auth.admin.updateUserById(userId, {
         password: temporaryPassword,
       });

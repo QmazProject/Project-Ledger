@@ -11,7 +11,7 @@ export default function ResetPassword() {
   const submit = async (e) => {
     e.preventDefault();
     setError("");
-    if (password.length < 8) return setError("Password must be at least 8 characters.");
+    if (password.length < 2) return setError("Password must be at least 2 characters.");
     if (password !== confirm) return setError("Passwords do not match.");
     setBusy(true);
     const { error: updateError } = await supabase.auth.updateUser({ password });

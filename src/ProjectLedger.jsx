@@ -1224,7 +1224,7 @@ function PasswordChangePanel({ onDone }) {
   const [busy, setBusy] = useState(false);
   const submit = async (e) => {
     e.preventDefault(); setError("");
-    if (password.length < 8) return setError("Password must be at least 8 characters.");
+    if (password.length < 2) return setError("Password must be at least 2 characters.");
     if (password !== confirm) return setError("Passwords do not match.");
     setBusy(true);
     const { error: passwordError } = await supabase.auth.updateUser({ password });
@@ -1273,7 +1273,7 @@ function AdminPanel({ onClose }) {
   }, []);
   const resetPassword = async (id) => {
     const value = temporary[id] || "";
-    if (value.length < 8) { setMessage("Enter a temporary password with at least 8 characters."); return; }
+    if (value.length < 2) { setMessage("Enter a temporary password with at least 2 characters."); return; }
     const data = await call({ action: "reset-password", user_id: id, temporary_password: value });
     if (data) { setMessage("Temporary password assigned. The user must change it after login."); setTemporary((p) => ({ ...p, [id]: "" })); await load(); }
   };
@@ -1293,7 +1293,7 @@ function AdminPanel({ onClose }) {
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.email || "—"}</td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.role}</td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, color: u.banned_until ? T.bad : T.collected }}>{u.banned_until ? "Blocked" : "Active"}</td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}><input type="password" placeholder="8+ characters" value={temporary[u.id] || ""} onChange={(e) => setTemporary((p) => ({ ...p, [u.id]: e.target.value }))} style={{ width: 150, padding: "4px 6px", border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 11 }} /></td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}><input type="password" placeholder="2+ characters" value={temporary[u.id] || ""} onChange={(e) => setTemporary((p) => ({ ...p, [u.id]: e.target.value }))} style={{ width: 150, padding: "4px 6px", border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 11 }} /></td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}><button type="button" disabled={busy} onClick={() => resetPassword(u.id)} style={{ marginRight: 6, padding: "4px 7px", border: `1px solid ${T.rule}`, background: T.paper2, fontSize: 11 }}>Reset</button><button type="button" disabled={busy} onClick={() => toggleBan(u)} style={{ padding: "4px 7px", border: `1px solid ${u.banned_until ? T.collected : T.bad}`, background: T.paper2, color: u.banned_until ? T.collected : T.bad, fontSize: 11 }}>{u.banned_until ? "Unblock" : "Block"}</button></td>
           </tr>)}</tbody>
         </table></div>
