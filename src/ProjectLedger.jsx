@@ -1331,6 +1331,7 @@ function PasswordChangePanel({ onDone }) {
 
 function AdminPanel({ onClose }) {
   const [users, setUsers] = useState([]);
+  const [captchaEnabled, setCaptchaEnabled] = useState(true);
   const [temporary, setTemporary] = useState({});
   const [resetSuccess, setResetSuccess] = useState({});
   const [busy, setBusy] = useState(false);
@@ -1349,7 +1350,7 @@ function AdminPanel({ onClose }) {
       if (!alive) return;
       setBusy(false);
       if (error || data?.error) setMessage(error?.message || data.error);
-      else setUsers(data?.users || []);
+      else { setUsers(data?.users || []); setCaptchaEnabled(data?.captcha_enabled !== false); }
     });
     return () => { alive = false; };
   }, []);
@@ -1360,6 +1361,10 @@ function AdminPanel({ onClose }) {
     if (data) { setMessage(`Temporary password created for ${users.find((u) => u.id === id)?.username || "the selected user"}.`); setResetSuccess((p) => ({ ...p, [id]: true })); setTemporary((p) => ({ ...p, [id]: "" })); await load(); }
   };
   const toggleBan = async (u) => { const data = await call({ action: u.banned_until ? "unban" : "ban", user_id: u.id }); if (data) await load(); };
+  const toggleCaptcha = async () => {
+    const data = await call({ action: "set-captcha", enabled: !captchaEnabled });
+    if (data) setCaptchaEnabled(data.captcha_enabled !== false);
+  };
   return <div style={{ position: "fixed", inset: 0, zIndex: 25, background: "rgba(22,33,28,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
     <div style={{ width: "min(1000px,100%)", maxHeight: "85vh", overflow: "auto", background: T.panel, border: `1px solid ${T.ink}` }}>
       <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
@@ -1368,6 +1373,15 @@ function AdminPanel({ onClose }) {
       </div>
       <div style={{ padding: 16 }}>
         {message && <div role="status" style={{ marginBottom: 10, color: message.includes("error") || message.includes("required") ? T.bad : T.inkSoft, fontSize: 12 }}>{message}</div>}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, padding: "10px 12px", marginBottom: 14, background: T.paper2, border: `1px solid ${T.rule}` }}>
+          <div>
+            <div style={{ fontFamily: DISPLAY, fontSize: 11, textTransform: "uppercase" }}>Live CAPTCHA protection</div>
+            <div style={{ marginTop: 3, color: T.inkSoft, fontSize: 11 }}>Require hCaptcha on sign-in and password recovery.</div>
+          </div>
+          <button type="button" disabled={busy} onClick={toggleCaptcha} style={{ minWidth: 92, padding: "6px 9px", border: `1px solid ${captchaEnabled ? T.collected : T.bad}`, background: captchaEnabled ? "#E4EFEC" : "#FBEEEC", color: captchaEnabled ? T.collected : T.bad, fontFamily: DISPLAY, fontWeight: 700, fontSize: 11 }}>
+            {captchaEnabled ? "Enabled" : "Disabled"}
+          </button>
+        </div>
         <div className="overflow-auto"><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
           <thead><tr>{["Username", "Email", "Role", "Status", "Temporary password", "Actions"].map((h) => <th key={h} style={{ textAlign: "left", padding: "6px 7px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{h}</th>)}</tr></thead>
           <tbody>{users.map((u) => <tr key={u.id}>

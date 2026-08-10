@@ -27,40 +27,40 @@ Deno.serve(async (request) => {
   if (request.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    const { username, captcha_token } = await request.json();
+    const { username, password, captcha_token } = await request.json().catch(() => ({}));
     const normalizedUsername = String(username || "").trim().toLowerCase();
-    const genericResponse = { ok: true };
-    if (!normalizedUsername) return json(genericResponse);
+    const plainPassword = String(password || "");
+    if (!normalizedUsername || !plainPassword) return json({ error: "Username and password are required." }, 400);
 
     const url = Deno.env.get("SUPABASE_URL")!;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const siteUrl = Deno.env.get("PUBLIC_SITE_URL") || "https://project-ledger-psi.vercel.app";
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
     const admin = createClient(url, serviceKey, { auth: { persistSession: false } });
     const { data: setting } = await admin.from("security_settings")
       .select("captcha_enabled").eq("id", 1).maybeSingle();
     const captchaEnabled = setting?.captcha_enabled !== false;
+
     if (captchaEnabled) {
       const secret = Deno.env.get("HCAPTCHA_SECRET");
       if (!secret || !captcha_token || !(await captchaIsValid(String(captcha_token), secret, request.headers.get("x-forwarded-for")))) {
-        return json(genericResponse);
+        return json({ error: "Complete the CAPTCHA challenge first." }, 400);
       }
     }
 
-    const { data, error } = await admin.rpc("consume_password_recovery", {
-      p_username: normalizedUsername,
-    });
-    if (error || !data?.allowed || !data.email) return json(genericResponse);
+    const { data: profile, error: profileError } = await admin.from("profiles")
+      .select("id").eq("username", normalizedUsername).maybeSingle();
+    if (profileError || !profile) return json({ error: "Invalid username or password." }, 401);
+    const { data: authUser, error: authUserError } = await admin.auth.admin.getUserById(profile.id);
+    const email = authUser?.user?.email;
+    if (authUserError || !email) return json({ error: "Invalid username or password." }, 401);
 
-    // The redirect is fixed server-side so a client cannot send reset tokens
-    // to an untrusted destination.
-    const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-    await fetch(`${url}/auth/v1/recover`, {
-      method: "POST",
-      headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ email: data.email, redirect_to: `${siteUrl}/reset-password` }),
-    });
-    return json(genericResponse);
-  } catch (_error) {
-    return json({ ok: true });
+    // The global Supabase Auth CAPTCHA setting must be disabled. This function
+    // performs the conditional verification above instead.
+    const auth = createClient(url, anonKey, { auth: { persistSession: false } });
+    const { data, error } = await auth.auth.signInWithPassword({ email, password: plainPassword });
+    if (error || !data.session) return json({ error: error?.message || "Invalid username or password." }, 401);
+    return json({ session: data.session });
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 });

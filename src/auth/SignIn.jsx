@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import HCaptcha from "@hcaptcha/react-hcaptcha";
 import { supabase, isConfigured } from "../lib/supabase";
 import { T, DISPLAY, BODY, MONO } from "../theme";
@@ -22,8 +22,16 @@ export default function SignIn() {
   const [notice, setNotice] = useState("");
   const [forgot, setForgot] = useState(false);
   const [captchaToken, setCaptchaToken] = useState("");
+  const [captchaEnabled, setCaptchaEnabled] = useState(true);
   const captchaRef = useRef(null);
   const captchaSiteKey = import.meta.env.VITE_HCAPTCHA_SITE_KEY || import.meta.env.VITE_CAPTCHA_SITE_KEY;
+
+  useEffect(() => {
+    let alive = true;
+    supabase?.from("security_settings").select("captcha_enabled").eq("id", 1).maybeSingle()
+      .then(({ data }) => { if (alive && data) setCaptchaEnabled(data.captcha_enabled !== false); });
+    return () => { alive = false; };
+  }, []);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -36,7 +44,7 @@ export default function SignIn() {
       return;
     }
 
-    if (!captchaToken) {
+    if (captchaEnabled && !captchaToken) {
       setError("Complete the CAPTCHA challenge first.");
       return;
     }
@@ -45,35 +53,26 @@ export default function SignIn() {
     const normalizedUsername = username.trim().toLowerCase();
     if (forgot) {
       await supabase.functions.invoke("password-recovery", {
-        body: { username: normalizedUsername, captcha_token: captchaToken },
+        body: { username: normalizedUsername, ...(captchaEnabled ? { captcha_token: captchaToken } : {}) },
       });
-      captchaRef.current?.resetCaptcha();
+      if (captchaEnabled) captchaRef.current?.resetCaptcha();
       setCaptchaToken("");
       setBusy(false);
       setNotice("If the username exists, a recovery link has been sent. Please check the registered email.");
       return;
     }
 
-    const { data: email, error: lookupError } = await supabase.rpc(
-      "get_login_email",
-      { p_username: normalizedUsername },
-    );
-
-    if (lookupError || !email) {
-      setBusy(false);
-      setError("Invalid username or password.");
-      setPassword("");
-      return;
-    }
-
-    const { error } = await supabase.auth.signInWithPassword({ email, password, options: { captchaToken } });
-    captchaRef.current?.resetCaptcha();
+    const { data, error: functionError } = await supabase.functions.invoke("auth-login", {
+      body: { username: normalizedUsername, password, ...(captchaEnabled ? { captcha_token: captchaToken } : {}) },
+    });
+    if (!functionError && data?.session) await supabase.auth.setSession(data.session);
+    if (captchaEnabled) captchaRef.current?.resetCaptcha();
     setCaptchaToken("");
     setBusy(false);
 
     // on success the auth listener in AuthGate swaps this screen out
-    if (error) {
-      setError(readable(error));
+    if (functionError || data?.error) {
+      setError(readable({ message: data?.error || functionError?.message }));
       setPassword("");
     }
   };
@@ -183,11 +182,13 @@ export default function SignIn() {
               {notice}
             </div>}
 
-            {captchaSiteKey ? <div style={{ marginBottom: 14, display: "flex", justifyContent: "center" }}>
+            {captchaEnabled && captchaSiteKey ? <div style={{ marginBottom: 14, display: "flex", justifyContent: "center" }}>
               <HCaptcha ref={captchaRef} sitekey={captchaSiteKey} onVerify={setCaptchaToken}
                         onExpire={() => setCaptchaToken("")} onError={() => setCaptchaToken("")} />
-            </div> : <div role="alert" style={{ marginBottom: 14, color: T.bad, fontSize: 12 }}>
+            </div> : captchaEnabled ? <div role="alert" style={{ marginBottom: 14, color: T.bad, fontSize: 12 }}>
               CAPTCHA site key is not configured.
+            </div> : <div role="status" style={{ marginBottom: 14, color: T.inkSoft, fontSize: 12 }}>
+              CAPTCHA is disabled by an administrator.
             </div>}
 
             <button type="submit" disabled={busy}

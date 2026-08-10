@@ -4,6 +4,25 @@ This guide explains how hCaptcha protects the Project Ledger authentication flow
 
 ## 1. How the protection works
 
+Project Ledger supports an administrator-controlled CAPTCHA switch in **User management**.
+Because Supabase's built-in CAPTCHA setting is project-wide, it must be disabled when using
+this switch. The `auth-login` and `password-recovery` Edge Functions verify hCaptcha
+server-side only when the administrator has CAPTCHA enabled.
+
+Set the hCaptcha secret for the Edge Functions (never expose it as a `VITE_*` variable):
+
+```bash
+supabase secrets set HCAPTCHA_SECRET=your-hcaptcha-secret
+```
+
+Deploy the functions after changing them:
+
+```bash
+supabase functions deploy auth-login
+supabase functions deploy password-recovery
+supabase functions deploy admin-users
+```
+
 There are two keys:
 
 - **Site key**: public. This is used by the frontend to display the hCaptcha widget.

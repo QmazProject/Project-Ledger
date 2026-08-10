@@ -36,8 +36,10 @@ Deno.serve(async (request) => {
       const { data: profiles, error: profileError } = await admin.from("profiles")
         .select("id, username, role, force_password_change");
       if (profileError) throw profileError;
+      const { data: security } = await admin.from("security_settings")
+        .select("captcha_enabled").eq("id", 1).maybeSingle();
       const byId = new Map((profiles || []).map((p) => [p.id, p]));
-      return json({ users: (data.users || []).map((u) => ({
+      return json({ captcha_enabled: security?.captcha_enabled !== false, users: (data.users || []).map((u) => ({
         id: u.id,
         email: u.email || "",
         username: byId.get(u.id)?.username || "",
@@ -46,6 +48,14 @@ Deno.serve(async (request) => {
         banned_until: u.banned_until || null,
         last_sign_in_at: u.last_sign_in_at || null,
       })) });
+    }
+
+    if (action === "set-captcha") {
+      const enabled = body.enabled !== false;
+      const { error } = await admin.from("security_settings")
+        .update({ captcha_enabled: enabled, updated_at: new Date().toISOString() }).eq("id", 1);
+      if (error) throw error;
+      return json({ ok: true, captcha_enabled: enabled });
     }
 
     const userId = String(body.user_id || "");
