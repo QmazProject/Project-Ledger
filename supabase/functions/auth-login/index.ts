@@ -42,8 +42,10 @@ Deno.serve(async (request) => {
 
     if (captchaEnabled) {
       const secret = Deno.env.get("HCAPTCHA_SECRET");
-      if (!secret || !captcha_token || !(await captchaIsValid(String(captcha_token), secret, request.headers.get("x-forwarded-for")))) {
-        return json({ error: "Complete the CAPTCHA challenge first." }, 400);
+      if (!secret) return json({ error: "CAPTCHA server secret is not configured." }, 500);
+      if (!captcha_token) return json({ error: "Complete the CAPTCHA challenge first." }, 400);
+      if (!(await captchaIsValid(String(captcha_token), secret, request.headers.get("x-forwarded-for")))) {
+        return json({ error: "CAPTCHA verification failed. Check the hCaptcha site key and allowed domain, then try again." }, 400);
       }
     }
 
