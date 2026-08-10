@@ -13,6 +13,15 @@ function readable(err) {
   return err?.message || "Sign in failed. Try again.";
 }
 
+async function functionErrorMessage(error, data) {
+  if (data?.error) return data.error;
+  try {
+    const body = await error?.context?.json();
+    if (body?.error) return body.error;
+  } catch { /* keep the SDK message when the response body is unavailable */ }
+  return error?.message || "Sign in failed. Try again.";
+}
+
 export default function SignIn() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -72,7 +81,7 @@ export default function SignIn() {
 
     // on success the auth listener in AuthGate swaps this screen out
     if (functionError || data?.error) {
-      setError(readable({ message: data?.error || functionError?.message }));
+      setError(readable({ message: await functionErrorMessage(functionError, data) }));
       setPassword("");
     }
   };
