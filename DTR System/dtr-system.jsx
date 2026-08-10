@@ -14,7 +14,7 @@ const SLOTS = [
 ];
 const MON = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const ADMIN_ID = "005582";
-const SCHED_DEF = { amStart: "08:00", amEnd: "11:00", pmStart: "13:00", pmEnd: "17:00" };
+const SCHED_DEF = { amStart: "08:00", amEnd: "12:00", pmStart: "13:00", pmEnd: "17:00" };
 const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF };
 
 /* ============================ helpers ============================ */

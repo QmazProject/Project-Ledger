@@ -268,11 +268,12 @@ async function saveDataset(store, label, userId, username) {
 async function loadManual() {
   if (!isConfigured || !supabase) return {};
   const { data, error } = await supabase.from("project_manual_updates")
-    .select("project_id, target_qty, unit, start_date, target_completion, actual_output, remarks");
+    .select("project_id, target_qty, unit, start_date, target_completion, actual_completion, actual_output, remarks");
   if (error) throw error;
   return Object.fromEntries((data || []).map((row) => [row.project_id, {
     target: row.target_qty, unit: row.unit, start: row.start_date,
-    due: row.target_completion, actual: row.actual_output, note: row.remarks,
+    due: row.target_completion, finish: row.actual_completion,
+    actual: row.actual_output, note: row.remarks,
   }]));
 }
 async function saveManualRow(id, values, oldValues, userId, username) {
@@ -283,6 +284,7 @@ async function saveManualRow(id, values, oldValues, userId, username) {
     unit: values.unit || null,
     start_date: values.start || null,
     target_completion: values.due || null,
+    actual_completion: values.finish || null,
     actual_output: values.actual === "" || values.actual === null ? null : toNum(values.actual),
     remarks: values.note || null,
     updated_by: userId,
@@ -292,7 +294,8 @@ async function saveManualRow(id, values, oldValues, userId, username) {
 
   const auditFields = [
     ["target", "Target qty"], ["unit", "Unit"], ["start", "Start date"],
-    ["due", "Target completion"], ["actual", "Actual output"], ["note", "Remarks"],
+    ["due", "Target completion"], ["finish", "Actual completion"],
+    ["actual", "Actual output"], ["note", "Remarks"],
   ];
   const changes = auditFields
     .filter(([field]) => String(oldValues?.[field] ?? "") !== String(values?.[field] ?? ""))
@@ -316,6 +319,13 @@ function daysUntil(due) {
   if (!due) return null;
   const t = Date.parse(due + "T00:00:00");
   return isNaN(t) ? null : Math.round((t - today0()) / DAY);
+}
+/* days from `from` to `to`, both yyyy-mm-dd; null when either is missing or
+   unparseable. Positive means `to` falls after `from`. */
+function daysBetween(from, to) {
+  if (!from || !to) return null;
+  const a = Date.parse(from + "T00:00:00"), b = Date.parse(to + "T00:00:00");
+  return isNaN(a) || isNaN(b) ? null : Math.round((b - a) / DAY);
 }
 const fmtDate = (s) => {
   if (!s) return "";
@@ -385,6 +395,9 @@ const COLS = [
   { k: "unit", label: "Unit", edit: "text", w: 76 },
   { k: "start", label: "Start date", edit: "date", w: 128 },
   { k: "due", label: "Target completion", edit: "date", w: 132 },
+  /* the day the target was actually met — what separates "Delivered on time"
+     from plain "Delivered"; blank means unknown, never on time */
+  { k: "finish", label: "Actual completion", edit: "date", w: 132 },
   { k: "actual", label: "Actual output", edit: "qty", w: 88 },
   { k: "note", label: "Remarks", edit: "text", w: 190 },
 ];
@@ -1075,14 +1088,21 @@ function assessTargets(rows) {
     const needRate = remaining !== null && days !== null && days > 0 ? remaining / days : null;
     const pace = capacity !== null && needRate ? capacity / needRate : null;   // 1.0 = exactly enough
 
+    /* Was it on time? That is a claim about the day the work landed, so it is
+       answered by the hand-typed actual completion date and never by today's
+       date — measuring from today would relabel a project delivered early as
+       late the moment its deadline rolled by. Both dates are ISO yyyy-mm-dd,
+       so they compare directly. With no completion date typed in there is no
+       evidence either way, and the row stays plain "Delivered". */
+    const lateDays = done ? daysBetween(r.due, r.finish) : null;   // + = late, 0/- = on time
+    const onTime = done && !!r.finish && !!r.due && r.finish <= r.due;
+
     let bucket, rank;
     /* Standing is intentionally based on the values the user entered. The
        previous capacity calculation could call a row On track merely because
        its historical daily rate projected well, even when its visible target,
        output, and deadline indicated otherwise. */
-    /* There is no separate actual-completion-date input, so reaching the
-       target is treated as delivered on time. */
-    if (done) { bucket = "Delivered on time"; rank = 5; }
+    if (done) { bucket = onTime ? "Delivered on time" : "Delivered"; rank = onTime ? 5 : 4; }
     else if (days !== null && days < 0) { bucket = "Overdue"; rank = 0; }
     else if (days !== null && days <= 3) { bucket = "Critical"; rank = 1; }
     else { bucket = "On track"; rank = 3; }
@@ -1100,14 +1120,15 @@ function assessTargets(rows) {
       : shortfall * (r.bal || 0) * urgency * paceDrag;
 
     tracked.push({ ...r, target, actual, gap, remaining, progress, days, elapsed,
-                   capacity, canDeliver, needRate, pace, bucket, rank, score, done });
+                   capacity, canDeliver, needRate, pace, bucket, rank, score, done,
+                   onTime, lateDays });
   });
   return tracked.sort((a, b) => a.rank - b.rank || b.score - a.score);
 }
 
 const BUCKET_COLOR = {
   "Overdue": T.bad, "Critical": "#D2A21C", "Behind target": T.retention,
-  "On track": T.collected, "Delivered on time": T.collected, "Delivered late": T.inkFaint,
+  "On track": T.collected, "Delivered on time": T.collected, "Delivered": T.inkSoft,
 };
 
 /* the two standings that demand action are filled rather than outlined, so they
@@ -1143,7 +1164,7 @@ function TargetAnalysis({ rows }) {
     );
   }
 
-  const buckets = ["Overdue", "Critical", "Behind target", "On track", "Delivered on time", "Delivered late"];
+  const buckets = ["Overdue", "Critical", "Behind target", "On track", "Delivered on time", "Delivered"];
   const counts = {};
   buckets.forEach((b) => (counts[b] = tracked.filter((t) => t.bucket === b)));
 
@@ -1154,7 +1175,9 @@ function TargetAnalysis({ rows }) {
      record of what has landed, and never carry a priority weight */
   const actionItems = tracked.filter((t) => t.rank <= 2).slice(0, 10);
   const onTrack = tracked.filter((t) => t.bucket === "On track").slice(0, 8);
-  const achieved = tracked.filter((t) => t.bucket === "Delivered on time")
+  /* both delivered standings belong in the record of what has landed — a late
+     delivery is if anything the more useful one to see */
+  const achieved = tracked.filter((t) => t.done)
     .sort((a, b) => (b.bal || 0) - (a.bal || 0)).slice(0, 8);
   const priority = [...actionItems, ...onTrack, ...achieved];
   /* normalise the bar inside each bucket — otherwise one huge overdue project
@@ -1173,7 +1196,9 @@ function TargetAnalysis({ rows }) {
         <Kpi label="Projects with target" value={tracked.length}
              meta={`of ${rows.length} shown`} />
         <Kpi label="Achieved on time" value={counts["Delivered on time"].length} color={T.collected}
-             meta={counts["Delivered late"].length ? `${counts["Delivered late"].length} delivered late` : "none late"} />
+             meta={counts["Delivered"].length
+               ? `${counts["Delivered"].length} delivered, not confirmed on time`
+               : "every delivery on time"} />
         <Kpi label="Not yet achieved" value={notAchieved.length}
              meta={`${counts["Overdue"].length} overdue · ${counts["Critical"].length + counts["Behind target"].length} behind · ${counts["On track"].length} on track`} />
         <Kpi label="Overdue targets" value={counts["Overdue"].length} color={T.bad}
@@ -1242,10 +1267,19 @@ function TargetAnalysis({ rows }) {
                     style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, textAlign: "right",
                              color: p.pace === null ? T.inkFaint : p.pace < 1 ? T.bad : T.collected }}>
                   {p.pace === null ? "—" : p.pace.toFixed(2) + "\u00D7"}</td>
+                {/* once delivered, the countdown to the deadline is meaningless —
+                    what matters is the day it landed and by how much it missed */}
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, whiteSpace: "nowrap",
-                             color: p.days !== null && p.days < 0 ? T.bad : T.inkSoft }}>
+                             color: !p.done && p.days !== null && p.days < 0 ? T.bad : T.inkSoft }}>
                   {p.due ? fmtDate(p.due) : "—"}
-                  {p.days !== null && (
+                  {p.done ? (
+                    p.lateDays === null
+                      ? <span style={{ color: T.inkFaint }}> · completion date not set</span>
+                      : <span style={{ color: p.lateDays > 0 ? T.bad : T.collected }}>
+                          {" · "}{fmtDate(p.finish)}
+                          {p.lateDays > 0 ? ` (${p.lateDays}d late)` : " (on time)"}
+                        </span>
+                  ) : p.days !== null && (
                     <span style={{ color: T.inkFaint }}> · {p.days < 0 ? Math.abs(p.days) + "d late" : p.days + "d left"}</span>
                   )}
                 </td>
@@ -1271,8 +1305,10 @@ function TargetAnalysis({ rows }) {
       </div>
       <div className="mt-2 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint, lineHeight: 1.6 }}>
         On track means the target completion date is more than three days away and the target has not yet been reached.
-        Critical means the deadline is within three days; overdue means the deadline has passed. A project is delivered
-        on time when Actual output reaches Target qty. Priority ranks overdue and critical projects first.
+        Critical means the deadline is within three days; overdue means the deadline has passed. A project counts as
+        delivered when Actual output reaches Target qty, and as <b>delivered on time</b> only when its Actual completion
+        date is on or before the Target completion date — leave that date blank and it stays <b>delivered</b>, since
+        there is nothing to prove it landed on time. Priority ranks overdue and critical projects first.
       </div>
     </Panel>
   );
@@ -1771,3 +1807,4 @@ export default function ProjectLedger({ user, onSignOut }) {
     </div>
   );
 }
+
