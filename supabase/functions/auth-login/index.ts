@@ -58,11 +58,10 @@ Deno.serve(async (request) => {
     if (authUserError || !email) return json({ error: "Invalid username or password." }, 401);
 
     // The global Supabase Auth CAPTCHA setting must be disabled. This function
-    // performs the conditional verification above instead. Passing the token
-    // when enabled also keeps deployments working during the transition.
+    // performs the conditional verification above instead; passing the same
+    // token to Auth would verify a single-use hCaptcha response twice.
     const auth = createClient(url, anonKey, { auth: { persistSession: false } });
-    const authOptions = captchaEnabled ? { options: { captchaToken: String(captcha_token) } } : {};
-    const { data, error } = await auth.auth.signInWithPassword({ email, password: plainPassword, ...authOptions });
+    const { data, error } = await auth.auth.signInWithPassword({ email, password: plainPassword });
     if (error || !data.session) return json({ error: error?.message || "Invalid username or password." }, 401);
     return json({ session: data.session });
   } catch (error) {

@@ -59,7 +59,6 @@ Deno.serve(async (request) => {
       body: JSON.stringify({
         email: data.email,
         redirect_to: `${siteUrl}/reset-password`,
-        ...(captchaEnabled ? { captcha_token } : {}),
       }),
     });
     return json(genericResponse);
