@@ -56,7 +56,11 @@ Deno.serve(async (request) => {
     await fetch(`${url}/auth/v1/recover`, {
       method: "POST",
       headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ email: data.email, redirect_to: `${siteUrl}/reset-password` }),
+      body: JSON.stringify({
+        email: data.email,
+        redirect_to: `${siteUrl}/reset-password`,
+        ...(captchaEnabled ? { captcha_token } : {}),
+      }),
     });
     return json(genericResponse);
   } catch (_error) {
