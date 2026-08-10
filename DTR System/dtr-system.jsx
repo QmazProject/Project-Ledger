@@ -14,7 +14,7 @@ const SLOTS = [
 ];
 const MON = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const ADMIN_ID = "005582";
-const SCHED_DEF = { amStart: "08:00", amEnd: "12:00", pmStart: "13:00", pmEnd: "17:00" };
+const SCHED_DEF = { amStart: "08:00", amEnd: "11:00", pmStart: "13:00", pmEnd: "17:00" };
 const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF };
 
 /* ============================ helpers ============================ */
@@ -39,7 +39,14 @@ function parseTime(txt, merHint) {
   let h = +m[1];
   const mi = m[2] ? +m[2] : 0;
   if (h > 23 || mi > 59) return null;
-  const mer = m[3] ? (m[3][0] === "A" ? "AM" : "PM") : h <= 12 ? merHint : null;
+  /* The time input returns 24-hour values such as 12:19. A slot meridian
+     hint must not turn noon into 00:19, which makes AM out look earlier
+     than AM in. Only bare hour input needs the slot hint. */
+  const mer = m[3]
+    ? (m[3][0] === "A" ? "AM" : "PM")
+    : t.includes(":")
+      ? null
+      : h <= 12 ? merHint : null;
   if (mer === "PM" && h < 12) h += 12;
   if (mer === "AM" && h === 12) h = 0;
   return `${p2(h)}:${p2(mi)}`;
