@@ -514,6 +514,17 @@ function orderIssue(r, key, t) {
   return null;
 }
 
+/* Validate every filled punch after a proposed edit. Checking only the edited
+   value against the current neighbors can trap a user in an already-invalid
+   day: correcting AM in is blocked because the old AM out is still earlier. */
+function recordOrderIssue(r) {
+  for (const slot of SLOTS) {
+    const issue = orderIssue(r, slot.k, r[slot.k]);
+    if (issue) return issue;
+  }
+  return null;
+}
+
 /* regular hours are counted only inside the scheduled window, and capped at its length */
 const overlap = (a, b, lo, hi) => (!a || !b ? 0 : Math.max(0, Math.min(toMin(b), hi) - Math.max(toMin(a), lo)));
 const schedCap = (s) => Math.max(0, toMin(s.amEnd) - toMin(s.amStart)) + Math.max(0, toMin(s.pmEnd) - toMin(s.pmStart));
@@ -1355,7 +1366,8 @@ export default function DTRSystem({ onBack }) {
     if (cleared) { await writeRec(me.id, dateStr, (r) => { delete r[slot.k]; }); setEditing(null); return; }
     const t = parseTime(val, slot.mer);
     if (t === null) { say("Could not read that time"); return; }
-    const issue = orderIssue(recFor(me.id, dateStr), slot.k, t);
+    const candidate = { ...recFor(me.id, dateStr), [slot.k]: t };
+    const issue = recordOrderIssue(candidate);
     if (issue) { say(issue); return; }
     if ((slot.k === "pmOut" || slot.k === "otOut") && !note.trim()) {
       say("Write your accomplishment first"); return;
