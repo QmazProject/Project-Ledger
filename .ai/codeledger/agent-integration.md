@@ -10,4 +10,8 @@ Run `codeledger watch --agent codex` in a second terminal and leave it running w
 
 ## MCP tools
 
-Codex can call `codeledger_get_context`, `codeledger_find_symbol`, `codeledger_get_impact`, `codeledger_get_history`, `codeledger_get_recent_changes`, `codeledger_get_issues`, `codeledger_get_decisions`, `codeledger_record_change`, and `codeledger_mark_verified` during an ongoing conversation.
+Codex can call `codeledger_get_resume`, `codeledger_get_context`, `codeledger_find_symbol`, `codeledger_get_impact`, `codeledger_get_history`, `codeledger_get_recent_changes`, `codeledger_get_issues`, `codeledger_get_decisions`, `codeledger_record_change`, `codeledger_mark_verified`, `codeledger_get_session_state`, and `codeledger_record_checkpoint` during an ongoing conversation.
+
+## Continuing across sessions
+
+Call `codeledger_get_resume` at the start of a session and `codeledger_record_checkpoint` before it ends. The MCP server starts and ends its own session, so no setup is needed for this to work.

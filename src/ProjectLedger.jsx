@@ -1228,15 +1228,21 @@ function PasswordChangePanel({ onDone }) {
     if (password.length < 6 || password.length > 8) return setError("Password must be between 6 and 8 characters.");
     if (password !== confirm) return setError("Passwords do not match.");
     setBusy(true);
-    const { error: passwordError } = await supabase.auth.updateUser({ password });
-    if (!passwordError) {
+    // Supabase's normal client update enforces the configured weak-password
+    // check. This special flow is already limited to users with a temporary
+    // password, so complete it through the protected server-side operation.
+    const { data: passwordData, error: passwordError } = await supabase.functions.invoke("complete-password-change", {
+      body: { password },
+    });
+    const passwordMessage = passwordData?.error || passwordError?.message;
+    if (!passwordMessage) {
       const { error: profileError } = await supabase.rpc("complete_password_change");
       if (profileError) setError(profileError.message);
       else {
         setSuccess(true);
         window.setTimeout(onDone, 1800);
       }
-    } else setError(passwordError.message);
+    } else setError(passwordMessage);
     setBusy(false);
   };
   const field = { width: "100%", padding: "9px 11px", fontFamily: MONO, fontSize: 13, color: T.ink,

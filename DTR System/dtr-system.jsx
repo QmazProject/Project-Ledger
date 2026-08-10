@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, Fragment } from "react";
 import { supabase, isConfigured } from "../src/lib/supabase";
+import { WheelPicker, WheelPickerWrapper } from "@ncdai/react-wheel-picker";
+import "@ncdai/react-wheel-picker/style.css";
 
 /* ============================ constants ============================ */
 const SLOTS = [
@@ -195,7 +197,16 @@ function buildDtrPdf(o) {
 
   /* ---- signatures ---- */
   const sw = 160, sy = tBot - 46;
+  const sigScale = Math.min(1.5, Math.max(0.5, Number(o.signatureScale) || 1));
+  const sigX = (Number(o.signatureX) || 0) * 2.83465;
+  const sigY = (Number(o.signatureY) || 0) * 2.83465;
   [X0, X0 + (W - sw) / 2, X1 - sw].forEach((sx, i) => {
+    if (i === 0 && o.signature) {
+      const maxW = sw - 12, maxH = 27;
+      const sc = Math.min(maxW / o.signature.w, maxH / o.signature.h) * sigScale;
+      const iw = o.signature.w * sc, ih = o.signature.h * sc;
+      c.push(`q ${nf(iw)} 0 0 ${nf(ih)} ${nf(sx + (sw - iw) / 2 + sigX)} ${nf(sy + 3 + sigY)} cm /Im1 Do Q`);
+    }
     line(sx, sy, sx + sw, sy);
     ctext(sx + sw / 2, sy - 9, ["EMPLOYEE SIGNATURE", "SUPERVISOR / DEPT MANAGER", "GENERAL MANAGER"][i], 8, true);
   });
@@ -205,7 +216,7 @@ function buildDtrPdf(o) {
   const objs = [
     "<< /Type /Catalog /Pages 2 0 R >>",
     "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${nf(PW)} ${nf(PH)}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >>${o.logo ? " /XObject << /Im0 7 0 R >>" : ""} >> /Contents 4 0 R >>`,
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${nf(PW)} ${nf(PH)}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >>${o.logo || o.signature ? ` /XObject <<${o.logo ? " /Im0 7 0 R" : ""}${o.signature ? ` /Im1 ${o.logo ? 8 : 7} 0 R` : ""} >>` : ""} >> /Contents 4 0 R >>`,
     `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
@@ -214,6 +225,12 @@ function buildDtrPdf(o) {
     objs.push(
       `<< /Type /XObject /Subtype /Image /Width ${o.logo.w} /Height ${o.logo.h} /ColorSpace /DeviceRGB ` +
       `/BitsPerComponent 8 /Filter /DCTDecode /Length ${o.logo.bytes.length} >>\nstream\n${o.logo.bytes}\nendstream`
+    );
+  }
+  if (o.signature) {
+    objs.push(
+      `<< /Type /XObject /Subtype /Image /Width ${o.signature.w} /Height ${o.signature.h} /ColorSpace /DeviceRGB ` +
+      `/BitsPerComponent 8 /Filter /DCTDecode /Length ${o.signature.bytes.length} >>\nstream\n${o.signature.bytes}\nendstream`
     );
   }
   let pdf = "%PDF-1.4\n";
@@ -253,6 +270,229 @@ function scaleImage(file, max, mime, quality) {
   });
 }
 
+function SignatureEditor({ value, onSave, onRemove }) {
+  const canvasRef = useRef(null);
+  const drawing = useRef(false);
+  const last = useRef(null);
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width = 520;
+    canvas.height = 180;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (value) {
+      const img = new Image();
+      img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      img.src = value;
+    }
+    setDirty(false);
+  }, [value]);
+
+  const point = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * event.currentTarget.width,
+      y: ((event.clientY - rect.top) / rect.height) * event.currentTarget.height,
+    };
+  };
+  const start = (event) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drawing.current = true;
+    last.current = point(event);
+  };
+  const move = (event) => {
+    if (!drawing.current) return;
+    const next = point(event), ctx = event.currentTarget.getContext("2d");
+    ctx.strokeStyle = "#12233A";
+    ctx.lineWidth = 4;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(last.current.x, last.current.y);
+    ctx.lineTo(next.x, next.y);
+    ctx.stroke();
+    last.current = next;
+    setDirty(true);
+  };
+  const stop = () => { drawing.current = false; last.current = null; };
+  const clear = () => {
+    const canvas = canvasRef.current;
+    if (canvas) canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+    setDirty(true);
+  };
+
+  return (
+    <div className="signatureEditor">
+      <canvas
+        ref={canvasRef} className="signatureCanvas" aria-label="Draw signature"
+        onPointerDown={start} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop}
+      />
+      <div className="signatureActions">
+        <button className="btn ghost sm" type="button" onClick={clear}>Clear</button>
+        <button className="btn sm" type="button" disabled={!dirty} onClick={() => { onSave(canvasRef.current.toDataURL("image/png")); setDirty(false); }}>Save signature</button>
+        {value && <button className="btn ghost sm" type="button" onClick={onRemove}>Remove saved</button>}
+      </div>
+      <span className="hint">Draw above with a mouse, finger, or stylus, or upload a transparent PNG.</span>
+    </div>
+  );
+}
+
+function SignaturePlacementEditor({ value, x, y, scale, onSave }) {
+  const previewRef = useRef(null);
+  const interaction = useRef(null);
+  const [draft, setDraft] = useState({ x: Number(x) || 0, y: Number(y) || 0, scale: Number(scale) || 1 });
+  const PX_PER_MM = 4;
+
+  useEffect(() => {
+    setDraft({ x: Number(x) || 0, y: Number(y) || 0, scale: Number(scale) || 1 });
+  }, [value, x, y, scale]);
+
+  const start = (event, mode) => {
+    event.preventDefault();
+    event.stopPropagation();
+    previewRef.current.setPointerCapture(event.pointerId);
+    interaction.current = { mode, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, draft };
+  };
+  const move = (event) => {
+    const active = interaction.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    const dx = event.clientX - active.startX, dy = event.clientY - active.startY;
+    if (active.mode === "resize") {
+      setDraft((p) => ({ ...p, scale: Math.min(1.5, Math.max(0.5, active.draft.scale + dx / 180)) }));
+    } else {
+      setDraft({
+        ...active.draft,
+        x: Math.min(30, Math.max(-30, active.draft.x + dx / PX_PER_MM)),
+        y: Math.min(20, Math.max(-20, active.draft.y - dy / PX_PER_MM)),
+      });
+    }
+  };
+  const stop = (event) => {
+    if (interaction.current && interaction.current.pointerId === event.pointerId) interaction.current = null;
+  };
+  const save = () => onSave({
+    signatureX: Math.round(draft.x * 10) / 10,
+    signatureY: Math.round(draft.y * 10) / 10,
+    signatureScale: Math.round(draft.scale * 100) / 100,
+  });
+
+  return (
+    <div>
+      <div
+        ref={previewRef} className="signaturePlacementPreview"
+        onPointerMove={move} onPointerUp={stop} onPointerCancel={stop}
+      >
+        <div className="placementLine" />
+        <span className="placementLabel">EMPLOYEE SIGNATURE</span>
+        <div
+          className="placementObject"
+          style={{ left: `calc(50% + ${draft.x * PX_PER_MM}px)`, bottom: `${28 + draft.y * PX_PER_MM}px`, transform: `translateX(-50%) scale(${draft.scale})` }}
+          onPointerDown={(event) => start(event, "drag")}
+        >
+          <img src={value} alt="Signature placement preview" />
+          <button type="button" className="placementHandle" aria-label="Resize signature" onPointerDown={(event) => start(event, "resize")} />
+        </div>
+      </div>
+      <div className="signaturePlacementActions">
+        <span className="hint">Drag the signature. Drag the corner to resize.</span>
+        <button className="btn sm" type="button" onClick={save}>Save placement</button>
+      </div>
+    </div>
+  );
+}
+
+const WHEEL_ROW = 36;
+/* the ring is a cylinder: 360/WHEEL_VISIBLE is the angle per row, and a quarter of the
+   count is how many rows stay visible each side of centre. 16 gives 22.5deg steps and
+   four rows above/below, which is the curve an iOS picker shows. */
+const WHEEL_VISIBLE = 16;
+/* deceleration of a fling is dragSensitivity*10, so a low number coasts a long way */
+const WHEEL_DRAG = 2.5;
+/* a stepped move (tap a row, arrow key, mouse wheel) animates for sqrt(rows/this) seconds */
+const WHEEL_STEP = 12;
+const WHEEL_HOURS = Array.from({ length: 12 }, (_, i) => p2(i + 1));
+const WHEEL_MINUTES = Array.from({ length: 60 }, (_, i) => p2(i));
+const WHEEL_MERS = ["AM", "PM"];
+
+/* the tick you feel as each row passes the centre band */
+const wheelTick = () => { try { navigator.vibrate?.(8); } catch { /* unsupported */ } };
+
+function WheelColumn({ label, values, value, onChange, infinite = false }) {
+  const options = values.map((item) => ({ value: item, label: item }));
+  const change = (next) => { if (next !== value) wheelTick(); onChange(next); };
+  return (
+    <div className="wheelGroup">
+      <span className="wheelLabel">{label}</span>
+      <WheelPickerWrapper className="wheelColumn">
+        <WheelPicker
+          options={options} value={value} onValueChange={change}
+          infinite={infinite} visibleCount={WHEEL_VISIBLE} optionItemHeight={WHEEL_ROW}
+          dragSensitivity={WHEEL_DRAG} scrollSensitivity={WHEEL_STEP}
+        />
+      </WheelPickerWrapper>
+    </div>
+  );
+}
+
+/* "13:45" -> the three wheel positions, and back again */
+const toWheelParts = (hm) => {
+  const [rawHour, rawMinute] = String(hm).split(":").map(Number);
+  const h = Number.isFinite(rawHour) ? rawHour : 0;
+  return { hour: p2(h % 12 || 12), minute: p2(Number.isFinite(rawMinute) ? rawMinute : 0), mer: h >= 12 ? "PM" : "AM" };
+};
+const fromWheelParts = ({ hour, minute, mer }) => {
+  let h = Number(hour) % 12;
+  if (mer === "PM") h += 12;
+  return `${p2(h)}:${minute}`;
+};
+
+function TimeWheelPicker({ value, onConfirm, onCancel }) {
+  const initial = value || nowHM();
+  /* one piece of state for the three columns: a fling settling on one wheel can fire
+     while another is still moving, and separate states would write back stale siblings */
+  const [parts, setParts] = useState(() => toWheelParts(initial));
+  /* only holds what was typed while it is still incomplete; the wheels are the source
+     of truth the rest of the time */
+  const [typed, setTyped] = useState(null);
+  const manual = typed ?? fromWheelParts(parts);
+  const setPart = (key) => (next) => {
+    setParts((prev) => (prev[key] === next ? prev : { ...prev, [key]: next }));
+    setTyped(null);
+  };
+  const changeManual = (event) => {
+    const next = event.target.value;
+    const [rawHour, rawMinute] = next.split(":").map(Number);
+    if (!/^\d{1,2}:\d{2}$/.test(next) || rawHour > 23 || rawMinute > 59) { setTyped(next); return; }
+    setParts(toWheelParts(next));
+    setTyped(null);
+  };
+  const confirm = () => {
+    onConfirm(manual || fromWheelParts(parts));
+  };
+  return (
+    <div className="wheelPicker" tabIndex={-1} onKeyDown={(e) => { if (e.key === "Enter") confirm(); if (e.key === "Escape") onCancel(); }}>
+      <label className="manualTimeLabel">Type a time
+        <input type="time" inputMode="numeric" step="60" value={manual} onChange={changeManual} />
+      </label>
+      <div className="wheelColumns">
+        <WheelColumn label="Hour" values={WHEEL_HOURS} value={parts.hour} onChange={setPart("hour")} infinite />
+        <span className="wheelSeparator" aria-hidden="true">:</span>
+        <WheelColumn label="Minute" values={WHEEL_MINUTES} value={parts.minute} onChange={setPart("minute")} infinite />
+        {/* AM/PM stops at both ends: looping two options would repeat them around the
+            ring, and the picker snaps back to the first copy of whatever is selected */}
+        <WheelColumn label="AM / PM" values={WHEEL_MERS} value={parts.mer} onChange={setPart("mer")} />
+      </div>
+      <div className="wheelActions">
+        <button type="button" onClick={onCancel}>Cancel</button>
+        <button type="button" className="pri" onClick={confirm}>Save</button>
+      </div>
+    </div>
+  );
+}
+
 /* a punch can't fall before the last one recorded or after the next one */
 function orderIssue(r, key, t) {
   const i = SLOTS.findIndex((s) => s.k === key);
@@ -288,6 +528,19 @@ function dayMinutes(r, sched) {
 }
 const otMinutes = (r) => (r.otIn && r.otOut ? Math.max(0, toMin(r.otOut) - toMin(r.otIn)) : 0);
 
+/* The screen always works these out live, so what you see is never a stale number. They are
+   also written onto the stored day so the totals sit in Supabase next to the punches that
+   produced them. Returns true when the stamp actually changed anything. */
+function stampTotals(rec, sched) {
+  const dm = dayMinutes(rec, sched), om = otMinutes(rec), credit = fmtDay(dm, schedCap(sched));
+  if (rec.dayMinutes === dm && rec.otMinutes === om && rec.dayCredit === credit) return false;
+  rec.dayMinutes = dm;
+  rec.otMinutes = om;
+  rec.dayCredit = credit;
+  rec.totalsAt = new Date().toISOString();
+  return true;
+}
+
 /* payroll periods run 28 -> 12 and 13 -> 27 */
 function periodOf(d) {
   const y = d.getFullYear(), m = d.getMonth(), day = d.getDate();
@@ -302,33 +555,154 @@ const logKey = (id, y) => `dtr:log:${id}:${y}`;
 
 /* storage — DTR data stays in its own table and never shares Project Ledger rows */
 const DTR_STORAGE_TABLE = "dtr_storage_dtr";
+
+/* Every value is mirrored on the device before it is sent up, so a punch survives a
+   dropped connection instead of vanishing. Keys that have not reached the cloud yet are
+   remembered in PENDING_KEY and pushed again once the browser is back online. */
+const LOCAL_PREFIX = "dtr.local.";
+const PENDING_KEY = "dtr.pending";
+const lsGet = (key, fb) => {
+  try { const raw = window.localStorage.getItem(LOCAL_PREFIX + key); return raw === null ? fb : JSON.parse(raw); }
+  catch { return fb; }
+};
+const lsSet = (key, val) => {
+  try { window.localStorage.setItem(LOCAL_PREFIX + key, JSON.stringify(val)); return true; }
+  catch { return false; }
+};
+const pendingKeys = () => { const v = lsGet(PENDING_KEY, []); return Array.isArray(v) ? v : []; };
+const markPending = (key, yes) => {
+  const next = pendingKeys().filter((k) => k !== key);
+  if (yes) next.push(key);
+  lsSet(PENDING_KEY, next);
+};
+
+const cloudReady = () => isConfigured && !!supabase;
+async function cloudPut(key, val) {
+  const { error } = await supabase.from(DTR_STORAGE_TABLE).upsert({ storage_key: key, payload: val }, { onConflict: "storage_key" });
+  return !error;
+}
+
 async function sGet(key, fb) {
-  let cloudMissing = false;
-  if (isConfigured && supabase) {
+  /* a key still waiting to sync is newer on this device than in the cloud — reading the
+     cloud copy over it would throw away whatever was punched while offline */
+  if (pendingKeys().includes(key)) return lsGet(key, fb);
+  if (cloudReady()) {
     try {
       const { data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload").eq("storage_key", key).maybeSingle();
-      if (!error && data) return data.payload;
-      cloudMissing = !error;
-    } catch (e) { /* use platform storage below */ }
+      if (!error && data) { lsSet(key, data.payload); return data.payload; }
+      if (!error) {
+        /* nothing stored yet: seed the cloud from whatever this device already has */
+        const local = lsGet(key, fb);
+        await cloudPut(key, local);
+        return local;
+      }
+    } catch { /* fall through to the device copy */ }
   }
-  try {
-    const r = await window.storage.get(key, true);
-    const value = r && r.value ? JSON.parse(r.value) : fb;
-    if (cloudMissing && isConfigured && supabase) {
-      await supabase.from(DTR_STORAGE_TABLE).upsert({ storage_key: key, payload: value }, { onConflict: "storage_key" });
-    }
-    return value;
-  } catch (e) { return fb; }
+  return lsGet(key, fb);
 }
+
+/* "synced" = in the cloud, "local" = safe on this device but not sent yet, "fail" = nowhere */
 async function sSet(key, val) {
-  if (isConfigured && supabase) {
+  const savedLocally = lsSet(key, val);
+  if (cloudReady()) {
     try {
-      const { error } = await supabase.from(DTR_STORAGE_TABLE).upsert({ storage_key: key, payload: val }, { onConflict: "storage_key" });
-      if (!error) return true;
-    } catch (e) { /* use platform storage below */ }
+      if (await cloudPut(key, val)) { markPending(key, false); return "synced"; }
+    } catch { /* keep the device copy and retry later */ }
   }
-  try { const r = await window.storage.set(key, JSON.stringify(val), true); return !!r; }
-  catch (e) { return false; }
+  if (!savedLocally) return "fail";
+  markPending(key, true);
+  return "local";
+}
+
+/* push anything that was written while the cloud was unreachable */
+async function flushPending() {
+  if (!cloudReady()) return;
+  for (const key of pendingKeys()) {
+    const val = lsGet(key, null);
+    if (val === null) { markPending(key, false); continue; }
+    try { if (await cloudPut(key, val)) markPending(key, false); else break; }
+    catch { break; }
+  }
+}
+
+/* ---- passcodes ----
+   An ID number is not a secret: coworkers know each other's. The passcode is what proves
+   who is punching. It is never stored in the clear, and never leaves this file as plain
+   text. PBKDF2 rather than a bare digest because the roster row holding the hash is
+   readable by anyone with the public key, so the work factor is the only thing standing
+   between a leaked hash and a six-digit code. */
+const PIN_ITER = 210000;
+const PIN_MIN = 4;
+const subtleCrypto = () => (typeof window !== "undefined" && window.crypto && window.crypto.subtle) || null;
+const b64 = (buf) => window.btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+async function derivePin(pin, saltB64, iter) {
+  const sub = subtleCrypto();
+  if (!sub) return null;
+  const salt = Uint8Array.from(window.atob(saltB64), (c) => c.charCodeAt(0));
+  const key = await sub.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveBits"]);
+  const bits = await sub.deriveBits({ name: "PBKDF2", salt, iterations: iter, hash: "SHA-256" }, key, 256);
+  return b64(bits);
+}
+async function makePin(pin) {
+  const salt = window.crypto.getRandomValues(new Uint8Array(16));
+  const pinSalt = b64(salt);
+  const pinHash = await derivePin(pin, pinSalt, PIN_ITER);
+  if (!pinHash) return null;
+  return { pinSalt, pinHash, pinIter: PIN_ITER };
+}
+const hasPin = (e) => !!(e && e.pinHash && e.pinSalt);
+async function verifyPin(pin, emp) {
+  if (!hasPin(emp)) return false;
+  const got = await derivePin(pin, emp.pinSalt, Number(emp.pinIter) || PIN_ITER);
+  if (!got || got.length !== emp.pinHash.length) return false;
+  /* compare every character, so a wrong passcode does not fail faster the earlier it differs */
+  let diff = 0;
+  for (let i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ emp.pinHash.charCodeAt(i);
+  return diff === 0;
+}
+
+/* A wrong passcode costs time, so guessing a six-digit code stops being practical. The
+   counter lives on the device, so it slows a person at the kiosk rather than someone
+   scripting against the database — that gap is what the RLS notes in the migration cover. */
+const LOCK_KEY = "dtr.attempts";
+const LOCK_AFTER = 5;
+const LOCK_MINUTES = 5;
+const lockState = (id) => { const all = lsGet(LOCK_KEY, {}) || {}; return all[id] || { n: 0, until: 0 }; };
+const lockSet = (id, val) => { const all = lsGet(LOCK_KEY, {}) || {}; if (val) all[id] = val; else delete all[id]; lsSet(LOCK_KEY, all); };
+const lockedFor = (id) => { const s = lockState(id); return s.until > Date.now() ? Math.ceil((s.until - Date.now()) / 60000) : 0; };
+const noteBadPin = (id) => {
+  const s = lockState(id);
+  const n = s.n + 1;
+  lockSet(id, n >= LOCK_AFTER ? { n: 0, until: Date.now() + LOCK_MINUTES * 60000 } : { n, until: 0 });
+  return n >= LOCK_AFTER ? 0 : LOCK_AFTER - n;
+};
+
+/* Which years this employee has records in. Read-only on purpose: sGet seeds the cloud
+   with a fallback when a key is missing, so probing year by year would leave an empty row
+   behind for every year it looked at. One key listing plus the device copies is enough. */
+async function storedLogYears(id) {
+  const years = new Set();
+  const take = (key) => {
+    const head = `dtr:log:${id}:`;
+    if (!key.startsWith(head)) return;
+    const y = Number(key.slice(head.length));
+    if (Number.isInteger(y) && y > 1970) years.add(y);
+  };
+  try {
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const raw = window.localStorage.key(i);
+      if (raw && raw.startsWith(LOCAL_PREFIX)) take(raw.slice(LOCAL_PREFIX.length));
+    }
+  } catch { /* private mode: the cloud listing below still answers */ }
+  if (cloudReady()) {
+    try {
+      const { data, error } = await supabase
+        .from(DTR_STORAGE_TABLE).select("storage_key").like("storage_key", "dtr:log:%");
+      if (!error && data) data.forEach((row) => take(row.storage_key || ""));
+    } catch { /* offline: the device copies stand in */ }
+  }
+  return [...years].sort((a, b) => a - b);
 }
 
 /* ============================ styles ============================ */
@@ -468,9 +842,27 @@ const CSS = `
 .qm .logoPrev{width:92px;height:92px;border:1.5px solid var(--ink);background:#fff;display:grid;place-items:center;flex:none;overflow:hidden}
 .qm .logoPrev img{max-width:100%;max-height:100%;object-fit:contain}
 .qm .logoPrev .none{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--zinc-dk);text-align:center;padding:6px}
+.qm .signatureList{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:12px}
+.qm .signatureCard{border:1.5px solid var(--zinc-dk);padding:12px;background:#fff}
+.qm .signatureCard h4{font-family:var(--disp);font-size:18px;text-transform:uppercase;margin:0 0 2px}
+.qm .signatureCard p{font-size:11px;color:var(--ink-soft);margin:0 0 9px}
+.qm .signatureCanvas{display:block;width:100%;height:106px;border:1.5px dashed var(--zinc-dk);background:repeating-linear-gradient(0deg,#fff,#fff 25px,#f5f7f8 26px);touch-action:none;cursor:crosshair}
+.qm .signatureActions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.qm .signatureActions .btn:disabled{opacity:.45;cursor:not-allowed}
+.qm .signatureEditor>.hint{display:block;margin-top:7px}
+.qm .signaturePlacementPreview{position:relative;height:150px;margin-top:12px;border:1.5px solid var(--zinc-dk);background:#fff;overflow:hidden;touch-action:none}
+.qm .placementLine{position:absolute;left:10%;right:10%;bottom:28px;border-top:1.5px solid var(--ink)}
+.qm .placementLabel{position:absolute;left:0;right:0;bottom:9px;text-align:center;font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--ink)}
+.qm .placementObject{position:absolute;width:150px;height:55px;cursor:grab;touch-action:none;z-index:2}
+.qm .placementObject:active{cursor:grabbing}
+.qm .placementObject img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
+.qm .placementHandle{position:absolute;right:-6px;bottom:-6px;width:18px;height:18px;border:2px solid #fff;background:var(--hivis);box-shadow:0 0 0 1.5px var(--ink);border-radius:50%;padding:0;cursor:nwse-resize;touch-action:none}
+.qm .signaturePlacementActions{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:8px}
 .qm .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;max-width:640px}
 .qm .grid3 input{width:100%;border:1.5px solid var(--zinc-dk);padding:8px 9px;font-size:14px;font-family:var(--body)}
 .qm .banner{background:var(--rust);color:#fff;padding:10px 14px;font-size:13px;margin-bottom:16px}
+/* waiting to sync is not an error: the punch is safe, it just has not travelled yet */
+.qm .banner.warn{background:var(--hivis);color:var(--ink)}
 .qm .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:26px;z-index:60;background:var(--ink);color:#fff;padding:13px 22px;border-left:5px solid var(--hivis);font-family:var(--disp);font-size:19px;letter-spacing:.06em;text-transform:uppercase;box-shadow:0 8px 26px rgba(18,35,58,.3);max-width:88vw}
 .qm .modal{position:fixed;inset:0;background:rgba(18,35,58,.55);display:grid;place-items:center;z-index:70;padding:20px}
 .qm .modal .box{background:#fff;border:1.5px solid var(--ink);padding:24px;width:min(380px,100%)}
@@ -481,8 +873,78 @@ const CSS = `
 .qm .modal .row button{flex:1;padding:11px;font-family:var(--disp);font-size:16px;letter-spacing:.08em;text-transform:uppercase;border:1.5px solid var(--ink);background:#fff;color:var(--ink)}
 .qm .modal .row button.pri{background:var(--ink);color:#fff}
 .qm .modal .row button.del{border-color:var(--rust);color:var(--rust)}
+.qm .wheelPicker{outline:none}
+/* the field gets the full width of the box so the whole value, AM/PM included, stays visible */
+.qm .manualTimeLabel{display:grid;grid-template-columns:1fr;gap:6px;font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft)}
+.qm .manualTimeLabel input{width:100%;min-height:52px;font-size:26px;font-weight:700;letter-spacing:.04em;text-align:center;padding:6px 10px;border:1.5px solid var(--ink);font-family:var(--mono);color:var(--ink);background:#fff}
+/* the clock button that opens the browser's own dropdown is dropped — the wheels below
+   are the picker, and two of them fighting over the same value is just confusing */
+.qm .manualTimeLabel input::-webkit-calendar-picker-indicator{display:none;-webkit-appearance:none}
+.qm .wheelColumns{display:grid;grid-template-columns:minmax(0,1fr) 16px minmax(0,1fr) minmax(0,.9fr);gap:6px;align-items:stretch;margin:14px 0 20px}
+.qm .wheelGroup{position:relative;min-width:0;text-align:center}
+/* the padding matches the label block above each wheel, so the colon centres on the
+   selected row however tall the wheel ends up */
+.qm .wheelSeparator{display:flex;align-items:center;justify-content:center;padding-top:19px;color:var(--ink);font:700 24px/1 var(--mono)}
+.qm .wheelGroup:after{display:none}
+.qm .wheelLabel{display:block;font-size:10px;line-height:14px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:5px}
+/* heights come from the picker itself (optionItemHeight and the ring geometry) — pinning
+   them here throws off the row hit-testing, which is measured against the column box */
+.qm .wheelColumn{overscroll-behavior:contain;touch-action:none;cursor:grab;user-select:none}
+.qm .wheelColumn:active{cursor:grabbing}
+.qm .wheelColumn [data-rwp]{cursor:grab}
+.qm .wheelColumn [data-rwp]:active{cursor:grabbing}
+.qm .wheelColumn [data-rwp-option],.qm .wheelColumn [data-rwp-highlight-item]{font-family:var(--mono);font-size:21px;color:var(--zinc-dk)}
+.qm .wheelColumn [data-rwp-highlight-wrapper]{border-top:1.5px solid var(--hivis);border-bottom:1.5px solid var(--hivis);background:#fff;font-weight:700;color:var(--ink);z-index:2}
+.qm .wheelColumn [data-rwp-highlight-item]{color:var(--ink)!important}
+.qm .wheelActions{display:flex;gap:8px;margin-top:10px}
+.qm .wheelActions button{flex:1;padding:11px;font-family:var(--disp);font-size:16px;letter-spacing:.08em;text-transform:uppercase;border:1.5px solid var(--ink);background:#fff;color:var(--ink)}
+.qm .wheelActions button.pri{background:var(--ink);color:#fff}
 .qm .sheetwrap{background:var(--zinc-dk);padding:20px;overflow-x:auto}
 .qm .shadow{box-shadow:0 6px 24px rgba(18,35,58,.22)}
+@media(max-width:600px){
+  .qm{padding:10px 8px 38px;font-size:14px}
+  .qm .top{gap:9px;padding-bottom:9px;margin-bottom:14px}
+  .qm .mark{width:30px;height:30px;font-size:17px}
+  .qm .brand{font-size:19px}
+  .qm .brand small{font-size:9px;letter-spacing:.11em}
+  .qm .clock{width:100%;font-size:11px;padding-left:39px;margin-top:-3px}
+  .qm .nav{width:100%;margin-left:0;gap:5px}
+  .qm .nav button{flex:1 1 auto;min-height:44px;padding:8px 7px;font-size:12px;letter-spacing:.04em}
+  .qm .nav button.out{flex-basis:100%;order:-1;background:var(--rust);color:#fff;border-color:var(--rust)}
+  .qm .card{padding:14px}
+  .qm .lockL{padding:18px 14px;gap:15px}
+  .qm .lockR{padding:15px}
+  .qm .pinbox{font-size:32px}
+  .qm .whohd{gap:10px;margin-bottom:14px;padding-bottom:11px}
+  .qm .whohd h2{font-size:27px}
+  .qm .datepick{width:100%;text-align:left}
+  .qm .dprow{width:100%}
+  .qm .dpbtn{flex:1;min-width:0;min-height:44px}
+  .qm .dptoday{min-height:44px}
+  .qm .strip{grid-template-columns:repeat(2,1fr);margin-bottom:14px}
+  .qm .slot{min-height:82px;padding:10px 5px 12px}
+  .qm .slot .v{font-size:16px}
+  .qm .act{gap:12px}
+  .qm .big{min-height:78px;padding:18px 14px;font-size:25px}
+  .qm .ot{min-height:48px;font-size:16px}
+  .qm textarea.note{min-height:110px}
+  .qm .sheetwrap{margin:0 -14px;padding:10px 8px}
+  .qm .sheet{min-width:700px}
+  .qm .ctl{gap:8px}
+  .qm .ctl select,.qm .ctl input,.qm .btn{min-height:44px}
+  .qm .signatureList{grid-template-columns:1fr}
+  .qm .signatureCanvas{height:112px}
+  .qm .signatureActions .btn{min-height:44px}
+  .qm .signatureCard > .btn{min-height:44px}
+  .qm .signaturePlacementPreview{height:160px}
+  .qm .signaturePlacementActions .btn{min-height:44px}
+  .qm .modal{padding:10px}
+  .qm .modal .box{padding:18px 14px;width:min(420px,100%)}
+  .qm .wheelColumns{grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) minmax(0,.9fr);gap:3px}
+  .qm .wheelColumn [data-rwp-option],.qm .wheelColumn [data-rwp-highlight-item]{font-size:19px}
+  .qm table.roster{display:block;overflow-x:auto;white-space:nowrap}
+  .qm table.roster th,.qm table.roster td{white-space:normal}
+}
 @media (prefers-reduced-motion:reduce){.qm *{transition:none!important}}
 `;
 
@@ -518,7 +980,10 @@ const SHEET_CSS = `
 .sheet .dtr input:focus,.sheet .dtr .cell:focus{background:#FFF3D0;outline:none}
 .sheet .sig{margin-top:13mm}
 .sheet .sig td{font-size:8pt;text-align:center;font-weight:bold;letter-spacing:0.3pt;padding-top:1.2mm}
-.sheet .sig td.ln{border-top:0.9pt solid #000}
+.sheet .sig td.ln{border-top:0.9pt solid #000;position:relative;overflow:visible;isolation:isolate}
+.sheet .sig td.ln .sigStack{position:relative;display:block;isolation:isolate;z-index:1}
+.sheet .sig td.ln .siglabel{position:relative;z-index:1}
+.sheet .sig td.ln .sigimg{position:absolute;left:calc(50% + var(--sig-x, 0mm));bottom:calc(-1mm + var(--sig-y, 0mm));z-index:10;transform:translateX(-50%) scale(var(--sig-scale, 1));max-width:42mm;max-height:13mm;object-fit:contain;pointer-events:none}
 .sheet .sig td.sp{border:none;width:7mm}
 `;
 
@@ -534,6 +999,47 @@ const PRINT_CSS = `
 `;
 
 /* ============================ component ============================ */
+/* Setting a passcode and an admin resetting one are the same form with one difference:
+   proving you know the old one. Admins skip that step because the reason they are here is
+   usually that the employee cannot. */
+function PasscodeForm({ emp, mode, onSave, say }) {
+  const [cur, setCur] = useState("");
+  const [next, setNext] = useState("");
+  const [again, setAgain] = useState("");
+  const [busy, setBusy] = useState(false);
+  const needsCurrent = mode === "self" && hasPin(emp);
+
+  const submit = async () => {
+    if (!subtleCrypto()) { say("This browser cannot store a passcode securely. Open the site over https."); return; }
+    if (next.length < PIN_MIN) { say(`Use at least ${PIN_MIN} digits`); return; }
+    if (next !== again) { say("The two passcodes do not match"); return; }
+    setBusy(true);
+    try {
+      if (needsCurrent && !(await verifyPin(cur, emp))) { say("Your current passcode is not right"); return; }
+      const fields = await makePin(next);
+      if (!fields) { say("Could not set the passcode"); return; }
+      onSave(fields);
+      setCur(""); setNext(""); setAgain("");
+      say(mode === "self" ? "Passcode saved" : `Passcode reset for ${emp.name || emp.id}`);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="grid3" style={{ alignItems: "end" }}>
+      {needsCurrent && (
+        <div><span className="lbl">Current passcode</span>
+          <input type="password" inputMode="numeric" autoComplete="current-password" value={cur} onChange={(e) => setCur(e.target.value)} /></div>
+      )}
+      <div><span className="lbl">New passcode</span>
+        <input type="password" inputMode="numeric" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} /></div>
+      <div><span className="lbl">Repeat it</span>
+        <input type="password" inputMode="numeric" autoComplete="new-password" value={again} onChange={(e) => setAgain(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }} /></div>
+      <div><button className="btn" disabled={busy} onClick={submit}>{busy ? "Saving…" : (hasPin(emp) ? "Change passcode" : "Set passcode")}</button></div>
+    </div>
+  );
+}
+
 export default function DTRSystem({ onBack }) {
   const [ready, setReady] = useState(false);
   const [view, setView] = useState("lock");
@@ -549,25 +1055,53 @@ export default function DTRSystem({ onBack }) {
   const [confirm, setConfirm] = useState(null);
   const [calMonth, setCalMonth] = useState(() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); });
   const [perStart, setPerStart] = useState(iso(periodOf(new Date()).s));
+  /* years this employee has stored records in — drives how far the period list reaches back */
+  const [logYears, setLogYears] = useState([]);
+  /* sign-in is two steps: "id" names the employee, "pin" proves it is them */
+  const [stage, setStage] = useState("id");
+  const [pending, setPending] = useState(null);
+  const [actor, setActor] = useState(null);
+  /* id of the employee whose passcode an admin is currently resetting */
+  const [resetting, setResetting] = useState("");
+  /* an admin looking at somebody else's DTR reads it and prints it, but changes nothing */
+  const [viewOnly, setViewOnly] = useState(false);
   const [site, setSite] = useState("");
   const [editing, setEditing] = useState(null);
   const [toast, setToast] = useState("");
   const [flash, setFlash] = useState("");
-  const [storeFail, setStoreFail] = useState(false);
+  /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
+  const [saveState, setSaveState] = useState("synced");
   const [clock, setClock] = useState(new Date());
   const [tickN, forceTick] = useState(0);
 
   const logsRef = useRef({});
   const sheetRef = useRef(null);
+  const pinRef = useRef(null);
   const timers = useRef({});
   const firstRun = useRef(true);
 
   const bump = () => forceTick((n) => n + 1);
   const sched = cfg.sched || SCHED_DEF;
   /* settings stay open while nobody is set up yet, so the system can be bootstrapped */
-  const isAdmin = !roster.some((r) => r.id) || !!(me && me.role === "admin");
+  /* while browsing someone else's DTR, `me` is the employee being read — the admin who
+     signed in is `actor`, and it is their role that still decides what is allowed */
+  const actorEmp = viewOnly ? actor : me;
+  const isAdmin = !roster.some((r) => r.id) || !!(actorEmp && actorEmp.role === "admin");
+  const canEdit = !viewOnly;
   const say = useCallback((m) => { setToast(m); setTimeout(() => setToast(""), 2800); }, []);
   const flashSaved = (which) => { setFlash(which); setTimeout(() => setFlash(""), 1400); };
+
+  /* ---- anything punched while the cloud was unreachable goes up on reconnect ---- */
+  useEffect(() => {
+    let alive = true;
+    const sync = async () => {
+      await flushPending();
+      if (alive) setSaveState(pendingKeys().length ? "local" : "synced");
+    };
+    sync();
+    window.addEventListener("online", sync);
+    return () => { alive = false; window.removeEventListener("online", sync); };
+  }, []);
 
   /* ---- boot ---- */
   useEffect(() => {
@@ -581,7 +1115,7 @@ export default function DTRSystem({ onBack }) {
       if (withRoles.length && !withRoles.some((e) => e.role === "admin")) {
         withRoles[Math.max(0, withRoles.findIndex((e) => e.id === ADMIN_ID))].role = "admin";
       }
-      setRoster(withRoles.length ? withRoles : [{ id: "", name: "", position: "", site: "", photo: "", role: "admin" }]);
+      setRoster(withRoles.length ? withRoles : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", role: "admin" }]);
       setCfg(Object.assign({}, DEF, c || {}));
       setView(rr.length ? "lock" : "settings");
       setReady(true);
@@ -591,19 +1125,28 @@ export default function DTRSystem({ onBack }) {
 
   useEffect(() => { const t = setInterval(() => setClock(new Date()), 1000); return () => clearInterval(t); }, []);
 
+  useEffect(() => {
+    if (view !== "lock") return undefined;
+    const t = setTimeout(() => pinRef.current?.focus(), 0);
+    return () => clearTimeout(t);
+  }, [view]);
+
   /* ---- auto-save roster + header ---- */
   useEffect(() => {
     if (!ready) return;
     clearTimeout(timers.current.roster);
     timers.current.roster = setTimeout(async () => {
       const keep = roster
-        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", role: e.role === "admin" ? "admin" : "viewer" }))
+        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", signature: e.signature || "", signatureX: Number(e.signatureX) || 0, signatureY: Number(e.signatureY) || 0, signatureScale: Number(e.signatureScale) || 1, role: e.role === "admin" ? "admin" : "viewer",
+           /* carried through explicitly: dropping these on an unrelated roster edit would
+              silently unlock every account that had a passcode */
+           pinHash: e.pinHash || "", pinSalt: e.pinSalt || "", pinIter: Number(e.pinIter) || 0 }))
         .filter((e) => e.id || e.name);
       const ids = keep.map((e) => e.id).filter(Boolean);
       if (new Set(ids).size !== ids.length) { say("Two employees share the same ID"); return; }
-      const ok = await sSet("dtr:roster", keep);
-      setStoreFail(!ok);
-      if (ok) flashSaved("roster");
+      const state = await sSet("dtr:roster", keep);
+      setSaveState(state);
+      if (state !== "fail") flashSaved("roster");
     }, 600);
   }, [roster, ready, say]);
 
@@ -612,16 +1155,29 @@ export default function DTRSystem({ onBack }) {
     if (firstRun.current) { firstRun.current = false; return; }
     clearTimeout(timers.current.cfg);
     timers.current.cfg = setTimeout(async () => {
-      const ok = await sSet("dtr:cfg", cfg);
-      setStoreFail(!ok);
-      if (ok) flashSaved("cfg");
+      const state = await sSet("dtr:cfg", cfg);
+      setSaveState(state);
+      if (state !== "fail") flashSaved("cfg");
     }, 500);
   }, [cfg, ready]);
 
   /* ---- log access ---- */
-  const ensureLog = useCallback(async (id, y) => {
+  /* sched is passed in rather than closed over so this keeps a stable identity and the
+     effects that depend on it do not re-run every time the header config changes */
+  const ensureLog = useCallback(async (id, y, workSched) => {
     const k = logKey(id, y);
-    if (!logsRef.current[k]) { logsRef.current[k] = await sGet(k, {}); bump(); }
+    if (!logsRef.current[k]) {
+      const log = await sGet(k, {});
+      /* re-stamp the whole year on load: this is what quietly brings stored totals back in
+         line after an admin edits the work schedule, with no bulk migration */
+      let changed = false;
+      Object.keys(log).forEach((ds) => { if (stampTotals(log[ds], workSched || SCHED_DEF)) changed = true; });
+      logsRef.current[k] = log;
+      bump();
+      /* no banner for this one: it is a recalculation, not something the user typed. If it
+         cannot reach the cloud it waits in the device copy and the reconnect flush sends it. */
+      if (changed) await sSet(k, log);
+    }
     return logsRef.current[k];
   }, []);
   const recFor = (id, dateStr) => {
@@ -629,38 +1185,80 @@ export default function DTRSystem({ onBack }) {
     return (logsRef.current[k] || {})[dateStr] || {};
   };
   const writeRec = async (id, dateStr, mut) => {
+    /* every punch, edit, note and leave mark funnels through here, so read-only is
+       enforced once rather than at each of the dozen places that can start a write */
+    if (viewOnly) return false;
     const y = +dateStr.slice(0, 4), k = logKey(id, y);
     logsRef.current[k] = logsRef.current[k] || {};
     logsRef.current[k][dateStr] = logsRef.current[k][dateStr] || {};
     mut(logsRef.current[k][dateStr]);
+    stampTotals(logsRef.current[k][dateStr], sched);
     bump();
-    const ok = await sSet(k, logsRef.current[k]);
-    setStoreFail(!ok);
-    return ok;
+    const state = await sSet(k, logsRef.current[k]);
+    setSaveState(state);
+    return state !== "fail";
   };
 
-  /* ---- sign in ---- */
-  const match = roster.find((r) => r.id && r.id === pin.trim());
-  async function signIn() {
-    const id = pin.trim();
-    if (!id) return;
-    const emp = roster.find((r) => r.id === id);
-    if (!emp) {
-      setLockMsg(roster.some((r) => r.id)
-        ? `No employee with ID ${id}. Check the number, or add them under Settings.`
-        : "Nobody is set up yet. Open Settings and add your team first.");
-      return;
-    }
-    await ensureLog(emp.id, new Date().getFullYear());
+  /* ---- sign in ----
+     Two steps: the ID says who you claim to be, the passcode proves it. The ID step still
+     shows the name and photo, so a mistyped number is caught before anyone hunts for a
+     passcode that was never going to match. */
+  const match = stage === "id" ? roster.find((r) => r.id && r.id === pin.trim()) : pending;
+
+  async function openEmp(emp, readOnly, byActor) {
+    await ensureLog(emp.id, new Date().getFullYear(), sched);
     setMe(emp);
+    setViewOnly(!!readOnly);
+    setActor(readOnly ? (byActor || actorEmp) : null);
+    setPerStart(iso(periodOf(new Date()).s));
     setSite(emp.site || "");
     setPunchDate(iso(new Date()));
     setNote(recFor(emp.id, iso(new Date())).note || "");
     setLockMsg("");
     setPin("");
-    setView("punch");
+    setStage("id");
+    setPending(null);
+    setView(readOnly ? "dtr" : "punch");
   }
-  function signOut() { setMe(null); setPin(""); setLockMsg(""); setView("lock"); }
+
+  async function signIn() {
+    const typed = pin.trim();
+    if (!typed) return;
+
+    if (stage === "id") {
+      const emp = roster.find((r) => r.id === typed);
+      if (!emp) {
+        setLockMsg(roster.some((r) => r.id)
+          ? `No employee with ID ${typed}. Check the number, or add them under Settings.`
+          : "Nobody is set up yet. Open Settings and add your team first.");
+        return;
+      }
+      /* a roster from before passcodes existed would lock everybody out if this demanded
+         one, so an account without a passcode still opens — and is asked to set one */
+      if (!hasPin(emp)) { await openEmp(emp, false); if (subtleCrypto()) say("Set a passcode in Settings so only you can open this ID"); return; }
+      const wait = lockedFor(emp.id);
+      if (wait) { setLockMsg(`Too many wrong passcodes. Try again in ${wait} minute${wait === 1 ? "" : "s"}.`); return; }
+      setPending(emp);
+      setStage("pin");
+      setPin("");
+      setLockMsg("");
+      return;
+    }
+
+    const emp = pending;
+    if (!emp) { setStage("id"); setPin(""); return; }
+    const wait = lockedFor(emp.id);
+    if (wait) { setLockMsg(`Too many wrong passcodes. Try again in ${wait} minute${wait === 1 ? "" : "s"}.`); return; }
+    if (await verifyPin(typed, emp)) { lockSet(emp.id, null); await openEmp(emp, false); return; }
+    const left = noteBadPin(emp.id);
+    setPin("");
+    setLockMsg(left
+      ? `That passcode is not right. ${left} ${left === 1 ? "try" : "tries"} left before this ID is held for ${LOCK_MINUTES} minutes.`
+      : `Too many wrong passcodes. This ID is held for ${LOCK_MINUTES} minutes.`);
+  }
+
+  function backToId() { setStage("id"); setPending(null); setPin(""); setLockMsg(""); }
+  function signOut() { setMe(null); setViewOnly(false); setPin(""); setLockMsg(""); setStage("id"); setPending(null); setView("lock"); }
 
   /* ---- punching ---- */
   const todayStr = iso(new Date());
@@ -692,20 +1290,23 @@ export default function DTRSystem({ onBack }) {
   };
   useEffect(() => {
     if (!me || !calOpen) return;
-    ensureLog(me.id, calMonth.getFullYear());
+    ensureLog(me.id, calMonth.getFullYear(), sched);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, calOpen, calMonth]);
 
-  useEffect(() => {
-    if (view === "settings" && !isAdmin) setView(me ? "punch" : "lock");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin, view]);
+  /* Settings is no longer admin-only: everyone reaches it to manage their own passcode,
+     and the admin-only sections render or not on their own. */
+  const savePinFor = (id, fields) => {
+    setRoster((p) => p.map((e) => (e.id === id ? { ...e, ...fields } : e)));
+    setMe((m) => (m && m.id === id ? { ...m, ...fields } : m));
+    setActor((a) => (a && a.id === id ? { ...a, ...fields } : a));
+  };
 
   /* switching date pulls that day's accomplishment in, and cancels any pending save for the old one */
   useEffect(() => {
     if (!me) return;
     clearTimeout(timers.current.note);
-    ensureLog(me.id, +viewDate.slice(0, 4)).then(() => {
+    ensureLog(me.id, +viewDate.slice(0, 4), sched).then(() => {
       setNote((recFor(me.id, viewDate).note || ""));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -743,7 +1344,39 @@ export default function DTRSystem({ onBack }) {
   }
 
   /* ---- periods ---- */
-  const periods = (() => { let p = periodOf(new Date()); const out = []; for (let i = 0; i < 10; i++) { out.push(p); p = prevPeriod(p); } return out; })();
+  /* the list reaches back to the employee's earliest stored year, so an old period stays
+     selectable for tracing instead of falling off a fixed window; a new employee with
+     nothing stored still gets the familiar ten */
+  useEffect(() => {
+    if (!me) { setLogYears([]); return undefined; }
+    let alive = true;
+    storedLogYears(me.id).then((ys) => { if (alive) setLogYears(ys); });
+    return () => { alive = false; };
+  }, [me]);
+
+  const periods = (() => {
+    const now = new Date();
+    const earliest = Math.min(logYears.length ? logYears[0] : now.getFullYear(), now.getFullYear());
+    const floor = new Date(earliest, 0, 1);
+    let p = periodOf(now);
+    const out = [];
+    while (out.length < 10 || p.e >= floor) {
+      out.push(p);
+      p = prevPeriod(p);
+      if (out.length > 600) break; /* ~25 years: a guard, not an expected path */
+    }
+    return out;
+  })();
+  /* one <optgroup> per year keeps a long list scannable */
+  const periodGroups = (() => {
+    const out = [];
+    periods.forEach((p) => {
+      const y = p.e.getFullYear();
+      if (!out.length || out[out.length - 1].year !== y) out.push({ year: y, items: [] });
+      out[out.length - 1].items.push(p);
+    });
+    return out;
+  })();
   const sd = perStart.split("-").map(Number);
   const period = periodOf(new Date(sd[0], sd[1] - 1, sd[2]));
   /* Sundays are hidden unless something was actually recorded that day */
@@ -758,7 +1391,7 @@ export default function DTRSystem({ onBack }) {
     if (!me || view !== "dtr") return;
     const yrs = [];
     days.forEach((d) => { if (yrs.indexOf(d.getFullYear()) < 0) yrs.push(d.getFullYear()); });
-    yrs.forEach((y) => ensureLog(me.id, y));
+    yrs.forEach((y) => ensureLog(me.id, y, sched));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, view, perStart]);
 
@@ -805,8 +1438,11 @@ export default function DTRSystem({ onBack }) {
         };
       });
       try {
-        const bytes = buildDtrPdf({
+      let signature = null;
+      if (me.signature) { try { signature = await logoAsJpeg(me.signature); } catch (e) { signature = null; } }
+      const bytes = buildDtrPdf({
           co: cfg.co || DEF.co, dept: cfg.dept || DEF.dept, title: cfg.title || DEF.title, logo,
+          signature, signatureX: me.signatureX, signatureY: me.signatureY, signatureScale: me.signatureScale,
           name: me.name || "", position: me.position || "", site, period: periodLabel(period),
           rows, dayTotal: fmtDay(dSum, cap), otTotal: fmtDur(oSum),
         });
@@ -885,10 +1521,21 @@ export default function DTRSystem({ onBack }) {
     } catch (err) { say("That file could not be read as an image"); }
   }
 
+  async function onSignatureUpload(i, e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      const data = await scaleImage(f, 520, "image/png");
+      setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature: data } : emp)));
+      say("Signature saved");
+    } catch (err) { say("That signature file could not be read"); }
+  }
+
   /* ---- roster editing ---- */
   const setEmp = (i, field, val) =>
     setRoster((p) => p.map((e, j) => (j === i ? { ...e, [field]: field === "id" ? val.replace(/\s/g, "") : val } : e)));
-  const addEmp = () => setRoster((p) => [...p, { id: "", name: "", position: "", site: "", photo: "", role: "viewer" }]);
+  const addEmp = () => setRoster((p) => [...p, { id: "", name: "", position: "", site: "", photo: "", signature: "", role: "viewer" }]);
   const adminsBesides = (i) => roster.filter((e, j) => j !== i && e.role === "admin" && (e.id || e.name)).length;
   const setRole = (i, val) => {
     if (val !== "admin" && adminsBesides(i) === 0) { say("Keep at least one admin, or nobody can open Settings"); return; }
@@ -898,7 +1545,7 @@ export default function DTRSystem({ onBack }) {
     if (roster[i] && roster[i].role === "admin" && adminsBesides(i) === 0 && roster.length > 1) {
       say("Make someone else an admin before removing this one"); return;
     }
-    setRoster((p) => (p.length > 1 ? p.filter((_, j) => j !== i) : [{ id: "", name: "", position: "", site: "", photo: "", role: "admin" }]));
+    setRoster((p) => (p.length > 1 ? p.filter((_, j) => j !== i) : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", role: "admin" }]));
   };
 
   /* ============================ render ============================ */
@@ -916,9 +1563,10 @@ export default function DTRSystem({ onBack }) {
           <div className="brand">{cfg.co || "QM Builders"}<small>Daily Time Record</small></div>
           <div className="nav">
             {onBack && <button className="out" onClick={onBack}>Back to Project Ledger</button>}
-            <button className={view === "punch" || view === "lock" ? "on" : ""} onClick={() => setView(me ? "punch" : "lock")}>Punch</button>
-            {me && <button className={key("dtr")} onClick={() => setView("dtr")}>My DTR</button>}
-            {isAdmin && <button className={key("settings")} onClick={() => setView("settings")}>Settings</button>}
+            {!viewOnly && <button className={view === "punch" || view === "lock" ? "on" : ""} onClick={() => setView(me ? "punch" : "lock")}>Punch</button>}
+            {me && <button className={key("dtr")} onClick={() => setView("dtr")}>{viewOnly ? "Their DTR" : "My DTR"}</button>}
+            {(isAdmin || (me && !viewOnly)) && <button className={key("settings")} onClick={() => setView("settings")}>Settings</button>}
+            {viewOnly && actor && <button className="out" onClick={() => openEmp(actor, false)}>Close {me && me.name ? me.name.split(" ")[0] : "record"}</button>}
             {me && <button className="out" onClick={signOut}>Sign out</button>}
           </div>
           <div className="clock">
@@ -926,7 +1574,8 @@ export default function DTRSystem({ onBack }) {
           </div>
         </div>
 
-        {storeFail && <div className="banner noprint">Saving is unavailable right now, so changes won't be kept. Reload the page to try again.</div>}
+        {saveState === "local" && <div className="banner warn noprint">Saved on this device — waiting for a connection to send it to the office. Keep this page open.</div>}
+        {saveState === "fail" && <div className="banner noprint">Saving is unavailable right now, so changes won't be kept. Reload the page to try again.</div>}
 
         {/* ---------- LOCK ---------- */}
         {view === "lock" && (
@@ -934,16 +1583,26 @@ export default function DTRSystem({ onBack }) {
             <div className="lockL">
               <div className="lockText">
                 <div className="eyebrow">{clock.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</div>
-                <h1>Enter your<br />ID number</h1>
+                <h1>{stage === "pin" ? <>Enter your<br />passcode</> : <>Enter your<br />ID number</>}</h1>
                 <input
-                  className="pinbox" inputMode="numeric" autoComplete="off" placeholder="----" maxLength={8}
-                  aria-label="ID number" value={pin}
+                  ref={pinRef} className="pinbox" inputMode="numeric" autoComplete="off" autoFocus placeholder="----" maxLength={8}
+                  type={stage === "pin" ? "password" : "text"}
+                  aria-label={stage === "pin" ? "Passcode" : "ID number"} value={pin}
                   onChange={(e) => { setPin(e.target.value); setLockMsg(""); }}
-                  onKeyDown={(e) => { if (e.key === "Enter") signIn(); }}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === "NumpadEnter") signIn(); }}
                 />
                 <div className={"whois" + (lockMsg ? " bad" : "")}>
-                  {match ? (<><strong>{match.name || "(no name)"}</strong><span>{match.position || ""}</span></>) : lockMsg}
+                  {lockMsg
+                    ? lockMsg
+                    : match
+                      ? (<><strong>{match.name || "(no name)"}</strong><span>{stage === "pin" ? "Passcode required" : (match.position || "")}</span></>)
+                      : null}
                 </div>
+                {stage === "pin" && (
+                  <button className="btn ghost sm" style={{ marginTop: 10, alignSelf: "flex-start" }} onClick={backToId}>
+                    Not you? Start over
+                  </button>
+                )}
               </div>
               <div className="lockPhoto">
                 <div className={"frame" + (match && match.photo ? "" : " empty")}>
@@ -1042,7 +1701,7 @@ export default function DTRSystem({ onBack }) {
                   <div className="v">{rec[s.k] ? disp(rec[s.k], true) : "--:--"}</div>
                   <button
                     className="ed" type="button"
-                    onClick={() => setEditing({ slot: s, dateStr: viewDate, value: rec[s.k] ? disp(rec[s.k], true) : "" })}
+                    onClick={() => setEditing({ slot: s, dateStr: viewDate, value: rec[s.k] || "" })}
                   >{rec[s.k] ? "edit" : "set"}</button>
                 </div>
               ))}
@@ -1103,15 +1762,25 @@ export default function DTRSystem({ onBack }) {
         {view === "dtr" && me && (
           <>
             <div className="card noprint" style={{ marginBottom: 16 }}>
-              <h2 className="sec">My DTR</h2>
+              <h2 className="sec">{viewOnly ? `${me.name || me.id} — DTR` : "My DTR"}</h2>
               <p className="sub">
                 {me.name || me.id}{me.position ? " — " + me.position : ""}. Times come from the punches recorded under ID {me.id}.
               </p>
+              {viewOnly && (
+                <div className="pastnote" style={{ marginBottom: 16 }}>
+                  <strong>Read-only — this is not your record</strong>
+                  You can read any period and print it. Only {me.name || `ID ${me.id}`} can change these times, from their own sign-in.
+                </div>
+              )}
               <div className="ctl">
                 <div>
                   <span className="lbl">Payroll period</span>
                   <select value={perStart} onChange={(e) => setPerStart(e.target.value)}>
-                    {periods.map((p) => <option key={iso(p.s)} value={iso(p.s)}>{periodLabel(p)}</option>)}
+                    {periodGroups.map((g) => (
+                      <optgroup key={g.year} label={String(g.year)}>
+                        {g.items.map((p) => <option key={iso(p.s)} value={iso(p.s)}>{periodLabel(p)}</option>)}
+                      </optgroup>
+                    ))}
                   </select>
                 </div>
                 <div>
@@ -1205,7 +1874,9 @@ export default function DTRSystem({ onBack }) {
                               <input
                                 key={ds + s.k + (r[s.k] || "")}
                                 defaultValue={r[s.k] ? disp(r[s.k], true) : ""}
+                                readOnly={!canEdit}
                                 onBlur={(e) => {
+                                  if (!canEdit) return;
                                   const reset = () => { e.target.value = r[s.k] ? disp(r[s.k], true) : ""; };
                                   const raw = e.target.value.trim();
                                   const t = raw ? parseTime(raw, s.mer) : "";
@@ -1224,7 +1895,7 @@ export default function DTRSystem({ onBack }) {
                           <td className="num">{om ? fmtDur(om) : ""}</td>
                           <td className="actc">
                             <div
-                              className="cell" contentEditable suppressContentEditableWarning
+                              className="cell" contentEditable={canEdit} suppressContentEditableWarning
                               key={ds + "note" + (r.note || "")}
                               onBlur={(e) => {
                                 const v = e.currentTarget.textContent.trim();
@@ -1252,7 +1923,7 @@ export default function DTRSystem({ onBack }) {
                 <table className="sig">
                   <tbody>
                     <tr>
-                      <td className="ln">EMPLOYEE SIGNATURE</td><td className="sp" />
+                      <td className="ln"><span className="sigStack">{me.signature && <img className="sigimg" style={{ "--sig-x": `${Number(me.signatureX) || 0}mm`, "--sig-y": `${Number(me.signatureY) || 0}mm`, "--sig-scale": Number(me.signatureScale) || 1 }} src={me.signature} alt="Employee signature" />}<span className="siglabel">EMPLOYEE SIGNATURE</span></span></td><td className="sp" />
                       <td className="ln">SUPERVISOR / DEPT MANAGER</td><td className="sp" />
                       <td className="ln">GENERAL MANAGER</td>
                     </tr>
@@ -1266,12 +1937,28 @@ export default function DTRSystem({ onBack }) {
         {/* ---------- SETTINGS ---------- */}
         {view === "settings" && !isAdmin && (
           <div className="card">
-            <h2 className="sec">Settings locked</h2>
+            <h2 className="sec">My passcode</h2>
             <p className="sub">
-              Only employees with the <strong>Admin</strong> role can change the form header, work schedule, and employee list.
-              Sign in with an admin ID to make changes.
+              Your ID number is not a secret — the passcode is what keeps anyone else from punching as you.
+              Only the form header, work schedule, and employee list are admin-only.
             </p>
-            <button className="btn" onClick={() => { setMe(null); setView("lock"); }}>Go to sign in</button>
+            {me ? (
+              <>
+                {!hasPin(me) && (
+                  <div className="pastnote" style={{ marginBottom: 14 }}>
+                    <strong>No passcode set</strong>
+                    Until you set one, anybody who knows ID {me.id} can open your DTR and punch as you.
+                  </div>
+                )}
+                <PasscodeForm emp={me} mode="self" say={say} onSave={(fields) => savePinFor(me.id, fields)} />
+                <p className="hint" style={{ marginTop: 14 }}>
+                  Digits only, at least {PIN_MIN}. It is stored scrambled — nobody, including an admin, can read it back.
+                  If you forget it, an admin resets it for you.
+                </p>
+              </>
+            ) : (
+              <button className="btn" onClick={() => { setMe(null); setView("lock"); }}>Go to sign in</button>
+            )}
           </div>
         )}
 
@@ -1280,7 +1967,23 @@ export default function DTRSystem({ onBack }) {
             <h2 className="sec">Settings</h2>
             <p className="sub">Form header and the people who punch on this system. Changes save as you type — there is no save button to miss.</p>
 
-            <h3 className="s2 first">Form header</h3>
+            {actorEmp && actorEmp.id && (
+              <>
+                <h3 className="s2 first">My passcode</h3>
+                <p className="hint" style={{ marginBottom: 14 }}>
+                  Yours, for ID {actorEmp.id}. Admin rights make this the account most worth protecting.
+                </p>
+                {!hasPin(actorEmp) && (
+                  <div className="pastnote" style={{ marginBottom: 14 }}>
+                    <strong>No passcode set</strong>
+                    Anybody who knows ID {actorEmp.id} can sign in as you and open Settings.
+                  </div>
+                )}
+                <PasscodeForm emp={actorEmp} mode="self" say={say} onSave={(fields) => savePinFor(actorEmp.id, fields)} />
+              </>
+            )}
+
+            <h3 className={"s2" + (actorEmp && actorEmp.id ? "" : " first")}>Form header</h3>
             <p className="hint" style={{ marginBottom: 16 }}>Appears at the top of every printed DTR.</p>
             <div className="logoRow">
               <div>
@@ -1351,7 +2054,8 @@ export default function DTRSystem({ onBack }) {
               </thead>
               <tbody>
                 {roster.map((e, i) => (
-                  <tr key={i}>
+                  <Fragment key={i}>
+                  <tr>
                     <td>
                       <label className="photocell" title="Upload a photo">
                         {e.photo ? <img src={e.photo} alt="" /> : <span>Add</span>}
@@ -1373,11 +2077,67 @@ export default function DTRSystem({ onBack }) {
                         <option value="admin">Admin</option>
                       </select>
                     </td>
-                    <td className="x"><button onClick={() => delEmp(i)}>Remove</button></td>
+                    <td className="x">
+                      {e.id && me && e.id !== me.id && (
+                        <button onClick={() => openEmp(e, true, actorEmp)}>View DTR</button>
+                      )}
+                      <button onClick={() => setResetting(resetting === e.id ? "" : e.id)} disabled={!e.id}>
+                        {hasPin(e) ? "Reset passcode" : "Set passcode"}
+                      </button>
+                      <button onClick={() => delEmp(i)}>Remove</button>
+                    </td>
                   </tr>
+                  {resetting && resetting === e.id && e.id && (
+                    <tr>
+                      <td colSpan={7} style={{ background: "var(--zinc)" }}>
+                        <span className="lbl">
+                          {hasPin(e) ? "Reset" : "Set"} passcode for {e.name || e.id}
+                        </span>
+                        <PasscodeForm
+                          emp={e} mode="reset" say={say}
+                          onSave={(fields) => { savePinFor(e.id, fields); setResetting(""); }}
+                        />
+                        <p className="hint" style={{ marginTop: 10 }}>
+                          {hasPin(e)
+                            ? "Their old passcode stops working immediately. Tell them the new one in person, and have them change it under Settings."
+                            : "Until this is set, anyone who knows this ID can punch as this employee."}
+                        </p>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
+            <h3 className="s2">Employee signatures</h3>
+            <p className="hint" style={{ marginBottom: 12 }}>
+              Draw with a mouse, finger, or stylus, or upload a transparent PNG. The saved signature appears on that employee's printable DTR.
+            </p>
+            <div className="signatureList">
+              {roster.map((e, i) => (
+                <div className="signatureCard" key={"signature-" + i}>
+                  <h4>{e.name || e.id || `Employee ${i + 1}`}</h4>
+                  <p>{[e.position, e.id ? `ID ${e.id}` : "ID not set"].filter(Boolean).join(" · ")}</p>
+                  <SignatureEditor
+                    value={e.signature || ""}
+                    onSave={(signature) => setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature } : emp)))}
+                    onRemove={() => setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature: "" } : emp)))}
+                  />
+                  <label className="btn ghost sm" style={{ display: "inline-block", marginTop: 7 }}>
+                    Upload signature PNG<input type="file" accept="image/png,image/*" hidden onChange={(ev) => onSignatureUpload(i, ev)} />
+                  </label>
+                  {e.signature ? (
+                    <SignaturePlacementEditor
+                      value={e.signature}
+                      x={e.signatureX}
+                      y={e.signatureY}
+                      scale={e.signatureScale}
+                      onSave={(placement) => setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, ...placement } : emp)))}
+                    />
+                  ) : <p className="hint" style={{ marginTop: 10 }}>Save a signature above to adjust its placement.</p>}
+                </div>
+              ))}
+            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
               <button className="btn ghost" onClick={addEmp}>Add employee</button>
               <span className={"saved" + (flash === "roster" ? " on" : "")}>Saved</span>
@@ -1391,16 +2151,14 @@ export default function DTRSystem({ onBack }) {
         <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setEditing(null); }}>
           <div className="box">
             <h3>{editing.value ? "Correct" : "Set"} {editing.slot.label}</h3>
-            <p>Type it like 8:05 or 5:10 PM.</p>
-            <input
-              autoFocus defaultValue={editing.value}
-              onKeyDown={(e) => { if (e.key === "Enter") applyEdit(e.currentTarget.value, false); if (e.key === "Escape") setEditing(null); }}
-              id="qm-edit-input"
+            <p>Type a time or scroll the hour, minute, and AM/PM wheels to choose it.</p>
+            <TimeWheelPicker
+              value={editing.value}
+              onConfirm={(value) => applyEdit(value, false)}
+              onCancel={() => setEditing(null)}
             />
             <div className="row">
-              <button className="del" onClick={() => applyEdit("", true)}>Clear</button>
-              <button onClick={() => setEditing(null)}>Cancel</button>
-              <button className="pri" onClick={() => applyEdit(document.getElementById("qm-edit-input").value, false)}>Save</button>
+              <button className="del" onClick={() => applyEdit("", true)}>Clear time</button>
             </div>
           </div>
         </div>
