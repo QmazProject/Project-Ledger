@@ -10,9 +10,8 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
   headers: { ...corsHeaders, "Content-Type": "application/json" },
 });
 
-async function captchaIsValid(token: string, secret: string, remoteIp: string | null) {
+async function captchaIsValid(token: string, secret: string) {
   const body = new URLSearchParams({ secret, response: token });
-  if (remoteIp) body.set("remoteip", remoteIp);
   const response = await fetch("https://hcaptcha.com/siteverify", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -44,7 +43,7 @@ Deno.serve(async (request) => {
       const secret = Deno.env.get("HCAPTCHA_SECRET");
       if (!secret) return json({ error: "CAPTCHA server secret is not configured." }, 500);
       if (!captcha_token) return json({ error: "Complete the CAPTCHA challenge first." }, 400);
-      const verification = await captchaIsValid(String(captcha_token), secret, request.headers.get("x-forwarded-for"));
+      const verification = await captchaIsValid(String(captcha_token), secret);
       if (!verification.ok) {
         const detail = verification.codes.length ? ` (${verification.codes.join(", ")})` : "";
         return json({ error: `CAPTCHA verification failed${detail}. Check the hCaptcha site key, secret, and allowed domain.` }, 400);

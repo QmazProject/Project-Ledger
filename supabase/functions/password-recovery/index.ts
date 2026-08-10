@@ -10,9 +10,8 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
   headers: { ...corsHeaders, "Content-Type": "application/json" },
 });
 
-async function captchaIsValid(token: string, secret: string, remoteIp: string | null) {
+async function captchaIsValid(token: string, secret: string) {
   const body = new URLSearchParams({ secret, response: token });
-  if (remoteIp) body.set("remoteip", remoteIp);
   const response = await fetch("https://hcaptcha.com/siteverify", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -41,7 +40,7 @@ Deno.serve(async (request) => {
     const captchaEnabled = setting?.captcha_enabled !== false;
     if (captchaEnabled) {
       const secret = Deno.env.get("HCAPTCHA_SECRET");
-      if (!secret || !captcha_token || !(await captchaIsValid(String(captcha_token), secret, request.headers.get("x-forwarded-for")))) {
+      if (!secret || !captcha_token || !(await captchaIsValid(String(captcha_token), secret))) {
         return json(genericResponse);
       }
     }
