@@ -576,9 +576,12 @@ const markPending = (key, yes) => {
   lsSet(PENDING_KEY, next);
 };
 
+let lastCloudError = "";
 const cloudReady = () => isConfigured && !!supabase;
 async function cloudPut(key, val) {
   const { error } = await supabase.from(DTR_STORAGE_TABLE).upsert({ storage_key: key, payload: val }, { onConflict: "storage_key" });
+  lastCloudError = error?.message || "";
+  if (error) console.error("DTR cloud sync failed", { key, message: error.message, code: error.code });
   return !error;
 }
 
@@ -1068,6 +1071,7 @@ export default function DTRSystem({ onBack }) {
   const [site, setSite] = useState("");
   const [editing, setEditing] = useState(null);
   const [toast, setToast] = useState("");
+  const [syncError, setSyncError] = useState("");
   const [flash, setFlash] = useState("");
   /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
   const [saveState, setSaveState] = useState("synced");
@@ -1096,7 +1100,10 @@ export default function DTRSystem({ onBack }) {
     let alive = true;
     const sync = async () => {
       await flushPending();
-      if (alive) setSaveState(pendingKeys().length ? "local" : "synced");
+      if (alive) {
+        setSaveState(pendingKeys().length ? "local" : "synced");
+        setSyncError(pendingKeys().length ? lastCloudError : "");
+      }
     };
     sync();
     // A browser can stay "online" while Supabase is temporarily unavailable.
@@ -1157,6 +1164,7 @@ export default function DTRSystem({ onBack }) {
       if (new Set(ids).size !== ids.length) { say("Two employees share the same ID"); return; }
       const state = await sSet("dtr:roster", keep);
       setSaveState(state);
+      setSyncError(state === "local" ? lastCloudError : "");
       if (state !== "fail") flashSaved("roster");
     }, 600);
   }, [roster, ready, say]);
@@ -1168,6 +1176,7 @@ export default function DTRSystem({ onBack }) {
     timers.current.cfg = setTimeout(async () => {
       const state = await sSet("dtr:cfg", cfg);
       setSaveState(state);
+      setSyncError(state === "local" ? lastCloudError : "");
       if (state !== "fail") flashSaved("cfg");
     }, 500);
   }, [cfg, ready]);
@@ -1207,6 +1216,7 @@ export default function DTRSystem({ onBack }) {
     bump();
     const state = await sSet(k, logsRef.current[k]);
     setSaveState(state);
+    setSyncError(state === "local" ? lastCloudError : "");
     return state !== "fail";
   };
 
@@ -1585,7 +1595,9 @@ export default function DTRSystem({ onBack }) {
           </div>
         </div>
 
-        {saveState === "local" && <div className="banner warn noprint">Saved on this device — waiting for a connection to send it to the office. Keep this page open.</div>}
+        {saveState === "local" && <div className="banner warn noprint">
+          Saved on this device — waiting to send it to the office.{syncError ? ` Sync error: ${syncError}` : " Keep this page open while it retries."}
+        </div>}
         {saveState === "fail" && <div className="banner noprint">Saving is unavailable right now, so changes won't be kept. Reload the page to try again.</div>}
 
         {/* ---------- LOCK ---------- */}
