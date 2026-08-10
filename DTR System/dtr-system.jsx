@@ -14,6 +14,25 @@ const SLOTS = [
 ];
 const MON = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const ADMIN_ID = "005582";
+const DTR_CONTROL_NO = "HRD.FL60.00 (06/24)";
+const PAPER_SIZES = {
+  LEGAL: { label: "Legal — 8.5 × 14 in", css: "Legal", width: 612, height: 1008 },
+  LETTER: { label: "Letter — 8.5 × 11 in", css: "Letter", width: 612, height: 792 },
+  A4: { label: "A4 — 8.27 × 11.69 in", css: "A4", width: 595.28, height: 841.89 },
+};
+const dtrPdfOverflows = (rows, paperSize) => {
+  const paper = PAPER_SIZES[paperSize] || PAPER_SIZES.LEGAL;
+  const pageWidth = paper.width - 51;
+  const noteW = pageWidth * 0.30 - 8;
+  const rowHeights = Array.from({ length: Math.max(21, rows.length) }, (_, i) => {
+    const note = rows[i] && rows[i].note;
+    const lines = note ? wrapPdfText(note, noteW, 7.2, false) : [];
+    return Math.max(19.84, lines.length * 7.2 + 5);
+  });
+  const bodyH = rowHeights.reduce((sum, height) => sum + height, 0);
+  /* Keep enough space below the table for signatures and the control number. */
+  return bodyH > paper.height - 259;
+};
 const SCHED_DEF = { amStart: "08:00", amEnd: "12:00", pmStart: "13:00", pmEnd: "17:00" };
 const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF };
 
@@ -63,6 +82,22 @@ const txtW = (s, size, bold) => {
   for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); w += c >= 32 && c <= 126 ? t[c - 32] : 500; }
   return (w * size) / 1000;
 };
+const wrapPdfText = (value, maxW, size, bold) => {
+  const lines = [];
+  String(value == null ? "" : value).replace(/\r\n?/g, "\n").split("\n").forEach((paragraph) => {
+    if (!paragraph) { lines.push(""); return; }
+    let current = "";
+    for (const ch of paragraph) {
+      const next = current + ch;
+      if (current && txtW(next, size, bold) > maxW) {
+        lines.push(current);
+        current = ch;
+      } else current = next;
+    }
+    lines.push(current);
+  });
+  return lines.length ? lines : [""];
+};
 const pesc = (s) =>
   String(s == null ? "" : s).replace(/[^\x20-\xFF]/g, "?").replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 const nf = (n) => (Math.round(n * 100) / 100).toString();
@@ -86,7 +121,8 @@ function logoAsJpeg(dataUrl) {
 }
 
 function buildDtrPdf(o) {
-  const PW = 595.28, PH = 841.89, M = 25.5;
+  const paper = PAPER_SIZES[o.paperSize] || PAPER_SIZES.LETTER;
+  const PW = paper.width, PH = paper.height, M = 25.5;
   const X0 = M, X1 = PW - M, W = X1 - X0, YTOP = PH - M;
   const c = [];
   const line = (x1, y1, x2, y2) => c.push(`${nf(x1)} ${nf(y1)} m ${nf(x2)} ${nf(y2)} l S`);
@@ -146,7 +182,13 @@ function buildDtrPdf(o) {
   const bodyRows = Math.max(PAD, o.rows.length);
   const totalH = 21;
   const tTop = fy1 - 22 - 20;
-  const tBot = tTop - theadH - bodyRows * rh - totalH;
+  const noteW = bx[10] - bx[9] - 8;
+  const rowHeights = Array.from({ length: bodyRows }, (_, i) => {
+    const lines = o.rows[i] && o.rows[i].note ? wrapPdfText(o.rows[i].note, noteW, 7.2, false) : [];
+    return Math.max(rh, lines.length * 7.2 + 5);
+  });
+  const bodyH = rowHeights.reduce((sum, height) => sum + height, 0);
+  const tBot = tTop - theadH - bodyH - totalH;
   rect(X0, tBot, W, tTop - tBot);
 
   const r1b = tTop - hh1, r2b = r1b - hh2, r3b = r2b - hh3;
@@ -175,15 +217,16 @@ function buildDtrPdf(o) {
   for (let i = 1; i <= 6; i++) ctext(cmid(i, i + 1), mid(r2b, hh3, 7), i % 2 ? "IN" : "OUT", 7, true);
 
   /* ---- rows ---- */
-  const totalTop = r3b - bodyRows * rh;
+  const totalTop = r3b - bodyH;
   [1, 5, 6, 7, 8, 9].forEach((i) => line(bx[i], r3b, bx[i], totalTop));
   [6, 7, 8, 9].forEach((i) => line(bx[i], totalTop, bx[i], tBot));
   let y = r3b;
   for (let i = 0; i < bodyRows; i++) {
     const r = o.rows[i];
-    if (!r || !r.leave) [2, 3, 4].forEach((j) => line(bx[j], y, bx[j], y - rh));
+    const rowH = rowHeights[i];
+    if (!r || !r.leave) [2, 3, 4].forEach((j) => line(bx[j], y, bx[j], y - rowH));
     if (r) {
-      const base = mid(y, rh, 8);
+      const base = mid(y, rowH, 8);
       ctext(cmid(0, 1), base, r.date, 8, false);
       if (r.sun) ctext(cmid(0, 1), base - 6, "SUN", 5.6, true);
       if (r.leave) {
@@ -193,9 +236,16 @@ function buildDtrPdf(o) {
       }
       if (r.day) ctext(cmid(7, 8), base, r.day, 7.6, true);
       if (r.ot) ctext(cmid(8, 9), base, r.ot, 7.6, true);
-      if (r.note) text(bx[9] + 4, base, fit(r.note, bx[10] - bx[9] - 8, 7.2, false), 7.2, false);
+      if (r.note) {
+        const noteLines = wrapPdfText(r.note, noteW, 7.2, false);
+        const lineH = 7.2;
+        noteLines.forEach((lineText, lineIndex) => {
+          text(bx[9] + 4, base + ((noteLines.length - 1) / 2 - lineIndex) * lineH,
+            lineText, 7.2, false);
+        });
+      }
     }
-    y -= rh;
+    y -= rowH;
     line(X0, y, X1, y);
   }
   ctext(cmid(6, 7), mid(y, totalH, 8.5), "TOTAL", 8.5, true);
@@ -217,6 +267,8 @@ function buildDtrPdf(o) {
     line(sx, sy, sx + sw, sy);
     ctext(sx + sw / 2, sy - 9, ["EMPLOYEE SIGNATURE", "SUPERVISOR / DEPT MANAGER", "GENERAL MANAGER"][i], 8, true);
   });
+  const controlY = 12;
+  text(X1 - txtW(DTR_CONTROL_NO, 7, false), controlY, DTR_CONTROL_NO, 7, false);
 
   /* ---- assemble ---- */
   const stream = c.join("\n");
@@ -997,7 +1049,7 @@ const SHEET_CSS = `
 .sheet .dtr td.actc{text-align:left;padding:0 1.6mm;font-size:7.8pt;line-height:1.25}
 .sheet .dtr tr.tot td{font-weight:bold;height:7.4mm;font-size:8.5pt;letter-spacing:0.3pt}
 .sheet .dtr input,.sheet .dtr .cell{width:100%;height:100%;min-height:6.4mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7.2pt;text-align:center;padding:0;color:#000}
-.sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none}
+.sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none;white-space:pre-wrap;overflow-wrap:anywhere}
 .sheet .dtr input:focus,.sheet .dtr .cell:focus{background:#FFF3D0;outline:none}
 .sheet .sig{margin-top:13mm}
 .sheet .sig td{font-size:8pt;text-align:center;font-weight:bold;letter-spacing:0.3pt;padding-top:1.2mm}
@@ -1010,7 +1062,7 @@ const SHEET_CSS = `
 
 const PRINT_CSS = `
 @media print{
-  @page{size:A4 portrait;margin:9mm}
+  @page{size:Legal portrait;margin:9mm}
   .qm{background:#fff;padding:0}
   .qm .noprint{display:none!important}
   .qm .sheetwrap{background:none;padding:0;overflow:visible}
@@ -1072,6 +1124,13 @@ export default function DTRSystem({ onBack }) {
   const [note, setNote] = useState("");
   const [punchDate, setPunchDate] = useState(iso(new Date()));
   const [printHref, setPrintHref] = useState("");
+  const [pdfWarning, setPdfWarning] = useState("");
+  const [paperSize, setPaperSize] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dtr-paper-size");
+      return PAPER_SIZES[saved] ? saved : "LEGAL";
+    } catch (e) { return "LEGAL"; }
+  });
   const [calOpen, setCalOpen] = useState(false);
   const [confirm, setConfirm] = useState(null);
   const [calMonth, setCalMonth] = useState(() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); });
@@ -1104,6 +1163,7 @@ export default function DTRSystem({ onBack }) {
 
   const bump = () => forceTick((n) => n + 1);
   const sched = cfg.sched || SCHED_DEF;
+  const paper = PAPER_SIZES[paperSize] || PAPER_SIZES.LETTER;
   /* settings stay open while nobody is set up yet, so the system can be bootstrapped */
   /* while browsing someone else's DTR, `me` is the employee being read — the admin who
      signed in is `actor`, and it is their role that still decides what is allowed */
@@ -1317,13 +1377,13 @@ export default function DTRSystem({ onBack }) {
     const stamp = nowHM();
     const issue = orderIssue(rec, slot.k, stamp);
     if (issue) { say(issue); return; }
-    await writeRec(me.id, viewDate, (r) => { r[slot.k] = stamp; r.note = note.trim(); });
+    await writeRec(me.id, viewDate, (r) => { r[slot.k] = stamp; r.note = note; });
     say(`${slot.label} recorded — ${disp(stamp, true)}`);
   }
   useEffect(() => {
     if (!me) return;
     clearTimeout(timers.current.note);
-    timers.current.note = setTimeout(() => { writeRec(me.id, viewDate, (r) => { r.note = note.trim(); }); }, 700);
+    timers.current.note = setTimeout(() => { writeRec(me.id, viewDate, (r) => { r.note = note; }); }, 700);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note]);
 
@@ -1385,7 +1445,7 @@ export default function DTRSystem({ onBack }) {
     if ((slot.k === "pmOut" || slot.k === "otOut") && !note.trim()) {
       say("Write your accomplishment first"); return;
     }
-    await writeRec(me.id, dateStr, (r) => { r[slot.k] = t; if (note.trim()) r.note = note.trim(); });
+    await writeRec(me.id, dateStr, (r) => { r[slot.k] = t; if (note.trim()) r.note = note; });
     setEditing(null);
   }
 
@@ -1483,6 +1543,12 @@ export default function DTRSystem({ onBack }) {
           note: r.note || "",
         };
       });
+      if (dtrPdfOverflows(rows, paperSize)) {
+        setPrintHref((old) => { if (old) URL.revokeObjectURL(old); return ""; });
+        setPdfWarning(`The activities are too long for one ${paper.label} page. Use “Print from browser” to save a multi-page PDF so all text, signatures, and the control number remain visible.`);
+        return;
+      }
+      setPdfWarning("");
       try {
       let signature = null;
       if (me.signature) { try { signature = await logoAsJpeg(me.signature); } catch (e) { signature = null; } }
@@ -1490,6 +1556,7 @@ export default function DTRSystem({ onBack }) {
           co: cfg.co || DEF.co, dept: cfg.dept || DEF.dept, title: cfg.title || DEF.title, logo,
           signature, signatureX: me.signatureX, signatureY: me.signatureY, signatureScale: me.signatureScale,
           name: me.name || "", position: me.position || "", site, period: periodLabel(period),
+          paperSize,
           rows, dayTotal: fmtDay(dSum, cap), otTotal: fmtDur(oSum),
         });
         const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
@@ -1499,7 +1566,7 @@ export default function DTRSystem({ onBack }) {
     }, 200);
     return () => { dead = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, me, perStart, site, cfg, tickN]);
+  }, [view, me, perStart, site, cfg, paperSize, tickN]);
 
   function printableDoc() {
     const clone = buildPrintable();
@@ -1507,7 +1574,7 @@ export default function DTRSystem({ onBack }) {
     const parts = [
       "<!DOCTYPE html>", "<html>", "<head>", '<meta charset="utf-8">',
       "<title>Daily Time Record</title>",
-      "<sty" + "le>" + SHEET_CSS + "@page{size:A4 portrait;margin:9mm} html,body{margin:0;padding:0;background:#fff} .sheet{width:auto;margin:0;padding:0;box-shadow:none}</sty" + "le>",
+      "<sty" + "le>" + SHEET_CSS + `@page{size:${paper.css} portrait;margin:9mm} html,body{margin:0;padding:0;background:#fff} .sheet{width:auto;margin:0;padding:0;box-shadow:none}</sty` + "le>",
       "</head>", "<bo" + "dy>", clone.outerHTML, "</bo" + "dy>", "</html>",
     ];
     return parts.join("");
@@ -1520,7 +1587,7 @@ export default function DTRSystem({ onBack }) {
     try { w = window.open("", "_blank"); } catch (e) { w = null; }
     if (w && w.document) {
       const st = w.document.createElement("style");
-      st.textContent = SHEET_CSS + "@page{size:A4 portrait;margin:9mm} .sheet{width:auto;margin:0;padding:0}";
+      st.textContent = SHEET_CSS + `@page{size:${paper.css} portrait;margin:9mm} .sheet{width:auto;margin:0;padding:0}`;
       w.document.head.appendChild(st);
       w.document.title = "Daily Time Record";
       w.document.body.style.margin = "0";
@@ -1835,13 +1902,26 @@ export default function DTRSystem({ onBack }) {
                   <span className="lbl">Project site</span>
                   <input value={site} onChange={(e) => setSite(e.target.value)} placeholder="Project site" />
                 </div>
-                {printHref
+                <div>
+                  <span className="lbl">Paper size</span>
+                  <select value={paperSize} onChange={(e) => {
+                    const next = PAPER_SIZES[e.target.value] ? e.target.value : "LEGAL";
+                    setPaperSize(next);
+                    try { localStorage.setItem("dtr-paper-size", next); } catch (err) {}
+                  }}>
+                    {Object.entries(PAPER_SIZES).map(([key, size]) => <option key={key} value={key}>{size.label}</option>)}
+                  </select>
+                </div>
+                {pdfWarning
+                  ? <button className="btn" disabled style={{ opacity: 0.5 }}>Use browser print for multiple pages</button>
+                  : printHref
                   ? <a className="btn" href={printHref} download={dtrFileName()}>Print / Save PDF</a>
                   : <button className="btn" disabled style={{ opacity: 0.5 }}>Preparing PDF…</button>}
                 <button className="btn ghost" onClick={doPrint}>Print from browser</button>
               </div>
+              {pdfWarning && <div role="alert" className="pastnote" style={{ marginTop: 10, marginBottom: 0 }}>{pdfWarning}</div>}
               <p className="hint">
-                <strong>Print / Save PDF</strong> downloads a real PDF, already laid out for A4 portrait — open it and print, or
+                <strong>Print / Save PDF</strong> downloads a real PDF, already laid out for {paper.label} portrait — open it and print, or
                 send it as-is. <strong>Print from browser</strong> is an alternative that may be blocked, since this page runs inside a
                 restricted frame; the PDF download always works. Any cell below can be corrected before you export.
               </p>
@@ -1946,7 +2026,7 @@ export default function DTRSystem({ onBack }) {
                               className="cell" contentEditable={canEdit} suppressContentEditableWarning
                               key={ds + "note" + (r.note || "")}
                               onBlur={(e) => {
-                                const v = e.currentTarget.textContent.trim();
+                                const v = e.currentTarget.innerText.replace(/\r\n?/g, "\n");
                                 if (v === (r.note || "")) return;
                                 writeRec(me.id, ds, (rr) => { rr.note = v; });
                               }}
