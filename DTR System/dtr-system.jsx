@@ -1099,8 +1099,19 @@ export default function DTRSystem({ onBack }) {
       if (alive) setSaveState(pendingKeys().length ? "local" : "synced");
     };
     sync();
+    // A browser can stay "online" while Supabase is temporarily unavailable.
+    // Retry queued writes periodically and when the tab becomes active again;
+    // waiting only for window.online would leave the banner stuck indefinitely.
+    const retry = window.setInterval(sync, 30000);
+    const onVisible = () => { if (document.visibilityState === "visible") sync(); };
     window.addEventListener("online", sync);
-    return () => { alive = false; window.removeEventListener("online", sync); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearInterval(retry);
+      window.removeEventListener("online", sync);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   /* ---- boot ---- */
