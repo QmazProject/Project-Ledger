@@ -449,8 +449,10 @@ const fromWheelParts = ({ hour, minute, mer }) => {
   return `${p2(h)}:${minute}`;
 };
 
-function TimeWheelPicker({ value, onConfirm, onCancel }) {
-  const initial = value || nowHM();
+function TimeWheelPicker({ value, merHint, onConfirm, onCancel }) {
+  /* Empty AM/PM slots should not inherit the current clock's meridian. At
+     1:15 PM, opening an empty AM editor must start in AM, not PM. */
+  const initial = value || (merHint === "AM" ? "08:00" : "13:00");
   /* one piece of state for the three columns: a fling settling on one wheel can fire
      while another is still moving, and separate states would write back stale siblings */
   const [parts, setParts] = useState(() => toWheelParts(initial));
@@ -2189,6 +2191,7 @@ export default function DTRSystem({ onBack }) {
             <p>Type a time or scroll the hour, minute, and AM/PM wheels to choose it.</p>
             <TimeWheelPicker
               value={editing.value}
+              merHint={editing.slot.mer}
               onConfirm={(value) => applyEdit(value, false)}
               onCancel={() => setEditing(null)}
             />
