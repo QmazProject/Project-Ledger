@@ -449,10 +449,8 @@ const fromWheelParts = ({ hour, minute, mer }) => {
   return `${p2(h)}:${minute}`;
 };
 
-function TimeWheelPicker({ value, merHint, onConfirm, onCancel }) {
-  /* Empty AM/PM slots should not inherit the current clock's meridian. At
-     1:15 PM, opening an empty AM editor must start in AM, not PM. */
-  const initial = value || (merHint === "AM" ? "08:00" : "13:00");
+function TimeWheelPicker({ value, onConfirm, onCancel }) {
+  const initial = value || nowHM();
   /* one piece of state for the three columns: a fling settling on one wheel can fire
      while another is still moving, and separate states would write back stale siblings */
   const [parts, setParts] = useState(() => toWheelParts(initial));
@@ -1300,6 +1298,12 @@ export default function DTRSystem({ onBack }) {
   const isToday = viewDate === todayStr;
   const rec = me ? recFor(me.id, viewDate) : {};
   const nextSlot = SLOTS.find((s) => !rec[s.k]);
+  const editDefaultTime = (slot) => ({
+    amIn: sched.amStart,
+    amOut: sched.amEnd,
+    pmIn: sched.pmStart,
+    pmOut: sched.pmEnd,
+  }[slot.k] || nowHM());
 
   async function punch(slot) {
     if ((slot.k === "pmOut" || slot.k === "otOut") && !note.trim()) { say("Write your accomplishment first"); return; }
@@ -1738,7 +1742,7 @@ export default function DTRSystem({ onBack }) {
                   <div className="v">{rec[s.k] ? disp(rec[s.k], true) : "--:--"}</div>
                   <button
                     className="ed" type="button"
-                    onClick={() => setEditing({ slot: s, dateStr: viewDate, value: rec[s.k] || "" })}
+                    onClick={() => setEditing({ slot: s, dateStr: viewDate, value: rec[s.k] || editDefaultTime(s) })}
                   >{rec[s.k] ? "edit" : "set"}</button>
                 </div>
               ))}
@@ -1760,7 +1764,7 @@ export default function DTRSystem({ onBack }) {
                   <button className="big" disabled>All punched for today<small>Nothing left to record. Come back tomorrow.</small></button>
                 ))}
                 {!rec.leave && nextSlot && (
-                  <button className="ot" onClick={() => setEditing({ slot: nextSlot, dateStr: viewDate, value: "" })}>
+                  <button className="ot" onClick={() => setEditing({ slot: nextSlot, dateStr: viewDate, value: rec[nextSlot.k] || editDefaultTime(nextSlot) })}>
                     Enter {nextSlot.label} manually
                   </button>
                 )}
@@ -2191,7 +2195,6 @@ export default function DTRSystem({ onBack }) {
             <p>Type a time or scroll the hour, minute, and AM/PM wheels to choose it.</p>
             <TimeWheelPicker
               value={editing.value}
-              merHint={editing.slot.mer}
               onConfirm={(value) => applyEdit(value, false)}
               onCancel={() => setEditing(null)}
             />
