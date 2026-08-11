@@ -689,6 +689,11 @@ const logKey = (id, y) => `dtr:log:${id}:${y}`;
 /* storage — DTR data stays in its own table and never shares Project Ledger rows */
 const DTR_STORAGE_TABLE = "dtr_storage_dtr";
 const DTR_PROFILE_TABLE = "dtr_employee_profiles";
+const DTR_ATTACHMENTS_TABLE = "dtr_attachments";
+const DTR_ATTACHMENTS_BUCKET = "dtr-attachments";
+const ATTACHMENT_TYPES = ["Gate Pass", "SOR", "OTR", "Medical", "Leave form", "Other"];
+const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_MIMES = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
 const DTR_SESSION_VIEW = "dtr.session.view";
 const DTR_SESSION_EMPLOYEE = "dtr.session.employee";
 
@@ -788,6 +793,61 @@ async function saveDtrProfiles(roster) {
     }
     return true;
   } catch { return false; }
+}
+
+const attachmentDate = (value) => String(value || "").slice(0, 10);
+const safeAttachmentName = (value) => String(value || "document")
+  .replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 90) || "document";
+
+async function signedAttachmentUrl(path) {
+  if (!cloudReady() || !path) return "";
+  const { data, error } = await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).createSignedUrl(path, 3600);
+  return error ? "" : (data?.signedUrl || "");
+}
+
+async function listDtrAttachments(employeeId, period) {
+  if (!cloudReady() || !employeeId || !period) return [];
+  try {
+    const { data, error } = await supabase.from(DTR_ATTACHMENTS_TABLE)
+      .select("id,employee_id,employee_name,payroll_start,payroll_end,work_date,attachment_type,note,file_name,storage_path,mime_type,file_size,uploaded_by_id,uploaded_by_name,created_at")
+      .eq("employee_id", String(employeeId))
+      .eq("payroll_start", iso(period.s))
+      .eq("payroll_end", iso(period.e))
+      .order("work_date", { ascending: true }).order("created_at", { ascending: true });
+    if (error || !Array.isArray(data)) return [];
+    return (await Promise.all(data.map(async (item) => ({ ...item, url: await signedAttachmentUrl(item.storage_path) })))).filter((item) => item.url);
+  } catch { return []; }
+}
+
+async function uploadDtrAttachment({ employee, actor, period, workDate, type, note, file }) {
+  if (!cloudReady()) throw new Error("Attachment storage is not configured.");
+  if (!file) throw new Error("Choose a file first.");
+  if (!ATTACHMENT_MIMES.includes(file.type)) throw new Error("Use a PDF, JPG, PNG, or WEBP file.");
+  if (file.size > ATTACHMENT_MAX_BYTES) throw new Error("Attachments must be 10 MB or smaller.");
+  const id = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const path = `${safeAttachmentName(employee.id)}/${iso(period.s)}/${attachmentDate(workDate)}/${id}-${safeAttachmentName(file.name)}`;
+  const { error: uploadError } = await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).upload(path, file, { contentType: file.type, upsert: false });
+  if (uploadError) throw uploadError;
+  const row = {
+    employee_id: String(employee.id), employee_name: employee.name || "",
+    payroll_start: iso(period.s), payroll_end: iso(period.e), work_date: attachmentDate(workDate),
+    attachment_type: type || "Other", note: String(note || "").trim(), file_name: file.name,
+    storage_path: path, mime_type: file.type, file_size: file.size,
+    uploaded_by_id: String(actor?.id || employee.id), uploaded_by_name: actor?.name || employee.name || "",
+  };
+  const { data, error: insertError } = await supabase.from(DTR_ATTACHMENTS_TABLE).insert(row).select("*").single();
+  if (insertError) {
+    await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).remove([path]);
+    throw insertError;
+  }
+  return { ...data, url: await signedAttachmentUrl(path) };
+}
+
+async function removeDtrAttachment(item) {
+  if (!cloudReady() || !item?.id) throw new Error("Attachment storage is not configured.");
+  const { error: rowError } = await supabase.from(DTR_ATTACHMENTS_TABLE).delete().eq("id", item.id);
+  if (rowError) throw rowError;
+  if (item.storage_path) await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).remove([item.storage_path]);
 }
 
 function mergeDtrProfiles(roster, profiles) {
@@ -1095,6 +1155,31 @@ const CSS = `
 .qm .modal .row button{flex:1;padding:11px;font-family:var(--disp);font-size:16px;letter-spacing:.08em;text-transform:uppercase;border:1.5px solid var(--ink);background:#fff;color:var(--ink)}
 .qm .modal .row button.pri{background:var(--ink);color:#fff}
 .qm .modal .row button.del{border-color:var(--rust);color:var(--rust)}
+.qm .attachmentBox{width:min(680px,100%);max-height:min(90vh,760px);overflow:auto}
+.qm .attachmentModalHead{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}
+.qm .attachmentModalHead h3{margin-bottom:5px}
+.qm .attachmentModalHead p{line-height:1.45}
+.qm .attachmentModalHead p span{font-family:var(--mono);font-size:11px}
+.qm .attachmentClose{border:0;background:none;color:var(--ink);font-size:28px;line-height:1;cursor:pointer;padding:0 4px}
+.qm .attachmentUpload{border:1px solid var(--rule);background:var(--paper2);padding:12px;margin:6px 0 14px;display:grid;gap:10px}
+.qm .attachmentUploadGrid{display:grid;grid-template-columns:150px minmax(0,1fr);gap:10px}
+.qm .attachmentUpload label{display:block}
+.qm .attachmentUpload input[type=file]{font-family:var(--mono);font-size:11px;width:100%;padding:7px 0}
+.qm .attachmentUploadFooter,.qm .attachmentListHead{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.qm .attachmentListHead{border-bottom:1px solid var(--rule);padding-bottom:8px}
+.qm .attachmentList{display:grid;gap:7px;margin-top:9px}
+.qm .attachmentItem{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:9px;align-items:center;border:1px solid var(--rule-soft);padding:8px;background:#fff}
+.qm .attachmentItem input{accent-color:var(--ink);width:16px;height:16px}
+.qm .attachmentInfo{min-width:0;display:grid;gap:2px}
+.qm .attachmentInfo strong{font-family:var(--disp);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.qm .attachmentInfo span,.qm .attachmentInfo small{font-family:var(--mono);font-size:10px;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qm .attachmentItemActions{display:flex;gap:5px}
+.qm .attachmentItemActions .danger{color:var(--rust);border-color:var(--rust)}
+.qm .dtrDateCell{position:relative}
+.qm .dtrAttachmentTrigger{position:absolute;right:2px;top:2px;width:18px;height:18px;display:grid;place-items:center;border:1px solid var(--rule);background:#fff;color:var(--ink);font-family:var(--mono);font-size:15px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s ease}
+.qm .dtrDateCell:hover .dtrAttachmentTrigger,.qm .dtrAttachmentTrigger:focus{opacity:1}
+.qm .dtrAttachmentTrigger.has{opacity:1;color:var(--rust);border-color:var(--rust);font-size:9px;font-weight:bold}
+.qm .dtrAttachmentPrint{display:none}
 .qm .wheelPicker{outline:none}
 /* the field gets the full width of the box so the whole value, AM/PM included, stays visible */
 .qm .manualTimeLabel{display:grid;grid-template-columns:1fr;gap:6px;font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft)}
@@ -1162,6 +1247,14 @@ const CSS = `
   .qm .signaturePlacementActions .btn{min-height:44px}
   .qm .modal{padding:10px}
   .qm .modal .box{padding:18px 14px;width:min(420px,100%)}
+  .qm .attachmentBox{width:min(680px,100%);max-height:calc(100vh - 20px)}
+  .qm .attachmentUploadGrid{grid-template-columns:1fr}
+  .qm .attachmentUploadFooter,.qm .attachmentListHead{align-items:stretch;flex-direction:column}
+  .qm .attachmentUploadFooter .btn,.qm .attachmentListHead .btn{width:100%;min-height:44px}
+  .qm .attachmentItem{grid-template-columns:auto minmax(0,1fr)}
+  .qm .attachmentItemActions{grid-column:2;justify-content:flex-start}
+  .qm .attachmentItemActions .btn{min-height:40px}
+  .qm .dtrAttachmentTrigger{opacity:1;position:relative;display:inline-grid;right:auto;top:auto;margin-left:3px;vertical-align:middle}
   .qm .wheelColumns{grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) minmax(0,.9fr);gap:3px}
   .qm .wheelColumn [data-rwp-option],.qm .wheelColumn [data-rwp-highlight-item]{font-size:19px}
   .qm table.roster{display:block;overflow-x:auto;white-space:nowrap}
@@ -1200,6 +1293,7 @@ const SHEET_CSS = `
 .sheet .dtr input,.sheet .dtr .cell{width:100%;height:100%;min-height:6.4mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7.2pt;text-align:center;padding:0;color:#000}
 .sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none;white-space:pre-wrap;overflow-wrap:normal;word-break:normal}
 .sheet .dtr input:focus,.sheet .dtr .cell:focus{background:#FFF3D0;outline:none}
+.sheet .dtrAttachmentPrint{display:none}
 .sheet .sig{margin-top:13mm}
 .sheet .sig td{font-size:8pt;text-align:center;font-weight:bold;letter-spacing:0.3pt;padding-top:1.2mm}
 .sheet .sig td.ln{border-top:0.9pt solid #000;position:relative;overflow:visible;isolation:isolate}
@@ -1218,8 +1312,101 @@ const PRINT_CSS = `
   .sheetwrap{background:none;padding:0;overflow:visible}
   .shadow{box-shadow:none}
   .sheet{width:auto;padding:0;min-height:calc(var(--paper-height) - 18mm)!important}
+  .sheet .dtrAttachmentPrint{display:block;font-size:6.5pt;line-height:1.2;margin-top:1mm;color:#263746}
 }
 `;
+
+const htmlEscape = (value) => String(value == null ? "" : value)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+const formatFileSize = (bytes) => {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+};
+const isAttachmentImage = (item) => String(item?.mime_type || "").startsWith("image/");
+
+function printDtrAttachments(items, title = "DTR supporting documents") {
+  const list = (items || []).filter((item) => item?.url);
+  if (!list.length) return;
+  let win = null;
+  try { win = window.open("", "_blank"); } catch { win = null; }
+  if (!win) return;
+  const body = list.map((item) => {
+    const heading = `<h2>${htmlEscape(item.attachment_type)} — ${htmlEscape(item.file_name)}</h2>`;
+    const meta = `<p class="meta">${htmlEscape(item.work_date)} · ${htmlEscape(item.employee_name)} · ${htmlEscape(item.note || "")}</p>`;
+    if (isAttachmentImage(item)) return `<section>${heading}${meta}<img src="${htmlEscape(item.url)}" alt="${htmlEscape(item.file_name)}" /></section>`;
+    if (item.mime_type === "application/pdf") return `<section>${heading}${meta}<iframe src="${htmlEscape(item.url)}" title="${htmlEscape(item.file_name)}"></iframe></section>`;
+    return `<section>${heading}${meta}<p><a href="${htmlEscape(item.url)}">Open attachment</a></p></section>`;
+  }).join("");
+  win.document.write(`<!doctype html><html><head><title>${htmlEscape(title)}</title><style>
+    @page{margin:12mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#12233A;margin:0}
+    section{break-after:page;min-height:90vh;padding:4mm 0}section:last-child{break-after:auto}
+    h2{font-size:18px;margin:0 0 6px;border-bottom:2px solid #12233A;padding-bottom:6px}
+    .meta{font-size:11px;color:#526273;margin:0 0 18px}img{display:block;max-width:100%;max-height:230mm;margin:auto;object-fit:contain}
+    iframe{width:100%;height:245mm;border:1px solid #ccd3da}a{color:#12233A}
+  </style></head><body>${body}</body></html>`);
+  win.document.close();
+  setTimeout(() => { try { win.focus(); win.print(); } catch {} }, 900);
+}
+
+function AttachmentModal({ employee, actor, period, date, items, canEdit, onClose, onAdded, onRemoved }) {
+  const [type, setType] = useState("Gate Pass");
+  const [note, setNote] = useState("");
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState(() => new Set((items || []).map((item) => item.id)));
+  const dateLabel = new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+
+  useEffect(() => { setSelected(new Set((items || []).map((item) => item.id))); }, [items]);
+
+  const upload = async () => {
+    if (!file || busy) return;
+    setBusy(true);
+    try {
+      const item = await uploadDtrAttachment({ employee, actor, period, workDate: date, type, note, file });
+      onAdded(item);
+      setFile(null); setNote("");
+      const input = document.getElementById("dtr-attachment-file");
+      if (input) input.value = "";
+    } catch (error) {
+      onAdded(null, error?.message || "Could not upload attachment.");
+    } finally { setBusy(false); }
+  };
+
+  const chosen = (items || []).filter((item) => selected.has(item.id));
+  const toggle = (id) => setSelected((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  return (
+    <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="box attachmentBox">
+        <div className="attachmentModalHead"><div><h3>Supporting documents</h3><p>{dateLabel}<br /><span>{employee.name || employee.id} · {periodLabel(period)}</span></p></div><button type="button" className="attachmentClose" onClick={onClose} aria-label="Close">×</button></div>
+        {canEdit && <div className="attachmentUpload">
+          <div className="attachmentUploadGrid">
+            <label><span className="lbl">Document type</span><select value={type} onChange={(e) => setType(e.target.value)}>{ATTACHMENT_TYPES.map((item) => <option key={item}>{item}</option>)}</select></label>
+            <label><span className="lbl">File</span><input id="dtr-attachment-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={(e) => setFile(e.target.files?.[0] || null)} /></label>
+          </div>
+          <label><span className="lbl">Note (optional)</span><input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Short description" /></label>
+          <div className="attachmentUploadFooter"><span className="hint">PDF, JPG, PNG, or WEBP · max 10 MB</span><button type="button" className="btn sm" disabled={!file || busy} onClick={upload}>{busy ? "Uploading…" : "Upload attachment"}</button></div>
+        </div>}
+        <div className="attachmentListHead"><strong>{items.length ? `${items.length} attachment${items.length === 1 ? "" : "s"}` : "No attachments for this date"}</strong>{items.length > 0 && <button type="button" className="btn ghost sm" onClick={() => printDtrAttachments(chosen, `DTR attachments — ${date}`)} disabled={!chosen.length}>Print selected ({chosen.length})</button>}</div>
+        {items.length > 0 && <div className="attachmentList">{items.map((item) => (
+          <div className="attachmentItem" key={item.id}>
+            <input type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} aria-label={`Select ${item.file_name}`} />
+            <div className="attachmentInfo"><strong>{item.attachment_type}</strong><span>{item.file_name} · {formatFileSize(item.file_size)}</span>{item.note && <small>{item.note}</small>}</div>
+            <div className="attachmentItemActions"><button type="button" className="btn ghost sm" onClick={() => printDtrAttachments([item], `DTR attachment — ${item.file_name}`)}>Print</button>{canEdit && <button type="button" className="btn ghost sm danger" onClick={async () => { if (!window.confirm(`Remove ${item.file_name}?`)) return; try { await removeDtrAttachment(item); onRemoved(item.id); } catch (error) { onAdded(null, error?.message || "Could not remove attachment."); } }}>Remove</button>}</div>
+          </div>
+        ))}</div>}
+        <div className="row"><button type="button" onClick={onClose}>Close</button></div>
+      </div>
+    </div>
+  );
+}
 
 /* ============================ component ============================ */
 /* Setting a passcode and an admin resetting one are the same form with one difference:
@@ -1329,6 +1516,8 @@ export default function DTRSystem({ onBack }) {
   const [syncError, setSyncError] = useState("");
   const [flash, setFlash] = useState("");
   const [signatureBusy, setSignatureBusy] = useState({});
+  const [attachments, setAttachments] = useState([]);
+  const [attachmentOpenDate, setAttachmentOpenDate] = useState("");
   /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
   const [saveState, setSaveState] = useState("synced");
   const [clock, setClock] = useState(new Date());
@@ -1714,6 +1903,20 @@ export default function DTRSystem({ onBack }) {
   const days = periodDays(period).filter((d) => d.getDay() !== 0 || workedOn(d));
 
   useEffect(() => {
+    if (!me || view !== "dtr") { setAttachments([]); return undefined; }
+    let alive = true;
+    setAttachments([]);
+    listDtrAttachments(me.id, period).then((items) => { if (alive) setAttachments(items); });
+    return () => { alive = false; };
+  }, [me, view, perStart]);
+
+  const attachmentsForDate = (dateStr) => attachments.filter((item) => item.work_date === dateStr);
+  const addAttachment = (item, error) => {
+    if (error) { say(error); return; }
+    if (item) { setAttachments((prev) => [...prev, item].sort((a, b) => String(a.work_date).localeCompare(String(b.work_date)))); say("Attachment uploaded"); }
+  };
+
+  useEffect(() => {
     if (!me || view !== "dtr") return;
     const yrs = [];
     days.forEach((d) => { if (yrs.indexOf(d.getFullYear()) < 0) yrs.push(d.getFullYear()); });
@@ -1754,6 +1957,10 @@ export default function DTRSystem({ onBack }) {
       let dSum = 0, oSum = 0;
       const rows = days.map((d) => {
         const r = recFor(me.id, iso(d));
+        const dateAttachments = attachmentsForDate(iso(d));
+        const attachmentNote = dateAttachments.length
+          ? `Attachments: ${dateAttachments.map((item) => `${item.attachment_type} — ${item.file_name}`).join(", ")}`
+          : "";
         const dm = dayMinutes(r, sched), om = otMinutes(r);
         dSum += dm; oSum += om;
         return {
@@ -1763,7 +1970,7 @@ export default function DTRSystem({ onBack }) {
           times: SLOTS.map((s) => (r[s.k] ? disp(r[s.k], true) : "")),
           day: dm ? fmtDay(dm, cap) : "",
           ot: om ? fmtDur(om) : "",
-          note: r.note || "",
+          note: [r.note || "", attachmentNote].filter(Boolean).join("\n"),
         };
       });
       if (dtrPdfOverflows(rows, paperSize)) {
@@ -2167,6 +2374,7 @@ export default function DTRSystem({ onBack }) {
                   ? <a className="btn" href={printHref} download={dtrFileName()}>Print / Save PDF</a>
                   : <button className="btn" disabled style={{ opacity: 0.5 }}>Preparing PDF…</button>}
                 <button className="btn ghost" onClick={doPrint}>Print from browser</button>
+                {attachments.length > 0 && <button className="btn ghost" onClick={() => printDtrAttachments(attachments, `DTR attachments — ${periodLabel(period)}`)}>Print attachments ({attachments.length})</button>}
               </div>
               {pdfWarning && <div role="alert" className="pastnote" style={{ marginTop: 10, marginBottom: 0 }}>{pdfWarning}</div>}
               <p className="hint">
@@ -2233,13 +2441,17 @@ export default function DTRSystem({ onBack }) {
                     {days.map((d) => {
                       const ds = iso(d);
                       const r = recFor(me.id, ds);
+                      const dateAttachments = attachmentsForDate(ds);
                       const dm = dayMinutes(r, sched), om = otMinutes(r);
                       dTot += dm; oTot += om;
                       return (
                         <tr key={ds}>
-                          <td className="dt">
+                          <td className="dt dtrDateCell">
                             {MON[d.getMonth()].slice(0, 3)} {d.getDate()}
                             {d.getDay() === 0 && <span className="sund"> SUN</span>}
+                            <button type="button" className={`dtrAttachmentTrigger${dateAttachments.length ? " has" : ""}`} onClick={() => setAttachmentOpenDate(ds)} aria-label={`Supporting documents for ${ds}`} title="Add or manage supporting documents">
+                              {dateAttachments.length ? dateAttachments.length : "+"}
+                            </button>
                           </td>
                           {r.leave ? (
                             <>
@@ -2286,6 +2498,7 @@ export default function DTRSystem({ onBack }) {
                                 writeRec(me.id, ds, (rr) => { rr.note = v; });
                               }}
                             >{r.note || ""}</div>
+                            {dateAttachments.length > 0 && <div className="dtrAttachmentPrint">Attachments: {dateAttachments.map((item) => `${item.attachment_type} — ${item.file_name}`).join(" · ")}</div>}
                           </td>
                         </tr>
                       );
@@ -2580,6 +2793,20 @@ export default function DTRSystem({ onBack }) {
             </div>
           </div>
         </div>
+      )}
+
+      {attachmentOpenDate && (
+        <AttachmentModal
+          employee={liveMe}
+          actor={actorEmp || liveMe}
+          period={period}
+          date={attachmentOpenDate}
+          items={attachmentsForDate(attachmentOpenDate)}
+          canEdit={canEdit}
+          onClose={() => setAttachmentOpenDate("")}
+          onAdded={addAttachment}
+          onRemoved={(id) => { setAttachments((prev) => prev.filter((item) => item.id !== id)); say("Attachment removed"); }}
+        />
       )}
 
       {toast && <div className="toast">{toast}</div>}
