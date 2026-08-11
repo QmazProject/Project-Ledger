@@ -50,7 +50,7 @@ function disp(hm, withMer) {
   let hh = a[0] % 12; if (hh === 0) hh = 12;
   return `${hh}:${p2(a[1])}${withMer ? " " + mer : ""}`;
 }
-function parseTime(txt, merHint) {
+function parseTime(txt, merHint, slotKey) {
   if (!txt) return "";
   const t = txt.trim().toUpperCase();
   const m = t.match(/^(\d{1,2})[:.\s]?(\d{2})?\s*(AM|PM|A|P)?$/);
@@ -58,11 +58,13 @@ function parseTime(txt, merHint) {
   let h = +m[1];
   const mi = m[2] ? +m[2] : 0;
   if (h > 23 || mi > 59) return null;
-  /* The time input returns 24-hour values such as 12:19. A slot meridian
-     hint must not turn noon into 00:19, which makes AM out look earlier
-     than AM in. Only bare hour input needs the slot hint. */
+  /* The time input returns 24-hour values such as 12:19. A bare 12 in the
+     AM-out field means noon in normal timesheet shorthand; explicit AM/PM
+     suffixes still always win, and other bare AM fields remain unchanged. */
   const mer = m[3]
     ? (m[3][0] === "A" ? "AM" : "PM")
+    : slotKey === "amOut" && h === 12 && !t.includes(":")
+      ? "PM"
     : t.includes(":")
       ? null
       : h <= 12 ? merHint : null;
@@ -86,13 +88,16 @@ const wrapPdfText = (value, maxW, size, bold) => {
   const lines = [];
   String(value == null ? "" : value).replace(/\r\n?/g, "\n").split("\n").forEach((paragraph) => {
     if (!paragraph) { lines.push(""); return; }
-    let current = "";
-    for (const ch of paragraph) {
-      const next = current + ch;
-      if (current && txtW(next, size, bold) > maxW) {
+    const words = paragraph.trim().split(/\s+/).filter(Boolean);
+    let current = words.shift() || "";
+    for (const word of words) {
+      const next = `${current} ${word}`;
+      if (txtW(next, size, bold) > maxW) {
         lines.push(current);
-        current = ch;
-      } else current = next;
+        current = word;
+      } else {
+        current = next;
+      }
     }
     lines.push(current);
   });
@@ -1023,7 +1028,7 @@ const CSS = `
 
 /* the printed A4 form — kept separate so the print window can reuse it verbatim */
 const SHEET_CSS = `
-.sheet{width:190mm;margin:0 auto;background:#fff;padding:5mm 5mm 6mm;font-family:Arial,Helvetica,sans-serif;color:#000;font-size:8.5pt;line-height:1.2}
+.sheet{position:relative;width:190mm;margin:0 auto;background:#fff;padding:5mm 5mm 6mm;font-family:Arial,Helvetica,sans-serif;color:#000;font-size:8.5pt;line-height:1.2}
 .sheet table{border-collapse:collapse;table-layout:fixed;width:100%}
 .sheet .hdr td{border:0.9pt solid #000;padding:1mm 2mm;vertical-align:middle}
 .sheet .hdr .logoc{width:19mm;text-align:center;padding:1.2mm}
@@ -1049,7 +1054,7 @@ const SHEET_CSS = `
 .sheet .dtr td.actc{text-align:left;padding:0 1.6mm;font-size:7.8pt;line-height:1.25}
 .sheet .dtr tr.tot td{font-weight:bold;height:7.4mm;font-size:8.5pt;letter-spacing:0.3pt}
 .sheet .dtr input,.sheet .dtr .cell{width:100%;height:100%;min-height:6.4mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7.2pt;text-align:center;padding:0;color:#000}
-.sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none;white-space:pre-wrap;overflow-wrap:anywhere}
+.sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none;white-space:pre-wrap;overflow-wrap:normal;word-break:normal}
 .sheet .dtr input:focus,.sheet .dtr .cell:focus{background:#FFF3D0;outline:none}
 .sheet .sig{margin-top:13mm}
 .sheet .sig td{font-size:8pt;text-align:center;font-weight:bold;letter-spacing:0.3pt;padding-top:1.2mm}
@@ -1058,16 +1063,17 @@ const SHEET_CSS = `
 .sheet .sig td.ln .siglabel{position:relative;z-index:1}
 .sheet .sig td.ln .sigimg{position:absolute;left:calc(50% + var(--sig-x, 0mm));bottom:calc(-1mm + var(--sig-y, 0mm));z-index:10;transform:translateX(-50%) scale(var(--sig-scale, 1));max-width:42mm;max-height:13mm;object-fit:contain;pointer-events:none}
 .sheet .sig td.sp{border:none;width:7mm}
+.sheet .controlNo{position:absolute;right:5mm;bottom:4.2mm;font-size:7pt;line-height:1;font-weight:normal;white-space:nowrap}
 `;
 
 const PRINT_CSS = `
 @media print{
   @page{size:Legal portrait;margin:9mm}
   .qm{background:#fff;padding:0}
-  .qm .noprint{display:none!important}
-  .qm .sheetwrap{background:none;padding:0;overflow:visible}
-  .qm .shadow{box-shadow:none}
-  .qm .sheet{width:auto;padding:0}
+  .noprint{display:none!important}
+  .sheetwrap{background:none;padding:0;overflow:visible}
+  .shadow{box-shadow:none}
+  .sheet{width:auto;padding:0;min-height:calc(var(--paper-height) - 18mm)!important}
 }
 `;
 
@@ -1437,7 +1443,7 @@ export default function DTRSystem({ onBack }) {
   async function applyEdit(val, cleared) {
     const { slot, dateStr } = editing;
     if (cleared) { await writeRec(me.id, dateStr, (r) => { delete r[slot.k]; }); setEditing(null); return; }
-    const t = parseTime(val, slot.mer);
+    const t = parseTime(val, slot.mer, slot.k);
     if (t === null) { say("Could not read that time"); return; }
     const candidate = { ...recFor(me.id, dateStr), [slot.k]: t };
     const issue = recordOrderIssue(candidate);
@@ -1519,6 +1525,9 @@ export default function DTRSystem({ onBack }) {
   const dtrFileName = () =>
     `DTR_${(me && me.name ? me.name : "employee").replace(/\s+/g, "_")}_${periodLabel(period).replace(/[^\w]+/g, "-")}.pdf`;
 
+  const printPageStyles = () =>
+    SHEET_CSS + PRINT_CSS + `@page{size:${paper.css} portrait;margin:9mm} html,body{margin:0;padding:0;background:#fff} .sheet{box-sizing:border-box;width:190mm;margin:0 auto;padding:0;box-shadow:none}`;
+
   /* a real anchor with a prepared blob URL survives sandboxes that block scripted popups */
   useEffect(() => {
     if (view !== "dtr" || !me) return;
@@ -1574,7 +1583,7 @@ export default function DTRSystem({ onBack }) {
     const parts = [
       "<!DOCTYPE html>", "<html>", "<head>", '<meta charset="utf-8">',
       "<title>Daily Time Record</title>",
-      "<sty" + "le>" + SHEET_CSS + `@page{size:${paper.css} portrait;margin:9mm} html,body{margin:0;padding:0;background:#fff} .sheet{width:auto;margin:0;padding:0;box-shadow:none}</sty` + "le>",
+      "<sty" + "le>" + printPageStyles() + "</sty" + "le>",
       "</head>", "<bo" + "dy>", clone.outerHTML, "</bo" + "dy>", "</html>",
     ];
     return parts.join("");
@@ -1587,7 +1596,7 @@ export default function DTRSystem({ onBack }) {
     try { w = window.open("", "_blank"); } catch (e) { w = null; }
     if (w && w.document) {
       const st = w.document.createElement("style");
-      st.textContent = SHEET_CSS + `@page{size:${paper.css} portrait;margin:9mm} .sheet{width:auto;margin:0;padding:0}`;
+      st.textContent = printPageStyles();
       w.document.head.appendChild(st);
       w.document.title = "Daily Time Record";
       w.document.body.style.margin = "0";
@@ -1928,7 +1937,7 @@ export default function DTRSystem({ onBack }) {
             </div>
 
             <div className="sheetwrap">
-              <div className="sheet shadow" ref={sheetRef}>
+              <div className="sheet shadow" ref={sheetRef} style={{ "--paper-height": `${(paper.height / 72) * 25.4}mm`, minHeight: `${(paper.height / 72) * 25.4}mm` }}>
                 <table className="hdr">
                   <tbody>
                     <tr>
@@ -2003,11 +2012,17 @@ export default function DTRSystem({ onBack }) {
                                 key={ds + s.k + (r[s.k] || "")}
                                 defaultValue={r[s.k] ? disp(r[s.k], true) : ""}
                                 readOnly={!canEdit}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    e.currentTarget.blur();
+                                  }
+                                }}
                                 onBlur={(e) => {
                                   if (!canEdit) return;
                                   const reset = () => { e.target.value = r[s.k] ? disp(r[s.k], true) : ""; };
                                   const raw = e.target.value.trim();
-                                  const t = raw ? parseTime(raw, s.mer) : "";
+                                  const t = raw ? parseTime(raw, s.mer, s.k) : "";
                                   if (t === null) { say("Could not read that time"); reset(); return; }
                                   if ((r[s.k] || "") === (t || "")) return;
                                   if (t) {
@@ -2057,6 +2072,7 @@ export default function DTRSystem({ onBack }) {
                     </tr>
                   </tbody>
                 </table>
+                <div className="controlNo">{DTR_CONTROL_NO}</div>
               </div>
             </div>
           </>

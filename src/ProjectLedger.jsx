@@ -268,18 +268,27 @@ async function saveDataset(store, label, userId, username) {
 async function loadManual() {
   if (!isConfigured || !supabase) return {};
   const { data, error } = await supabase.from("project_manual_updates")
-    .select("project_id, target_qty, unit, start_date, target_completion, actual_completion, actual_output, remarks");
+    .select("project_id, status, contract_amount, target_qty, unit, start_date, target_completion, actual_completion, actual_output, remarks");
   if (error) throw error;
-  return Object.fromEntries((data || []).map((row) => [row.project_id, {
-    target: row.target_qty, unit: row.unit, start: row.start_date,
-    due: row.target_completion, finish: row.actual_completion,
-    actual: row.actual_output, note: row.remarks,
-  }]));
+  return Object.fromEntries((data || []).map((row) => {
+    const manual = {
+      target: row.target_qty, unit: row.unit, start: row.start_date,
+      due: row.target_completion, finish: row.actual_completion,
+      actual: row.actual_output, note: row.remarks,
+    };
+    if (row.status !== null && row.status !== undefined) manual.status = row.status;
+    if (row.contract_amount !== null && row.contract_amount !== undefined) manual.contract = row.contract_amount;
+    return [row.project_id, manual];
+  }));
 }
-async function saveManualRow(id, values, oldValues, userId, username) {
+async function saveManualRow(id, values, oldValues, userId, username, changedFields) {
   if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
+  if (values.contract !== "" && values.contract !== null && toNum(values.contract) === null)
+    throw new Error("Contract must be a numeric amount.");
   const { error } = await supabase.from("project_manual_updates").upsert({
     project_id: id,
+    status: CLEAN(values.status) || null,
+    contract_amount: values.contract === "" || values.contract === null ? null : toNum(values.contract),
     target_qty: values.target === "" || values.target === null ? null : toNum(values.target),
     unit: values.unit || null,
     start_date: values.start || null,
@@ -293,11 +302,13 @@ async function saveManualRow(id, values, oldValues, userId, username) {
   if (error) throw error;
 
   const auditFields = [
+    ["status", "Status"], ["contract", "Contract"],
     ["target", "Target qty"], ["unit", "Unit"], ["start", "Start date"],
     ["due", "Target completion"], ["finish", "Actual completion"],
     ["actual", "Actual output"], ["note", "Remarks"],
   ];
   const changes = auditFields
+    .filter(([field]) => !changedFields || changedFields.has(field))
     .filter(([field]) => String(oldValues?.[field] ?? "") !== String(values?.[field] ?? ""))
     .map(([field, label]) => ({
       project_id: id,
@@ -382,8 +393,8 @@ const COLS = [
   { k: "engineer", label: "Senior engineer" },
   { k: "category", label: "Category" },
   { k: "location", label: "Location" },
-  { k: "status", label: "Status", pill: true },
-  { k: "contract", label: "Contract", money: true, w: 101 },
+  { k: "status", label: "Status", edit: "status", w: 160 },
+  { k: "contract", label: "Contract", edit: "amount", money: true, w: 101 },
   { k: "swa", label: "SWA %", pct: true },
   { k: "billpct", label: "Billed %", pct: true },
   { k: "net", label: "Collected (net)", money: true, group: "collection" },
@@ -824,13 +835,20 @@ function StatusChart({ rows }) {
 function EditCell({ value, type, onChange }) {
   const [focus, setFocus] = useState(false);
   const v = value ?? "";
+  const numericValue = type === "amount" ? toNum(v) : null;
+  const displayValue = type === "amount" && !focus && v !== ""
+    ? (numericValue === null ? v : money(numericValue))
+    : v;
 
   return (
     <input
-      value={v}
+      value={displayValue}
       type={type === "date" ? "date" : "text"}
-      inputMode={type === "qty" ? "decimal" : undefined}
-      onChange={(e) => onChange(e.target.value)}
+      inputMode={type === "qty" || type === "amount" ? "decimal" : undefined}
+      list={type === "status" ? "project-status-suggestions" : undefined}
+      onChange={(e) => onChange(type === "amount"
+        ? e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
+        : e.target.value)}
       onFocus={() => setFocus(true)}
       onBlur={() => setFocus(false)}
       onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
@@ -838,7 +856,7 @@ function EditCell({ value, type, onChange }) {
         width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
         background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
         fontFamily: type === "text" ? BODY : MONO, fontSize: 11.5, color: T.ink,
-        textAlign: type === "qty" ? "right" : "left", outline: "none",
+        textAlign: type === "qty" || type === "amount" ? "right" : "left", outline: "none",
       }}
     />
   );
@@ -913,7 +931,7 @@ function AuditModal({ target, onClose }) {
 }
 
 
-function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell, dirtyIds, dirtyCount, savingIds }) {
+function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell, dirtyIds, dirtyCount, savingIds, statusOptions = [] }) {
   const [showCollection, setShowCollection] = useState(false);
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
@@ -963,6 +981,9 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                 style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft }}>Export filtered CSV</button>
       </div>
     }>
+      <datalist id="project-status-suggestions">
+        {statusOptions.map((status) => <option key={status} value={status} />)}
+      </datalist>
       {data.length === 0 ? (
         <div className="py-10 text-center text-xs" style={{ color: T.inkFaint }}>No projects match these filters.</div>
       ) : (
@@ -1526,10 +1547,13 @@ export default function ProjectLedger({ user, onSignOut }) {
   const saveRow = async (id) => {
     if (!drafts[id] || savingIds.has(id)) return;
     const values = { ...(manual[id] || {}), ...drafts[id] };
+    const imported = importedRows.find((row) => row.id === id) || {};
+    const previous = { ...imported, ...(manual[id] || {}) };
+    const changedFields = new Set(Object.keys(drafts[id]));
     setSavingIds((prev) => new Set(prev).add(id));
     setSaveMessage("");
     try {
-      await saveManualRow(id, values, manual[id], user?.id, username);
+      await saveManualRow(id, values, previous, user?.id, username, changedFields);
       setManual((prev) => ({ ...prev, [id]: values }));
       setDrafts((prev) => { const next = { ...prev }; delete next[id]; return next; });
       setSaveMessage(`Saved changes for ${id}.`);
@@ -1559,9 +1583,13 @@ export default function ProjectLedger({ user, onSignOut }) {
     const merged = m || draft ? { ...r, ...(m || {}), ...(draft || {}) } : { ...r };
     const set = (x) => x !== undefined && x !== null && x !== "";
     merged.hasTarget = set(merged.target) || set(merged.due) ? "With target" : "No target";
-    if ((m?.note || draft?.note)) merged._hay = r._hay + " " + (merged.note || "").toLowerCase();
+    if (m || draft) merged._hay = [r._hay, merged.status, merged.contract, merged.note].filter(set).join(" ").toLowerCase();
     return merged;
   }), [importedRows, manual, drafts]);
+  const statusOptions = useMemo(() => [...new Set([
+    "ONGOING", "SUSPENDED", "COMPLETED",
+    ...records.map((r) => r.status).filter(Boolean),
+  ])].sort((a, b) => String(a).localeCompare(String(b))), [records]);
 
   const handleFiles = async (files) => {
     setBusy(true);
@@ -1792,7 +1820,7 @@ export default function ProjectLedger({ user, onSignOut }) {
             )}
             <LedgerTable rows={rows} sort={sort} onSort={onSort} onExport={exportCsv} onEdit={editManual}
                          onSaveRow={saveRow} onSaveAll={saveAll} dirtyIds={dirtyIds} dirtyCount={dirtyCount}
-                         savingIds={savingIds} onAuditCell={setAuditTarget} />
+                         savingIds={savingIds} onAuditCell={setAuditTarget} statusOptions={statusOptions} />
 
             <TargetAnalysis rows={rows} />
             {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
@@ -1807,4 +1835,3 @@ export default function ProjectLedger({ user, onSignOut }) {
     </div>
   );
 }
-
