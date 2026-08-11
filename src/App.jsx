@@ -32,7 +32,7 @@ function App() {
   if (dtrOpen) return <DTRSystem onBack={closeDtr} />;
 
   return (
-    <AuthGate>
+    <AuthGate onLoginDoubleTap={openDtr}>
       {(user, signOut) => <ProjectLedger user={user} onSignOut={signOut} />}
     </AuthGate>
   );

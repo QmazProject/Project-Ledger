@@ -6,7 +6,7 @@ import ResetPassword from "./ResetPassword";
 import PwaInstallPrompt from "./PwaInstallPrompt";
 
 /* Renders children(user, signOut) only for a signed-in session. */
-export default function AuthGate({ children }) {
+export default function AuthGate({ children, onLoginDoubleTap }) {
   const [session, setSession] = useState(null);
   const [checking, setChecking] = useState(isConfigured); // nothing to check when unconfigured
   const [recovery, setRecovery] = useState(false);
@@ -43,6 +43,29 @@ export default function AuthGate({ children }) {
 
     return () => { alive = false; sub.subscription.unsubscribe(); };
   }, []);
+
+  useEffect(() => {
+    if (session || recovery || !onLoginDoubleTap) return undefined;
+
+    let lastTap = 0;
+    const onTouchEnd = (event) => {
+      const coarsePointer = window.matchMedia?.("(pointer: coarse)").matches;
+      const hasTouch = navigator.maxTouchPoints > 0;
+      if (!coarsePointer && !hasTouch) return;
+
+      const now = Date.now();
+      if (lastTap && now - lastTap <= 360) {
+        event.preventDefault();
+        lastTap = 0;
+        onLoginDoubleTap();
+      } else {
+        lastTap = now;
+      }
+    };
+
+    document.addEventListener("touchend", onTouchEnd, { passive: false });
+    return () => document.removeEventListener("touchend", onTouchEnd);
+  }, [session, recovery, onLoginDoubleTap]);
 
   if (checking) {
     return (
