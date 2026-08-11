@@ -1,6 +1,6 @@
 {
-  "name": "Forlive Project Ledger",
-  "short_name": "Forlive",
+  "name": "Project Ledger",
+  "short_name": "PL",
   "description": "Project Ledger and Daily Time Record system",
   "id": "/",
   "start_url": "/",

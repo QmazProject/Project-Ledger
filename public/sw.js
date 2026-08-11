@@ -1,4 +1,4 @@
-const VERSION = "forlive-shell-v1";
+const VERSION = "project-ledger-shell-v2";
 const SHELL_CACHE = VERSION;
 const APP_SHELL = [
   "/",
@@ -16,7 +16,7 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) => Promise.all(
-      keys.filter((key) => key.startsWith("forlive-shell-") && key !== SHELL_CACHE)
+      keys.filter((key) => (key.startsWith("forlive-shell-") || key.startsWith("project-ledger-shell-")) && key !== SHELL_CACHE)
         .map((key) => caches.delete(key)),
     )),
   );

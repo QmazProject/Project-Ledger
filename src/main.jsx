@@ -6,7 +6,7 @@ import App from './App.jsx'
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch((error) => {
-      console.warn('Forlive service worker registration failed', error)
+      console.warn('Project Ledger service worker registration failed', error)
     })
   })
 }

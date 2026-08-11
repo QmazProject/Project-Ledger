@@ -17,7 +17,7 @@ function platformHint() {
   const platform = getPlatform();
   if (platform === "ios") return "On iPhone or iPad: tap Share in Safari, choose Add to Home Screen, then tap Add.";
   if (platform === "android") return "On Android: open the browser menu (⋮) and choose Install app or Add to Home screen.";
-  return "On desktop: use the install icon in the address bar or browser menu, then choose Install Forlive.";
+  return "On desktop: use the install icon in the address bar or browser menu, then choose Install Project Ledger.";
 }
 
 export default function PwaInstallPrompt() {
@@ -68,7 +68,7 @@ export default function PwaInstallPrompt() {
   };
 
   return (
-    <aside role="dialog" aria-label="Install Forlive" style={{
+    <aside role="dialog" aria-label="Install Project Ledger" style={{
       position: "fixed", right: 18, bottom: 18, zIndex: 100,
       width: "min(360px, calc(100vw - 36px))", padding: 14,
       background: T.panel, color: T.ink, border: `1px solid ${T.ink}`,
@@ -82,7 +82,7 @@ export default function PwaInstallPrompt() {
         <img src="/icons/icon-192x192.png" alt="" width="44" height="44" style={{ borderRadius: 8, flex: "none" }} />
         <div>
           <div style={{ fontFamily: DISPLAY, fontWeight: 800, fontSize: 17, letterSpacing: ".04em", textTransform: "uppercase" }}>Install application</div>
-          <div style={{ marginTop: 2, color: T.inkSoft, fontSize: 11.5, lineHeight: 1.4 }}>Install Forlive for faster access to Project Ledger and DTR.</div>
+          <div style={{ marginTop: 2, color: T.inkSoft, fontSize: 11.5, lineHeight: 1.4 }}>Install Project Ledger for faster access to the ledger and DTR.</div>
         </div>
       </div>
       <button type="button" onClick={install} disabled={busy} style={{
@@ -92,7 +92,7 @@ export default function PwaInstallPrompt() {
         opacity: busy ? .7 : 1,
       }}>{busy ? "Preparing install…" : "Install application"}</button>
       <div aria-live="polite" style={{ marginTop: 9, color: T.inkSoft, fontFamily: MONO, fontSize: 10.5, lineHeight: 1.45 }}>
-        {hint || (getPlatform() === "ios" ? "iPhone/iPad: use Safari Share → Add to Home Screen." : "Click Install application to install Forlive on this device.")}
+        {hint || (getPlatform() === "ios" ? "iPhone/iPad: use Safari Share → Add to Home Screen." : "Click Install application to install Project Ledger on this device.")}
       </div>
     </aside>
   );
