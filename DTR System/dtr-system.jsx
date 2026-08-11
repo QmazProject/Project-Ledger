@@ -1262,7 +1262,8 @@ const CSS = `
   .qm .attachmentItem{grid-template-columns:auto minmax(0,1fr)}
   .qm .attachmentItemActions{grid-column:2;justify-content:flex-start}
   .qm .attachmentItemActions .btn{min-height:40px}
-  .qm .dtrAttachmentTrigger{opacity:1;position:relative;display:inline-grid;right:auto;top:auto;margin-left:3px;vertical-align:middle}
+  .qm .dtrDateCell{cursor:pointer;touch-action:manipulation}
+  .qm .dtrAttachmentTrigger{display:none!important}
   .qm .wheelColumns{grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) minmax(0,.9fr);gap:3px}
   .qm .wheelColumn [data-rwp-option],.qm .wheelColumn [data-rwp-highlight-item]{font-size:19px}
   .qm table.roster{display:block;overflow-x:auto;white-space:nowrap}
@@ -2456,7 +2457,7 @@ export default function DTRSystem({ onBack }) {
                       dTot += dm; oTot += om;
                       return (
                         <tr key={ds}>
-                          <td className="dt dtrDateCell">
+                          <td className="dt dtrDateCell" onClick={() => setAttachmentOpenDate(ds)} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setAttachmentOpenDate(ds); } }} aria-label={`Supporting documents for ${ds}`}>
                             {MON[d.getMonth()].slice(0, 3)} {d.getDate()}
                             {d.getDay() === 0 && <span className="sund"> SUN</span>}
                             <button type="button" className={`dtrAttachmentTrigger${dateAttachments.length ? " has" : ""}`} onClick={() => setAttachmentOpenDate(ds)} aria-label={`Supporting documents for ${ds}`} title="Add or manage supporting documents">
