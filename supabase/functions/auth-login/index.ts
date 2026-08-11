@@ -50,12 +50,13 @@ Deno.serve(async (request) => {
       }
     }
 
-    const { data: profile, error: profileError } = await admin.from("profiles")
-      .select("id").eq("username", normalizedUsername).maybeSingle();
-    if (profileError || !profile) return json({ error: "Invalid username or password." }, 401);
-    const { data: authUser, error: authUserError } = await admin.auth.admin.getUserById(profile.id);
-    const email = authUser?.user?.email;
-    if (authUserError || !email) return json({ error: "Invalid username or password." }, 401);
+    // Resolve the username through the existing security-definer function.
+    // This replaces a profile lookup plus a separate admin user lookup with
+    // one database round trip while keeping the auth.users table protected.
+    const { data: email, error: emailError } = await admin.rpc("get_login_email", {
+      p_username: normalizedUsername,
+    });
+    if (emailError || !email) return json({ error: "Invalid username or password." }, 401);
 
     // The global Supabase Auth CAPTCHA setting must be disabled. This function
     // performs the conditional verification above instead; passing the same
