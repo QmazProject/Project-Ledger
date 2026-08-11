@@ -4,7 +4,18 @@ import ProjectLedger from "./ProjectLedger";
 import DTRSystem from "../DTR System/dtr-system.jsx";
 
 function App() {
-  const [dtrOpen, setDtrOpen] = useState(false);
+  const [dtrOpen, setDtrOpen] = useState(() => {
+    try { return window.sessionStorage.getItem("forlive.workspace") === "dtr"; }
+    catch { return false; }
+  });
+  const openDtr = () => {
+    try { window.sessionStorage.setItem("forlive.workspace", "dtr"); } catch { /* unavailable */ }
+    setDtrOpen(true);
+  };
+  const closeDtr = () => {
+    try { window.sessionStorage.setItem("forlive.workspace", "ledger"); } catch { /* unavailable */ }
+    setDtrOpen(false);
+  };
 
   useEffect(() => {
     if (dtrOpen) return undefined;
@@ -19,7 +30,7 @@ function App() {
       if (lastTap && now - lastTap <= 360) {
         event.preventDefault();
         lastTap = 0;
-        setDtrOpen(true);
+        openDtr();
       } else {
         lastTap = now;
       }
@@ -33,7 +44,7 @@ function App() {
     const onKeyDown = (event) => {
       if (event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "d") {
         event.preventDefault();
-        setDtrOpen(true);
+        openDtr();
       }
     };
 
@@ -41,7 +52,7 @@ function App() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  if (dtrOpen) return <DTRSystem onBack={() => setDtrOpen(false)} />;
+  if (dtrOpen) return <DTRSystem onBack={closeDtr} />;
 
   return (
     <AuthGate>

@@ -583,14 +583,14 @@ function FilterDropdown({ dim, counts, selected, onToggle, onClearOne, open, onO
     : selected.size + " selected";
 
   return (
-    <div className="relative" style={{ width: dim.w, minWidth: 130, flex: "1 1 auto", maxWidth: 320 }}>
+    <div className="project-filter-dropdown relative" style={{ width: dim.w, minWidth: 130, flex: "1 1 auto", maxWidth: 320 }}>
       <div className="mb-1 text-[9.5px] uppercase"
            style={{ fontFamily: DISPLAY, fontWeight: 600, letterSpacing: ".09em", color: T.inkSoft }}>
         {dim.label}
       </div>
       <button
         onClick={() => onOpen(open ? null : dim.k)}
-        className="flex w-full items-center justify-between gap-2 rounded-sm px-2.5 py-1.5 text-left text-xs"
+        className="project-filter-trigger flex w-full items-center justify-between gap-2 rounded-sm px-2.5 py-1.5 text-left text-xs"
         style={{
           border: `1px solid ${on || open ? T.ink : T.rule}`,
           background: on ? T.ink : T.panel,
@@ -609,7 +609,7 @@ function FilterDropdown({ dim, counts, selected, onToggle, onClearOne, open, onO
       </button>
 
       {open && (
-        <div className="absolute left-0 z-30 mt-1 rounded-sm p-2"
+        <div className="project-filter-menu absolute left-0 z-30 mt-1 rounded-sm p-2"
              style={{ top: "100%", width: Math.max(dim.w, 230), background: T.panel,
                       border: `1px solid ${T.ink}`, boxShadow: "0 18px 40px -20px rgba(22,33,28,.55)" }}>
           {counts.size > 8 && (
@@ -655,14 +655,14 @@ function FilterBar({ q, setQ, filters, countsFor, onToggle, onClearOne, onClearA
   }, [open]);
 
   return (
-    <div ref={ref} className="sticky top-0 z-20 mb-3 rounded-sm px-3 pb-3 pt-2.5"
+    <div ref={ref} className="project-filter-bar sticky top-0 z-20 mb-3 rounded-sm px-3 pb-3 pt-2.5"
          style={{ background: T.panel, border: `1px solid ${T.rule}`, boxShadow: "0 10px 26px -22px rgba(22,33,28,.7)" }}>
-      <div className="flex flex-wrap items-end gap-2">
-        <div className="relative" style={{ width: 220, minWidth: 160, flex: "1 1 auto", maxWidth: 320 }}>
+      <div className="project-filter-controls flex flex-wrap items-end gap-2">
+        <div className="project-filter-search relative" style={{ width: 220, minWidth: 160, flex: "1 1 auto", maxWidth: 320 }}>
           <div className="mb-1 text-[9.5px] uppercase"
                style={{ fontFamily: DISPLAY, fontWeight: 600, letterSpacing: ".09em", color: T.inkSoft }}>Search</div>
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="ID, project name, remarks\u2026"
-                 className="w-full rounded-sm px-2.5 py-1.5 text-xs"
+                 className="project-filter-search-input w-full rounded-sm px-2.5 py-1.5 text-xs"
                  style={{ border: `1px solid ${q ? T.ink : T.rule}` }} />
         </div>
 
@@ -672,8 +672,7 @@ function FilterBar({ q, setQ, filters, countsFor, onToggle, onClearOne, onClearA
                           open={open === d.k} onOpen={setOpen} />
         ))}
 
-        <button onClick={onClearAll} disabled={!anyActive}
-                className="rounded-sm px-2.5 py-1.5 text-[11px]"
+        <button className="project-filter-clear rounded-sm px-2.5 py-1.5 text-[11px]" onClick={onClearAll} disabled={!anyActive}
                 style={{ border: `1px solid ${T.rule}`, color: anyActive ? T.ink : T.inkFaint,
                          background: T.panel, opacity: anyActive ? 1 : 0.5, alignSelf: "flex-end" }}>
           Clear all
@@ -718,7 +717,7 @@ function GroupChart({ rows, groupBy, onGroupBy }) {
       {show.length === 0 ? (
         <div className="py-8 text-center text-xs" style={{ color: T.inkFaint }}>Nothing to chart.</div>
       ) : (
-        <div className="flex gap-2">
+        <div className="project-group-chart flex gap-2">
           {/* y axis */}
           <div className="relative shrink-0" style={{ width: 46, height: PLOT }}>
             {[1, 0.5, 0].map((f) => (
@@ -810,17 +809,17 @@ function StatusChart({ rows }) {
   return (
     <Panel title="Balance for collection by project status">
       {arr.length === 0 && <div className="py-8 text-center text-xs" style={{ color: T.inkFaint }}>Nothing to chart.</div>}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-around", gap: 6 }}>
+      <div className="project-status-chart-body" style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-around", gap: 6 }}>
       {arr.map((a) => (
-        <div key={a.k}>
-          <div className="flex items-center gap-2 text-xs">
-            <span className="w-20 shrink-0 truncate font-semibold" title={a.k}>{a.k}</span>
-            <span className="h-3.5 flex-1" style={{ background: T.paper2, border: `1px solid ${T.ruleSoft}` }}>
+        <div key={a.k} className="project-status-chart-row">
+          <div className="project-status-chart-line flex items-center gap-2 text-xs">
+            <span className="project-status-chart-label w-20 shrink-0 truncate font-semibold" title={a.k}>{a.k}</span>
+            <span className="project-status-chart-bar h-3.5 flex-1" style={{ background: T.paper2, border: `1px solid ${T.ruleSoft}` }}>
               <span className="block h-full" style={{ width: (a.bal / max) * 100 + "%", background: T.collected }} />
             </span>
-            <span className="w-24 shrink-0 text-right text-[11px]" style={{ fontFamily: MONO, color: T.inkSoft }}>{compact(a.bal)}</span>
+            <span className="project-status-chart-value w-24 shrink-0 text-right text-[11px]" style={{ fontFamily: MONO, color: T.inkSoft }}>{compact(a.bal)}</span>
           </div>
-          <div className="mt-0.5 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint, marginLeft: 88 }}>
+          <div className="project-status-chart-count mt-0.5 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint, marginLeft: 88 }}>
             {a.n} project{a.n === 1 ? "" : "s"}
           </div>
         </div>
@@ -956,7 +955,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
 
   return (
     <Panel title="Projects" right={
-      <div className="flex items-center gap-2">
+      <div className="project-ledger-actions flex items-center gap-2">
         <span className="text-[11px]" style={{ fontFamily: MONO, color: T.inkFaint }}>({data.length})</span>
         <button onClick={() => setShowCollection(!showCollection)}
                 className="rounded-sm px-3 py-1 text-xs"
@@ -970,15 +969,21 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
           {showCollection ? "▾ Hide" : "▸ Show"} collection detail ({groupCount})
         </button>
         <button onClick={onSaveAll} disabled={!dirtyCount || savingIds.size > 0}
-                className="rounded-sm px-2.5 py-1 text-xs"
+                className="project-save-action rounded-sm px-2.5 py-1 text-xs"
+                aria-label="Save changes" title="Save changes"
                 style={{ border: `1px solid ${dirtyCount ? T.collected : T.rule}`,
                          background: dirtyCount ? T.collected : T.paper2,
                          color: dirtyCount ? T.paper2 : T.inkFaint,
                          fontFamily: DISPLAY, fontWeight: 700, cursor: dirtyCount ? "pointer" : "default" }}>
-          {savingIds.size ? "Saving…" : `Save changes${dirtyCount ? ` (${dirtyCount})` : ""}`}
+          <svg className="project-action-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M5 3h12l2 2v16H5z"/><path d="M8 3v6h8V3M8 21v-6h8v6"/></svg>
+          <span className="project-action-label">{savingIds.size ? "Saving…" : `Save changes${dirtyCount ? ` (${dirtyCount})` : ""}`}</span>
         </button>
-        <button onClick={() => onExport(data)} className="rounded-sm px-2.5 py-1 text-xs"
-                style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft }}>Export filtered CSV</button>
+        <button onClick={() => onExport(data)} className="project-export-action rounded-sm px-2.5 py-1 text-xs"
+                aria-label="Export filtered CSV" title="Export filtered CSV"
+                style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft }}>
+          <svg className="project-action-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v3h14v-3"/></svg>
+          <span className="project-action-label">Export filtered CSV</span>
+        </button>
       </div>
     }>
       <datalist id="project-status-suggestions">
@@ -1230,13 +1235,13 @@ function TargetAnalysis({ rows }) {
       {/* how the tracked set splits */}
       <div className="mb-1 text-[10px] uppercase tracking-widest"
            style={{ fontFamily: DISPLAY, fontWeight: 600, color: T.inkSoft }}>Where they stand</div>
-      <div className="mb-3 flex h-6 overflow-hidden" style={{ border: `1px solid ${T.ink}`, background: T.paper2 }}>
+      <div className="project-target-status-bar mb-3 flex h-6 overflow-hidden" style={{ border: `1px solid ${T.ink}`, background: T.paper2 }}>
         {buckets.map((b) => counts[b].length ? (
           <div key={b} title={`${b} — ${counts[b].length} project${counts[b].length === 1 ? "" : "s"}`}
                style={{ width: (counts[b].length / tracked.length) * 100 + "%", background: BUCKET_COLOR[b] }} />
         ) : null)}
       </div>
-      <div className="mb-4 flex flex-wrap gap-x-4 gap-y-1 text-[11px]" style={{ color: T.inkSoft }}>
+      <div className="project-target-status-legend mb-4 flex flex-wrap gap-x-4 gap-y-1 text-[11px]" style={{ color: T.inkSoft }}>
         {buckets.map((b) => counts[b].length ? (
           <span key={b}>
             <span className="mr-1.5 inline-block h-2.5 w-2.5 align-[-1px]" style={{ background: BUCKET_COLOR[b] }} />
@@ -1776,7 +1781,7 @@ export default function ProjectLedger({ user, onSignOut }) {
             </div>
 
 
-            <div className="grid gap-3" style={{ gridTemplateColumns: "7fr 3fr", alignItems: "stretch" }}>
+            <div className="project-dashboard-grid grid gap-3" style={{ gridTemplateColumns: "7fr 3fr", alignItems: "stretch" }}>
               <Panel title="Where the money sits">
                 <Meter label="Contract amount — billed vs works still to do"
                   segments={[
@@ -1806,7 +1811,7 @@ export default function ProjectLedger({ user, onSignOut }) {
               <StatusChart rows={rows} />
             </div>
 
-            <div style={{ marginTop: 18 }}>
+            <div className="project-group-chart-wrap" style={{ marginTop: 18 }}>
               <GroupChart rows={rows} groupBy={groupBy} onGroupBy={setGroupBy} />
             </div>
 

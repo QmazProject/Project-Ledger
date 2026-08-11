@@ -1,2 +1,142 @@
 @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 @import "tailwindcss";
+
+/* Project Ledger filters stay compact on desktop, but become a clear one-column
+   control panel on phones so menus do not float over the dashboard content. */
+.project-action-icon {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .project-dashboard-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+    gap: 12px !important;
+  }
+
+  .project-dashboard-grid > *,
+  .project-group-chart-wrap,
+  .project-group-chart {
+    min-width: 0;
+  }
+
+  .project-group-chart-wrap {
+    margin-top: 12px !important;
+  }
+
+  .project-group-chart > .overflow-x-auto {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .project-status-chart-line {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 5px !important;
+  }
+
+  .project-status-chart-label,
+  .project-status-chart-value {
+    width: auto !important;
+  }
+
+  .project-status-chart-label {
+    max-width: none;
+  }
+
+  .project-status-chart-bar {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+  }
+
+  .project-status-chart-count {
+    margin-left: 0 !important;
+    margin-top: 6px !important;
+  }
+
+  .project-target-status-bar {
+    height: 16px !important;
+  }
+
+  .project-target-status-legend {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px !important;
+  }
+
+  .project-target-status-legend > span {
+    min-width: 0;
+    padding: 4px 6px;
+    border: 1px solid #D8DED8;
+    background: #F7F9F6;
+    line-height: 1.25;
+  }
+
+  .project-ledger-actions {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 6px !important;
+  }
+
+  .project-save-action,
+  .project-export-action {
+    width: 40px;
+    height: 40px;
+    padding: 0 !important;
+    display: inline-grid !important;
+    place-items: center;
+    flex: 0 0 40px;
+  }
+
+  .project-action-label {
+    display: none;
+  }
+
+  .project-action-icon {
+    display: block;
+    width: 18px;
+    height: 18px;
+  }
+
+  .project-filter-bar {
+    position: relative !important;
+    top: auto !important;
+    z-index: 10 !important;
+    margin-bottom: 16px !important;
+    padding: 12px !important;
+  }
+
+  .project-filter-controls {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    gap: 10px !important;
+    align-items: stretch !important;
+  }
+
+  .project-filter-search,
+  .project-filter-dropdown,
+  .project-filter-clear {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+  }
+
+  .project-filter-search-input,
+  .project-filter-trigger,
+  .project-filter-clear {
+    min-height: 44px;
+    font-size: 13px !important;
+  }
+
+  .project-filter-menu {
+    width: 100% !important;
+    max-width: 100%;
+    max-height: min(60vh, 420px);
+  }
+
+  .project-filter-clear {
+    justify-self: stretch;
+    padding-block: 10px !important;
+  }
+}

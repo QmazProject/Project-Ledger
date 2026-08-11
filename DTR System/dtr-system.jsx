@@ -334,11 +334,47 @@ function scaleImage(file, max, mime, quality) {
   });
 }
 
-function SignatureEditor({ value, onSave, onRemove }) {
+/* Remove a mostly solid background in the browser and keep the signature as a
+   transparent PNG. Sampling the image corners also works for light/colored
+   paper backgrounds without sending the employee's image to a third party. */
+function removeImageBackground(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth || img.width;
+      canvas.height = img.naturalHeight || img.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const { data, width, height } = image;
+      const corners = [
+        [0, 0], [width - 1, 0], [0, height - 1], [width - 1, height - 1],
+      ];
+      const background = corners.reduce((sum, [x, y]) => {
+        const i = (y * width + x) * 4;
+        return [sum[0] + data[i], sum[1] + data[i + 1], sum[2] + data[i + 2]];
+      }, [0, 0, 0]).map((n) => n / corners.length);
+      for (let i = 0; i < data.length; i += 4) {
+        const distance = Math.hypot(data[i] - background[0], data[i + 1] - background[1], data[i + 2] - background[2]);
+        if (distance <= 42) data[i + 3] = 0;
+        else if (distance < 92) data[i + 3] = Math.round(data[i + 3] * ((distance - 42) / 50));
+      }
+      ctx.putImageData(image, 0, 0);
+      resolve(canvas.toDataURL("image/png"));
+    };
+    img.onerror = () => reject(new Error("not an image"));
+    img.src = dataUrl;
+  });
+}
+
+function SignatureEditor({ value, onSave, onRemove, onRemoveBackground, backgroundBusy }) {
   const canvasRef = useRef(null);
   const drawing = useRef(false);
   const last = useRef(null);
+  const savedTimer = useRef(null);
   const [dirty, setDirty] = useState(false);
+  const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -354,6 +390,14 @@ function SignatureEditor({ value, onSave, onRemove }) {
     }
     setDirty(false);
   }, [value]);
+
+  useEffect(() => () => clearTimeout(savedTimer.current), []);
+
+  const confirmSaved = () => {
+    setSaved(true);
+    clearTimeout(savedTimer.current);
+    savedTimer.current = setTimeout(() => setSaved(false), 1800);
+  };
 
   const point = (event) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -396,10 +440,12 @@ function SignatureEditor({ value, onSave, onRemove }) {
       />
       <div className="signatureActions">
         <button className="btn ghost sm" type="button" onClick={clear}>Clear</button>
-        <button className="btn sm" type="button" disabled={!dirty} onClick={() => { onSave(canvasRef.current.toDataURL("image/png")); setDirty(false); }}>Save signature</button>
+        <button className="btn sm" type="button" disabled={!dirty} onClick={() => { onSave(canvasRef.current.toDataURL("image/png")); setDirty(false); confirmSaved(); }}>Save signature</button>
+        {value && <button className="btn ghost sm" type="button" disabled={backgroundBusy} onClick={onRemoveBackground}>{backgroundBusy ? "Removing…" : "Remove light background"}</button>}
         {value && <button className="btn ghost sm" type="button" onClick={onRemove}>Remove saved</button>}
       </div>
-      <span className="hint">Draw above with a mouse, finger, or stylus, or upload a transparent PNG.</span>
+      {saved && <span className="signatureSaved" role="status"><span className="signatureSavedMark">✓</span> Signature saved</span>}
+      <span className="hint">Draw above with a mouse, finger, or stylus, or upload a transparent PNG. Background removal works best on signatures photographed or scanned on plain paper.</span>
     </div>
   );
 }
@@ -407,12 +453,16 @@ function SignatureEditor({ value, onSave, onRemove }) {
 function SignaturePlacementEditor({ value, x, y, scale, onSave }) {
   const previewRef = useRef(null);
   const interaction = useRef(null);
+  const savedTimer = useRef(null);
   const [draft, setDraft] = useState({ x: Number(x) || 0, y: Number(y) || 0, scale: Number(scale) || 1 });
+  const [saved, setSaved] = useState(false);
   const PX_PER_MM = 4;
 
   useEffect(() => {
     setDraft({ x: Number(x) || 0, y: Number(y) || 0, scale: Number(scale) || 1 });
   }, [value, x, y, scale]);
+
+  useEffect(() => () => clearTimeout(savedTimer.current), []);
 
   const start = (event, mode) => {
     event.preventDefault();
@@ -437,11 +487,16 @@ function SignaturePlacementEditor({ value, x, y, scale, onSave }) {
   const stop = (event) => {
     if (interaction.current && interaction.current.pointerId === event.pointerId) interaction.current = null;
   };
-  const save = () => onSave({
-    signatureX: Math.round(draft.x * 10) / 10,
-    signatureY: Math.round(draft.y * 10) / 10,
-    signatureScale: Math.round(draft.scale * 100) / 100,
-  });
+  const save = () => {
+    onSave({
+      signatureX: Math.round(draft.x * 10) / 10,
+      signatureY: Math.round(draft.y * 10) / 10,
+      signatureScale: Math.round(draft.scale * 100) / 100,
+    });
+    setSaved(true);
+    clearTimeout(savedTimer.current);
+    savedTimer.current = setTimeout(() => setSaved(false), 1800);
+  };
 
   return (
     <div>
@@ -449,21 +504,24 @@ function SignaturePlacementEditor({ value, x, y, scale, onSave }) {
         ref={previewRef} className="signaturePlacementPreview"
         onPointerMove={move} onPointerUp={stop} onPointerCancel={stop}
       >
-        <div className="placementLine" />
-        <span className="placementLabel">EMPLOYEE SIGNATURE</span>
-        <div
-          className="placementObject"
-          style={{ left: `calc(50% + ${draft.x * PX_PER_MM}px)`, bottom: `${28 + draft.y * PX_PER_MM}px`, transform: `translateX(-50%) scale(${draft.scale})` }}
-          onPointerDown={(event) => start(event, "drag")}
-        >
-          <img src={value} alt="Signature placement preview" />
-          <button type="button" className="placementHandle" aria-label="Resize signature" onPointerDown={(event) => start(event, "resize")} />
+        <div className="placementEmployeeCell">
+          <div className="placementLine" />
+          <span className="placementLabel">EMPLOYEE SIGNATURE</span>
+          <div
+            className="placementObject"
+            style={{ left: `calc(50% + ${draft.x * PX_PER_MM}px)`, bottom: `${34 + draft.y * PX_PER_MM}px`, transform: `translateX(-50%) scale(${draft.scale})` }}
+            onPointerDown={(event) => start(event, "drag")}
+          >
+            <img src={value} alt="Signature placement preview" />
+            <button type="button" className="placementHandle" aria-label="Resize signature" onPointerDown={(event) => start(event, "resize")} />
+          </div>
         </div>
       </div>
       <div className="signaturePlacementActions">
-        <span className="hint">Drag the signature. Drag the corner to resize.</span>
+        <span className="placementGuide"><strong>Position signature</strong><span>Drag the signature to move it · drag the corner handle to resize</span><em>Size {Math.round(draft.scale * 100)}%</em></span>
         <button className="btn sm" type="button" onClick={save}>Save placement</button>
       </div>
+      {saved && <span className="signatureSaved placementSaved" role="status"><span className="signatureSavedMark">✓</span> Placement saved</span>}
     </div>
   );
 }
@@ -630,6 +688,9 @@ const logKey = (id, y) => `dtr:log:${id}:${y}`;
 
 /* storage — DTR data stays in its own table and never shares Project Ledger rows */
 const DTR_STORAGE_TABLE = "dtr_storage_dtr";
+const DTR_PROFILE_TABLE = "dtr_employee_profiles";
+const DTR_SESSION_VIEW = "dtr.session.view";
+const DTR_SESSION_EMPLOYEE = "dtr.session.employee";
 
 /* Every value is mirrored on the device before it is sent up, so a punch survives a
    dropped connection instead of vanishing. Keys that have not reached the cloud yet are
@@ -690,6 +751,62 @@ async function sSet(key, val) {
   if (!savedLocally) return "fail";
   markPending(key, true);
   return "local";
+}
+
+/* Identity fields also have a normalized Supabase record so a developer can correct an
+   employee's role without unpacking the larger roster JSON payload. The DTR sign-in is
+   passcode-based and login-free, so these policies intentionally match the existing DTR
+   storage model; the role is enforced by the app, not by Supabase RLS. */
+async function getDtrProfiles() {
+  if (!cloudReady()) return null;
+  try {
+    const { data, error } = await supabase
+      .from(DTR_PROFILE_TABLE)
+      .select("employee_id,name,role")
+      .order("employee_id");
+    return error ? null : (Array.isArray(data) ? data : []);
+  } catch { return null; }
+}
+
+async function saveDtrProfiles(roster) {
+  if (!cloudReady()) return false;
+  const rows = roster
+    .map((e) => ({ employee_id: String(e.id || "").trim(), name: String(e.name || "").trim(), role: e.role === "admin" ? "admin" : "viewer" }))
+    .filter((e) => e.employee_id);
+  try {
+    if (rows.length) {
+      const { error } = await supabase.from(DTR_PROFILE_TABLE).upsert(rows, { onConflict: "employee_id" });
+      if (error) return false;
+    }
+    const { data: existing, error: readError } = await supabase.from(DTR_PROFILE_TABLE).select("employee_id");
+    if (readError) return false;
+    const keep = new Set(rows.map((e) => e.employee_id));
+    const removed = (existing || []).map((e) => e.employee_id).filter((id) => id && !keep.has(id));
+    if (removed.length) {
+      const { error } = await supabase.from(DTR_PROFILE_TABLE).delete().in("employee_id", removed);
+      if (error) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+function mergeDtrProfiles(roster, profiles) {
+  if (!Array.isArray(profiles)) return roster;
+  const byId = new Map(profiles.filter((p) => p && p.employee_id).map((p) => [String(p.employee_id), p]));
+  const seen = new Set();
+  const merged = roster.map((employee) => {
+    const id = String(employee.id || "");
+    const profile = byId.get(id);
+    if (!profile) return employee;
+    seen.add(id);
+    return { ...employee, name: profile.name || employee.name || "", role: profile.role === "admin" ? "admin" : "viewer" };
+  });
+  profiles.forEach((profile) => {
+    const id = String(profile?.employee_id || "").trim();
+    if (!id || seen.has(id)) return;
+    merged.push({ id, name: profile.name || "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: profile.role === "admin" ? "admin" : "viewer" });
+  });
+  return merged;
 }
 
 /* push anything that was written while the cloud was unreachable */
@@ -908,7 +1025,17 @@ const CSS = `
 .qm table.roster input:focus{border-color:var(--ink)}
 .qm .rolesel{width:100%;border:1.5px solid var(--zinc-dk);padding:8px 6px;font-size:13.5px;font-family:var(--body);background:#fff;color:var(--ink)}
 .qm .rolesel:focus{border-color:var(--ink)}
-.qm table.roster td.x button{background:none;border:1.5px solid var(--zinc-dk);color:var(--rust);padding:7px 10px;font-size:13px}
+.qm table.roster td.x{white-space:nowrap}
+.qm .employeeActions{display:flex;align-items:center;justify-content:flex-end;gap:6px}
+.qm .iconAction{position:relative;display:inline-grid;place-items:center;width:34px;height:34px;padding:0;background:#fff;border:1.5px solid var(--zinc-dk);color:var(--rust);cursor:pointer}
+.qm .iconAction:hover,.qm .iconAction:focus-visible{border-color:var(--ink);color:var(--ink);outline:none}
+.qm .iconAction:focus-visible{box-shadow:0 0 0 3px rgba(26,26,24,.16)}
+.qm .iconAction:disabled{color:var(--zinc-dk);background:var(--zinc);cursor:not-allowed;box-shadow:none}
+.qm .iconAction svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.qm .iconAction[data-tooltip]::after{content:attr(data-tooltip);position:absolute;right:0;top:calc(100% + 7px);z-index:20;min-width:max-content;padding:5px 7px;background:var(--ink);color:#fff;font-size:11px;font-weight:500;letter-spacing:0;text-transform:none;pointer-events:none;opacity:0;transform:translateY(-3px);transition:opacity .14s ease,transform .14s ease}
+.qm .iconAction[data-tooltip]:hover::after,.qm .iconAction[data-tooltip]:focus-visible::after{opacity:1;transform:translateY(0)}
+.qm .iconAction.danger{color:var(--rust)}
+.qm .iconAction.danger:hover,.qm .iconAction.danger:focus-visible{border-color:var(--rust);color:var(--rust)}
 .qm .photocell{width:54px;height:66px;border:1.5px dashed var(--zinc-dk);background:#fff;display:grid;place-items:center;overflow:hidden;cursor:pointer}
 .qm .photocell img{width:100%;height:100%;object-fit:cover;display:block}
 .qm .photocell span{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--zinc-dk)}
@@ -928,17 +1055,34 @@ const CSS = `
 .qm .signatureActions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .qm .signatureActions .btn:disabled{opacity:.45;cursor:not-allowed}
 .qm .signatureEditor>.hint{display:block;margin-top:7px}
+.qm .signatureToggle{display:flex;align-items:flex-start;gap:9px;margin-top:10px;padding:9px 10px;border:1px solid var(--zinc-dk);background:#f8fafb;cursor:pointer}
+.qm .signatureToggle input{width:17px;height:17px;margin:1px 0 0;accent-color:var(--signal);flex:none}
+.qm .signatureToggle input:disabled{cursor:not-allowed;opacity:.5}
+.qm .signatureToggle span{display:flex;flex-direction:column;gap:2px}
+.qm .signatureToggle strong{font-size:12px;color:var(--ink);text-transform:uppercase;letter-spacing:.06em}
+.qm .signatureToggle small{font-size:11px;color:var(--ink-soft)}
+.qm .signatureSaved{display:inline-flex;align-items:center;gap:6px;margin-top:8px;color:var(--signal);font-size:12px;font-weight:700;animation:signatureSavedIn .22s ease-out both}
+.qm .signatureSavedMark{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;background:var(--signal);color:#fff;font-size:12px;animation:signatureSavedPop .4s ease-out both}
+@keyframes signatureSavedIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+@keyframes signatureSavedPop{0%{transform:scale(.4);opacity:0}70%{transform:scale(1.12)}100%{transform:scale(1);opacity:1}}
 .qm .signaturePlacementPreview{position:relative;height:150px;margin-top:12px;border:1.5px solid var(--zinc-dk);background:#fff;overflow:hidden;touch-action:none}
-.qm .placementLine{position:absolute;left:10%;right:10%;bottom:28px;border-top:1.5px solid var(--ink)}
-.qm .placementLabel{position:absolute;left:0;right:0;bottom:9px;text-align:center;font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--ink)}
-.qm .placementObject{position:absolute;width:150px;height:55px;cursor:grab;touch-action:none;z-index:2}
+.qm .placementEmployeeCell{position:relative;padding:7px 3px 0;text-align:center;font-size:8px;font-weight:700;letter-spacing:.04em;color:var(--ink);overflow:visible}
+.qm .signaturePlacementPreview>.placementEmployeeCell{position:absolute;inset:25px 10px 0;width:auto}
+.qm .placementLine{position:absolute;left:0;right:0;bottom:30px;border-top:1.5px solid var(--ink);pointer-events:none}
+.qm .placementLabel{position:absolute;left:0;right:0;bottom:8px;z-index:1;font-size:8px;font-weight:700;letter-spacing:.04em;color:var(--ink)}
+.qm .placementObject{position:absolute;width:150px;height:50px;cursor:grab;touch-action:none;z-index:2;transform-origin:center bottom}
 .qm .placementObject:active{cursor:grabbing}
 .qm .placementObject img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
 .qm .placementHandle{position:absolute;right:-6px;bottom:-6px;width:18px;height:18px;border:2px solid #fff;background:var(--hivis);box-shadow:0 0 0 1.5px var(--ink);border-radius:50%;padding:0;cursor:nwse-resize;touch-action:none}
 .qm .signaturePlacementActions{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:8px}
+.qm .placementGuide{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--ink-soft)}
+.qm .placementGuide strong{font-size:12px;color:var(--ink);text-transform:uppercase;letter-spacing:.08em}
+.qm .placementGuide em{font-style:normal;color:var(--signal);font-family:var(--mono);font-size:10px;letter-spacing:.04em}
+.qm .placementSaved{display:flex;margin-top:7px}
 .qm .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;max-width:640px}
 .qm .grid3 input{width:100%;border:1.5px solid var(--zinc-dk);padding:8px 9px;font-size:14px;font-family:var(--body)}
 .qm .banner{background:var(--rust);color:#fff;padding:10px 14px;font-size:13px;margin-bottom:16px}
+.qm .bootScreen{min-height:240px;display:grid;place-items:center;border:1.5px solid var(--zinc-dk);background:#fff;color:var(--ink-soft);font-family:var(--disp);font-size:17px;letter-spacing:.08em;text-transform:uppercase}
 /* waiting to sync is not an error: the punch is safe, it just has not travelled yet */
 .qm .banner.warn{background:var(--hivis);color:var(--ink)}
 .qm .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:26px;z-index:60;background:var(--ink);color:#fff;padding:13px 22px;border-left:5px solid var(--hivis);font-family:var(--disp);font-size:19px;letter-spacing:.06em;text-transform:uppercase;box-shadow:0 8px 26px rgba(18,35,58,.3);max-width:88vw}
@@ -1061,7 +1205,7 @@ const SHEET_CSS = `
 .sheet .sig td.ln{border-top:0.9pt solid #000;position:relative;overflow:visible;isolation:isolate}
 .sheet .sig td.ln .sigStack{position:relative;display:block;isolation:isolate;z-index:1}
 .sheet .sig td.ln .siglabel{position:relative;z-index:1}
-.sheet .sig td.ln .sigimg{position:absolute;left:calc(50% + var(--sig-x, 0mm));bottom:calc(-1mm + var(--sig-y, 0mm));z-index:10;transform:translateX(-50%) scale(var(--sig-scale, 1));max-width:42mm;max-height:13mm;object-fit:contain;pointer-events:none}
+.sheet .sig td.ln .sigimg{position:absolute;left:calc(50% + var(--sig-x, 0mm));bottom:calc(1mm + var(--sig-y, 0mm));z-index:10;transform:translateX(-50%) scale(var(--sig-scale, 1));transform-origin:center bottom;max-width:42mm;max-height:13mm;object-fit:contain;pointer-events:none}
 .sheet .sig td.sp{border:none;width:7mm}
 .sheet .controlNo{position:absolute;right:5mm;bottom:4.2mm;font-size:7pt;line-height:1;font-weight:normal;white-space:nowrap}
 `;
@@ -1081,6 +1225,34 @@ const PRINT_CSS = `
 /* Setting a passcode and an admin resetting one are the same form with one difference:
    proving you know the old one. Admins skip that step because the reason they are here is
    usually that the employee cannot. */
+function EmployeeActionIcon({ label, className = "", disabled = false, onClick, children }) {
+  return (
+    <button
+      type="button"
+      className={`iconAction ${className}`}
+      aria-label={label}
+      title={label}
+      data-tooltip={label}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+function EyeIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.4-6 9.5-6 9.5 6 9.5 6-3.4 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></svg>;
+}
+
+function KeyIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8.5" cy="15.5" r="4" /><path d="m11.5 12.5 8-8m-2 2 2 2m-5-1 2 2" /></svg>;
+}
+
+function TrashIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16m-10 4v6m4-6v6M9 7V4h6v3m-9 0 1 13h10l1-13" /></svg>;
+}
+
 function PasscodeForm({ emp, mode, onSave, say }) {
   const [cur, setCur] = useState("");
   const [next, setNext] = useState("");
@@ -1156,6 +1328,7 @@ export default function DTRSystem({ onBack }) {
   const [toast, setToast] = useState("");
   const [syncError, setSyncError] = useState("");
   const [flash, setFlash] = useState("");
+  const [signatureBusy, setSignatureBusy] = useState({});
   /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
   const [saveState, setSaveState] = useState("synced");
   const [clock, setClock] = useState(new Date());
@@ -1174,6 +1347,9 @@ export default function DTRSystem({ onBack }) {
   /* while browsing someone else's DTR, `me` is the employee being read — the admin who
      signed in is `actor`, and it is their role that still decides what is allowed */
   const actorEmp = viewOnly ? actor : me;
+  /* Settings edits update roster immediately; keep the signed-in employee reference
+     live so DTR preview and exports do not require another sign-in. */
+  const liveMe = me ? (roster.find((e) => e.id === me.id) || me) : me;
   const isAdmin = !roster.some((r) => r.id) || !!(actorEmp && actorEmp.role === "admin");
   const canEdit = !viewOnly;
   const say = useCallback((m) => { setToast(m); setTimeout(() => setToast(""), 2800); }, []);
@@ -1209,7 +1385,7 @@ export default function DTRSystem({ onBack }) {
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [r, c] = await Promise.all([sGet("dtr:roster", []), sGet("dtr:cfg", null)]);
+      const [r, c, profiles] = await Promise.all([sGet("dtr:roster", []), sGet("dtr:cfg", null), getDtrProfiles()]);
       if (!alive) return;
       const rr = Array.isArray(r) ? r : [];
       const withRoles = rr.map((e) => ({ ...e, role: e.role === "admin" ? "admin" : "viewer" }));
@@ -1217,13 +1393,47 @@ export default function DTRSystem({ onBack }) {
       if (withRoles.length && !withRoles.some((e) => e.role === "admin")) {
         withRoles[Math.max(0, withRoles.findIndex((e) => e.id === ADMIN_ID))].role = "admin";
       }
-      setRoster(withRoles.length ? withRoles : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", role: "admin" }]);
+      const bootRoster = mergeDtrProfiles(withRoles, profiles);
+      if (bootRoster.length && !bootRoster.some((e) => e.role === "admin")) {
+        bootRoster[Math.max(0, bootRoster.findIndex((e) => e.id === ADMIN_ID))].role = "admin";
+      }
+      const savedView = (() => {
+        try { return window.sessionStorage.getItem(DTR_SESSION_VIEW) || ""; } catch { return ""; }
+      })();
+      const savedEmployeeId = (() => {
+        try { return window.sessionStorage.getItem(DTR_SESSION_EMPLOYEE) || ""; } catch { return ""; }
+      })();
+      const savedEmployee = bootRoster.find((e) => e.id && e.id === savedEmployeeId);
+      const validSavedView = ["punch", "dtr", "settings"].includes(savedView);
+      setRoster(bootRoster.length ? bootRoster : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: "admin" }]);
       setCfg(Object.assign({}, DEF, c || {}));
-      setView(rr.length ? "lock" : "settings");
+      if (savedEmployee && validSavedView) {
+        setMe(savedEmployee);
+        setActor(null);
+        setViewOnly(false);
+        setPerStart(iso(periodOf(new Date()).s));
+        setSite(savedEmployee.site || "");
+        setPunchDate(iso(new Date()));
+        setNote("");
+        await ensureLog(savedEmployee.id, new Date().getFullYear(), SCHED_DEF);
+        setView(savedView);
+      } else {
+        setView(bootRoster.length ? "lock" : "settings");
+      }
       setReady(true);
     })();
     return () => { alive = false; };
   }, []);
+
+  /* Keep the current DTR workspace and employee in this tab across refreshes. */
+  useEffect(() => {
+    if (!ready) return;
+    try {
+      window.sessionStorage.setItem(DTR_SESSION_VIEW, view);
+      if (me?.id) window.sessionStorage.setItem(DTR_SESSION_EMPLOYEE, me.id);
+      else window.sessionStorage.removeItem(DTR_SESSION_EMPLOYEE);
+    } catch { /* session storage may be unavailable */ }
+  }, [view, me, ready]);
 
   useEffect(() => { const t = setInterval(() => setClock(new Date()), 1000); return () => clearInterval(t); }, []);
 
@@ -1238,8 +1448,8 @@ export default function DTRSystem({ onBack }) {
     if (!ready) return;
     clearTimeout(timers.current.roster);
     timers.current.roster = setTimeout(async () => {
-      const keep = roster
-        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", signature: e.signature || "", signatureX: Number(e.signatureX) || 0, signatureY: Number(e.signatureY) || 0, signatureScale: Number(e.signatureScale) || 1, role: e.role === "admin" ? "admin" : "viewer",
+        const keep = roster
+        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", signature: e.signature || "", signatureEnabled: e.signatureEnabled === true, signatureX: Number(e.signatureX) || 0, signatureY: Number(e.signatureY) || 0, signatureScale: Number(e.signatureScale) || 1, role: e.role === "admin" ? "admin" : "viewer",
            /* carried through explicitly: dropping these on an unrelated roster edit would
               silently unlock every account that had a passcode */
            pinHash: e.pinHash || "", pinSalt: e.pinSalt || "", pinIter: Number(e.pinIter) || 0 }))
@@ -1247,6 +1457,7 @@ export default function DTRSystem({ onBack }) {
       const ids = keep.map((e) => e.id).filter(Boolean);
       if (new Set(ids).size !== ids.length) { say("Two employees share the same ID"); return; }
       const state = await sSet("dtr:roster", keep);
+      await saveDtrProfiles(keep);
       setSaveState(state);
       setSyncError(state === "local" ? lastCloudError : "");
       if (state !== "fail") flashSaved("roster");
@@ -1363,7 +1574,10 @@ export default function DTRSystem({ onBack }) {
   }
 
   function backToId() { setStage("id"); setPending(null); setPin(""); setLockMsg(""); }
-  function signOut() { setMe(null); setViewOnly(false); setPin(""); setLockMsg(""); setStage("id"); setPending(null); setView("lock"); }
+  function signOut() {
+    try { window.sessionStorage.removeItem(DTR_SESSION_EMPLOYEE); window.sessionStorage.setItem(DTR_SESSION_VIEW, "lock"); } catch { /* unavailable */ }
+    setMe(null); setViewOnly(false); setPin(""); setLockMsg(""); setStage("id"); setPending(null); setView("lock");
+  }
 
   /* ---- punching ---- */
   const todayStr = iso(new Date());
@@ -1560,11 +1774,11 @@ export default function DTRSystem({ onBack }) {
       setPdfWarning("");
       try {
       let signature = null;
-      if (me.signature) { try { signature = await logoAsJpeg(me.signature); } catch (e) { signature = null; } }
+      if (liveMe.signature && liveMe.signatureEnabled === true) { try { signature = await logoAsJpeg(liveMe.signature); } catch (e) { signature = null; } }
       const bytes = buildDtrPdf({
           co: cfg.co || DEF.co, dept: cfg.dept || DEF.dept, title: cfg.title || DEF.title, logo,
-          signature, signatureX: me.signatureX, signatureY: me.signatureY, signatureScale: me.signatureScale,
-          name: me.name || "", position: me.position || "", site, period: periodLabel(period),
+          signature, signatureX: liveMe.signatureX, signatureY: liveMe.signatureY, signatureScale: liveMe.signatureScale,
+          name: liveMe.name || "", position: liveMe.position || "", site, period: periodLabel(period),
           paperSize,
           rows, dayTotal: fmtDay(dSum, cap), otTotal: fmtDur(oSum),
         });
@@ -1575,7 +1789,7 @@ export default function DTRSystem({ onBack }) {
     }, 200);
     return () => { dead = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, me, perStart, site, cfg, paperSize, tickN]);
+  }, [view, me, liveMe, perStart, site, cfg, paperSize, tickN]);
 
   function printableDoc() {
     const clone = buildPrintable();
@@ -1620,6 +1834,17 @@ export default function DTRSystem({ onBack }) {
     } catch (e) { say("Download blocked — use the link instead"); }
   }
 
+  if (!ready) {
+    return (
+      <div className="qm">
+        <style>{CSS}</style>
+        <div className="inner">
+          <div className="bootScreen" role="status" aria-live="polite">Restoring DTR…</div>
+        </div>
+      </div>
+    );
+  }
+
   /* ---- logo upload ---- */
   async function onLogo(e) {
     const f = e.target.files && e.target.files[0];
@@ -1650,14 +1875,29 @@ export default function DTRSystem({ onBack }) {
     try {
       const data = await scaleImage(f, 520, "image/png");
       setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature: data } : emp)));
-      say("Signature saved");
+      say("Signature uploaded — save it with the roster");
     } catch (err) { say("That signature file could not be read"); }
+  }
+
+  async function onSignatureRemoveBackground(i) {
+    const signature = roster[i]?.signature;
+    if (!signature || signatureBusy[i]) return;
+    setSignatureBusy((p) => ({ ...p, [i]: true }));
+    try {
+      const data = await removeImageBackground(signature);
+      setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature: data } : emp)));
+      say("Background removed — the transparent signature will be saved automatically");
+    } catch (err) {
+      say("The signature background could not be removed");
+    } finally {
+      setSignatureBusy((p) => ({ ...p, [i]: false }));
+    }
   }
 
   /* ---- roster editing ---- */
   const setEmp = (i, field, val) =>
     setRoster((p) => p.map((e, j) => (j === i ? { ...e, [field]: field === "id" ? val.replace(/\s/g, "") : val } : e)));
-  const addEmp = () => setRoster((p) => [...p, { id: "", name: "", position: "", site: "", photo: "", signature: "", role: "viewer" }]);
+  const addEmp = () => setRoster((p) => [...p, { id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: "viewer" }]);
   const adminsBesides = (i) => roster.filter((e, j) => j !== i && e.role === "admin" && (e.id || e.name)).length;
   const setRole = (i, val) => {
     if (val !== "admin" && adminsBesides(i) === 0) { say("Keep at least one admin, or nobody can open Settings"); return; }
@@ -1667,7 +1907,7 @@ export default function DTRSystem({ onBack }) {
     if (roster[i] && roster[i].role === "admin" && adminsBesides(i) === 0 && roster.length > 1) {
       say("Make someone else an admin before removing this one"); return;
     }
-    setRoster((p) => (p.length > 1 ? p.filter((_, j) => j !== i) : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", role: "admin" }]));
+    setRoster((p) => (p.length > 1 ? p.filter((_, j) => j !== i) : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: "admin" }]));
   };
 
   /* ============================ render ============================ */
@@ -2066,7 +2306,7 @@ export default function DTRSystem({ onBack }) {
                 <table className="sig">
                   <tbody>
                     <tr>
-                      <td className="ln"><span className="sigStack">{me.signature && <img className="sigimg" style={{ "--sig-x": `${Number(me.signatureX) || 0}mm`, "--sig-y": `${Number(me.signatureY) || 0}mm`, "--sig-scale": Number(me.signatureScale) || 1 }} src={me.signature} alt="Employee signature" />}<span className="siglabel">EMPLOYEE SIGNATURE</span></span></td><td className="sp" />
+                      <td className="ln"><span className="sigStack">{liveMe.signature && liveMe.signatureEnabled === true && <img className="sigimg" style={{ "--sig-x": `${Number(liveMe.signatureX) || 0}mm`, "--sig-y": `${Number(liveMe.signatureY) || 0}mm`, "--sig-scale": Number(liveMe.signatureScale) || 1 }} src={liveMe.signature} alt="Employee signature" />}<span className="siglabel">EMPLOYEE SIGNATURE</span></span></td><td className="sp" />
                       <td className="ln">SUPERVISOR / DEPT MANAGER</td><td className="sp" />
                       <td className="ln">GENERAL MANAGER</td>
                     </tr>
@@ -2222,13 +2462,23 @@ export default function DTRSystem({ onBack }) {
                       </select>
                     </td>
                     <td className="x">
+                      <div className="employeeActions">
                       {e.id && me && e.id !== me.id && (
-                        <button onClick={() => openEmp(e, true, actorEmp)}>View DTR</button>
+                        <EmployeeActionIcon label="View DTR" onClick={() => openEmp(e, true, actorEmp)}>
+                          <EyeIcon />
+                        </EmployeeActionIcon>
                       )}
-                      <button onClick={() => setResetting(resetting === e.id ? "" : e.id)} disabled={!e.id}>
-                        {hasPin(e) ? "Reset passcode" : "Set passcode"}
-                      </button>
-                      <button onClick={() => delEmp(i)}>Remove</button>
+                      <EmployeeActionIcon
+                        label={hasPin(e) ? "Reset passcode" : "Set passcode"}
+                        onClick={() => setResetting(resetting === e.id ? "" : e.id)}
+                        disabled={!e.id}
+                      >
+                        <KeyIcon />
+                      </EmployeeActionIcon>
+                      <EmployeeActionIcon label="Remove" className="danger" onClick={() => delEmp(i)}>
+                        <TrashIcon />
+                      </EmployeeActionIcon>
+                      </div>
                     </td>
                   </tr>
                   {resetting && resetting === e.id && e.id && (
@@ -2255,7 +2505,7 @@ export default function DTRSystem({ onBack }) {
             </table>
             <h3 className="s2">Employee signatures</h3>
             <p className="hint" style={{ marginBottom: 12 }}>
-              Draw with a mouse, finger, or stylus, or upload a transparent PNG. The saved signature appears on that employee's printable DTR.
+              Draw with a mouse, finger, or stylus, or upload a signature image. For scanned signatures, use <strong>Remove light background</strong> to create a transparent PNG before saving. The saved signature appears on that employee's printable DTR.
             </p>
             <div className="signatureList">
               {roster.map((e, i) => (
@@ -2266,9 +2516,20 @@ export default function DTRSystem({ onBack }) {
                     value={e.signature || ""}
                     onSave={(signature) => setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature } : emp)))}
                     onRemove={() => setRoster((p) => p.map((emp, j) => (j === i ? { ...emp, signature: "" } : emp)))}
+                    onRemoveBackground={() => onSignatureRemoveBackground(i)}
+                    backgroundBusy={!!signatureBusy[i]}
                   />
                   <label className="btn ghost sm" style={{ display: "inline-block", marginTop: 7 }}>
-                    Upload signature PNG<input type="file" accept="image/png,image/*" hidden onChange={(ev) => onSignatureUpload(i, ev)} />
+                    Upload signature image<input type="file" accept="image/png,image/*" hidden onChange={(ev) => onSignatureUpload(i, ev)} />
+                  </label>
+                  <label className="signatureToggle">
+                    <input
+                      type="checkbox"
+                      checked={e.signatureEnabled === true}
+                      disabled={!e.signature}
+                      onChange={(ev) => setEmp(i, "signatureEnabled", ev.target.checked)}
+                    />
+                    <span><strong>Include signature on DTR</strong><small>Shows under Employee Signature in PDF and browser print.</small></span>
                   </label>
                   {e.signature ? (
                     <SignaturePlacementEditor

@@ -3,6 +3,7 @@ import { supabase, isConfigured } from "../lib/supabase";
 import { T, DISPLAY, BODY } from "../theme";
 import SignIn from "./SignIn";
 import ResetPassword from "./ResetPassword";
+import PwaInstallPrompt from "./PwaInstallPrompt";
 
 /* Renders children(user, signOut) only for a signed-in session. */
 export default function AuthGate({ children }) {
@@ -57,7 +58,7 @@ export default function AuthGate({ children }) {
   }
 
   if (recovery || window.location.pathname === "/reset-password") return session ? <ResetPassword /> : <SignIn />;
-  if (!session) return <SignIn />;
+  if (!session) return <><SignIn /><PwaInstallPrompt /></>;
 
   const signOut = () => supabase.auth.signOut();
   return children(session.user, signOut);
