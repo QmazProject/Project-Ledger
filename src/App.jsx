@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import AuthGate from "./auth/AuthGate";
 import ProjectLedger from "./ProjectLedger";
 import DTRSystem from "../DTR System/dtr-system.jsx";
@@ -16,18 +16,6 @@ function App() {
     try { window.sessionStorage.setItem("forlive.workspace", "ledger"); } catch { /* unavailable */ }
     setDtrOpen(false);
   };
-
-  useEffect(() => {
-    const onKeyDown = (event) => {
-      if (event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "d") {
-        event.preventDefault();
-        openDtr();
-      }
-    };
-
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
 
   if (dtrOpen) return <DTRSystem onBack={closeDtr} />;
 

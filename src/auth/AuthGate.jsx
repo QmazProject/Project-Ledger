@@ -62,9 +62,19 @@ export default function AuthGate({ children, onLoginDoubleTap }) {
         lastTap = now;
       }
     };
+    const onKeyDown = (event) => {
+      if (event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        onLoginDoubleTap();
+      }
+    };
 
     document.addEventListener("touchend", onTouchEnd, { passive: false });
-    return () => document.removeEventListener("touchend", onTouchEnd);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("touchend", onTouchEnd);
+      document.removeEventListener("keydown", onKeyDown);
+    };
   }, [session, recovery, onLoginDoubleTap]);
 
   if (checking) {
