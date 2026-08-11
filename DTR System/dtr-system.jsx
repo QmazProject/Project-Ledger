@@ -799,9 +799,10 @@ const attachmentDate = (value) => String(value || "").slice(0, 10);
 const safeAttachmentName = (value) => String(value || "document")
   .replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 90) || "document";
 
-async function signedAttachmentUrl(path) {
+async function signedAttachmentUrl(path, downloadName = "") {
   if (!cloudReady() || !path) return "";
-  const { data, error } = await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).createSignedUrl(path, 3600);
+  const options = downloadName ? { download: downloadName } : undefined;
+  const { data, error } = await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).createSignedUrl(path, 3600, options);
   return error ? "" : (data?.signedUrl || "");
 }
 
@@ -815,7 +816,7 @@ async function listDtrAttachments(employeeId, period) {
       .eq("payroll_end", iso(period.e))
       .order("work_date", { ascending: true }).order("created_at", { ascending: true });
     if (error || !Array.isArray(data)) return [];
-    return (await Promise.all(data.map(async (item) => ({ ...item, url: await signedAttachmentUrl(item.storage_path) })))).filter((item) => item.url);
+    return (await Promise.all(data.map(async (item) => ({ ...item, url: await signedAttachmentUrl(item.storage_path), downloadUrl: await signedAttachmentUrl(item.storage_path, item.file_name) })))).filter((item) => item.url);
   } catch { return []; }
 }
 
@@ -840,7 +841,7 @@ async function uploadDtrAttachment({ employee, actor, period, workDate, type, no
     await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).remove([path]);
     throw insertError;
   }
-  return { ...data, url: await signedAttachmentUrl(path) };
+  return { ...data, url: await signedAttachmentUrl(path), downloadUrl: await signedAttachmentUrl(path, file.name) };
 }
 
 async function removeDtrAttachment(item) {
@@ -1167,13 +1168,18 @@ const CSS = `
 .qm .attachmentUpload input[type=file]{font-family:var(--mono);font-size:11px;width:100%;padding:7px 0}
 .qm .attachmentUploadFooter,.qm .attachmentListHead{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .qm .attachmentListHead{border-bottom:1px solid var(--rule);padding-bottom:8px}
+.qm .attachmentPrintControls{display:flex;align-items:flex-end;gap:8px}
+.qm .attachmentPrintControls label{display:grid;gap:3px}
+.qm .attachmentPrintControls select{font-family:var(--mono);font-size:11px;padding:7px;border:1px solid var(--rule);background:#fff;color:var(--ink)}
 .qm .attachmentList{display:grid;gap:7px;margin-top:9px}
-.qm .attachmentItem{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:9px;align-items:center;border:1px solid var(--rule-soft);padding:8px;background:#fff}
+.qm .attachmentItem{display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px 9px;align-items:center;border:1px solid var(--rule-soft);padding:8px;background:#fff}
 .qm .attachmentItem input{accent-color:var(--ink);width:16px;height:16px}
 .qm .attachmentInfo{min-width:0;display:grid;gap:2px}
 .qm .attachmentInfo strong{font-family:var(--disp);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
 .qm .attachmentInfo span,.qm .attachmentInfo small{font-family:var(--mono);font-size:10px;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.qm .attachmentItemActions{display:flex;gap:5px}
+.qm .attachmentItemActions{grid-column:2;display:flex;gap:5px;flex-wrap:nowrap;overflow-x:auto;min-width:0;padding-bottom:1px}
+.qm .attachmentItemActions .btn,.qm .attachmentItemActions a{flex:0 0 auto;white-space:nowrap}
+.qm .attachmentItemActions a{display:inline-flex;align-items:center;text-decoration:none}
 .qm .attachmentItemActions .danger{color:var(--rust);border-color:var(--rust)}
 .qm .dtrDateCell{position:relative}
 .qm .dtrAttachmentTrigger{position:absolute;right:2px;top:2px;width:18px;height:18px;display:grid;place-items:center;border:1px solid var(--rule);background:#fff;color:var(--ink);font-family:var(--mono);font-size:15px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s ease}
@@ -1250,6 +1256,8 @@ const CSS = `
   .qm .attachmentBox{width:min(680px,100%);max-height:calc(100vh - 20px)}
   .qm .attachmentUploadGrid{grid-template-columns:1fr}
   .qm .attachmentUploadFooter,.qm .attachmentListHead{align-items:stretch;flex-direction:column}
+  .qm .attachmentPrintControls{align-items:stretch;flex-direction:column;width:100%}
+  .qm .attachmentPrintControls select{min-height:44px;width:100%}
   .qm .attachmentUploadFooter .btn,.qm .attachmentListHead .btn{width:100%;min-height:44px}
   .qm .attachmentItem{grid-template-columns:auto minmax(0,1fr)}
   .qm .attachmentItemActions{grid-column:2;justify-content:flex-start}
@@ -1327,9 +1335,10 @@ const formatFileSize = (bytes) => {
 };
 const isAttachmentImage = (item) => String(item?.mime_type || "").startsWith("image/");
 
-function printDtrAttachments(items, title = "DTR supporting documents") {
+function printDtrAttachments(items, title = "DTR supporting documents", paperSize = "LEGAL") {
   const list = (items || []).filter((item) => item?.url);
   if (!list.length) return;
+  const paper = PAPER_SIZES[paperSize] || PAPER_SIZES.LEGAL;
   let win = null;
   try { win = window.open("", "_blank"); } catch { win = null; }
   if (!win) return;
@@ -1341,7 +1350,7 @@ function printDtrAttachments(items, title = "DTR supporting documents") {
     return `<section>${heading}${meta}<p><a href="${htmlEscape(item.url)}">Open attachment</a></p></section>`;
   }).join("");
   win.document.write(`<!doctype html><html><head><title>${htmlEscape(title)}</title><style>
-    @page{margin:12mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#12233A;margin:0}
+    @page{size:${paper.css} portrait;margin:12mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#12233A;margin:0}
     section{break-after:page;min-height:90vh;padding:4mm 0}section:last-child{break-after:auto}
     h2{font-size:18px;margin:0 0 6px;border-bottom:2px solid #12233A;padding-bottom:6px}
     .meta{font-size:11px;color:#526273;margin:0 0 18px}img{display:block;max-width:100%;max-height:230mm;margin:auto;object-fit:contain}
@@ -1351,7 +1360,7 @@ function printDtrAttachments(items, title = "DTR supporting documents") {
   setTimeout(() => { try { win.focus(); win.print(); } catch {} }, 900);
 }
 
-function AttachmentModal({ employee, actor, period, date, items, canEdit, onClose, onAdded, onRemoved }) {
+function AttachmentModal({ employee, actor, period, date, items, canEdit, paperSize, onPaperSizeChange, onClose, onAdded, onRemoved }) {
   const [type, setType] = useState("Gate Pass");
   const [note, setNote] = useState("");
   const [file, setFile] = useState(null);
@@ -1394,12 +1403,12 @@ function AttachmentModal({ employee, actor, period, date, items, canEdit, onClos
           <label><span className="lbl">Note (optional)</span><input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Short description" /></label>
           <div className="attachmentUploadFooter"><span className="hint">PDF, JPG, PNG, or WEBP · max 10 MB</span><button type="button" className="btn sm" disabled={!file || busy} onClick={upload}>{busy ? "Uploading…" : "Upload attachment"}</button></div>
         </div>}
-        <div className="attachmentListHead"><strong>{items.length ? `${items.length} attachment${items.length === 1 ? "" : "s"}` : "No attachments for this date"}</strong>{items.length > 0 && <button type="button" className="btn ghost sm" onClick={() => printDtrAttachments(chosen, `DTR attachments — ${date}`)} disabled={!chosen.length}>Print selected ({chosen.length})</button>}</div>
+        <div className="attachmentListHead"><strong>{items.length ? `${items.length} attachment${items.length === 1 ? "" : "s"}` : "No attachments for this date"}</strong><div className="attachmentPrintControls"><label><span className="lbl">Print size</span><select value={paperSize} onChange={(e) => onPaperSizeChange(e.target.value)}>{Object.entries(PAPER_SIZES).map(([key, size]) => <option key={key} value={key}>{size.label.split(" — ")[0]}</option>)}</select></label>{items.length > 0 && <button type="button" className="btn ghost sm" onClick={() => printDtrAttachments(chosen, `DTR attachments — ${date}`, paperSize)} disabled={!chosen.length}>Print selected ({chosen.length})</button>}</div></div>
         {items.length > 0 && <div className="attachmentList">{items.map((item) => (
           <div className="attachmentItem" key={item.id}>
             <input type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} aria-label={`Select ${item.file_name}`} />
             <div className="attachmentInfo"><strong>{item.attachment_type}</strong><span>{item.file_name} · {formatFileSize(item.file_size)}</span>{item.note && <small>{item.note}</small>}</div>
-            <div className="attachmentItemActions"><button type="button" className="btn ghost sm" onClick={() => printDtrAttachments([item], `DTR attachment — ${item.file_name}`)}>Print</button>{canEdit && <button type="button" className="btn ghost sm danger" onClick={async () => { if (!window.confirm(`Remove ${item.file_name}?`)) return; try { await removeDtrAttachment(item); onRemoved(item.id); } catch (error) { onAdded(null, error?.message || "Could not remove attachment."); } }}>Remove</button>}</div>
+            <div className="attachmentItemActions"><a className="btn ghost sm" href={item.url} target="_blank" rel="noreferrer">View</a><a className="btn ghost sm" href={item.downloadUrl || item.url} download={item.file_name}>Download</a><button type="button" className="btn ghost sm" onClick={() => printDtrAttachments([item], `DTR attachment — ${item.file_name}`, paperSize)}>Print</button>{canEdit && <button type="button" className="btn ghost sm danger" onClick={async () => { if (!window.confirm(`Remove ${item.file_name}?`)) return; try { await removeDtrAttachment(item); onRemoved(item.id); } catch (error) { onAdded(null, error?.message || "Could not remove attachment."); } }}>Remove</button>}</div>
           </div>
         ))}</div>}
         <div className="row"><button type="button" onClick={onClose}>Close</button></div>
@@ -1518,6 +1527,7 @@ export default function DTRSystem({ onBack }) {
   const [signatureBusy, setSignatureBusy] = useState({});
   const [attachments, setAttachments] = useState([]);
   const [attachmentOpenDate, setAttachmentOpenDate] = useState("");
+  const [attachmentPaperSize, setAttachmentPaperSize] = useState("LEGAL");
   /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
   const [saveState, setSaveState] = useState("synced");
   const [clock, setClock] = useState(new Date());
@@ -2374,7 +2384,7 @@ export default function DTRSystem({ onBack }) {
                   ? <a className="btn" href={printHref} download={dtrFileName()}>Print / Save PDF</a>
                   : <button className="btn" disabled style={{ opacity: 0.5 }}>Preparing PDF…</button>}
                 <button className="btn ghost" onClick={doPrint}>Print from browser</button>
-                {attachments.length > 0 && <button className="btn ghost" onClick={() => printDtrAttachments(attachments, `DTR attachments — ${periodLabel(period)}`)}>Print attachments ({attachments.length})</button>}
+                {attachments.length > 0 && <button className="btn ghost" onClick={() => printDtrAttachments(attachments, `DTR attachments — ${periodLabel(period)}`, attachmentPaperSize)}>Print attachments ({attachments.length})</button>}
               </div>
               {pdfWarning && <div role="alert" className="pastnote" style={{ marginTop: 10, marginBottom: 0 }}>{pdfWarning}</div>}
               <p className="hint">
@@ -2803,6 +2813,8 @@ export default function DTRSystem({ onBack }) {
           date={attachmentOpenDate}
           items={attachmentsForDate(attachmentOpenDate)}
           canEdit={canEdit}
+          paperSize={attachmentPaperSize}
+          onPaperSizeChange={setAttachmentPaperSize}
           onClose={() => setAttachmentOpenDate("")}
           onAdded={addAttachment}
           onRemoved={(id) => { setAttachments((prev) => prev.filter((item) => item.id !== id)); say("Attachment removed"); }}
