@@ -10,6 +10,8 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
   headers: { ...corsHeaders, "Content-Type": "application/json" },
 });
 
+const LEDGER_UPLOAD_BUCKET = "project-ledger-uploads";
+
 Deno.serve(async (request) => {
   if (request.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -34,20 +36,57 @@ Deno.serve(async (request) => {
       const { data, error } = await admin.auth.admin.listUsers({ page: 1, perPage: 1000 });
       if (error) throw error;
       const { data: profiles, error: profileError } = await admin.from("profiles")
-        .select("id, username, role, force_password_change");
+        .select("id, username, role, force_password_change, multiple_targets_enabled");
       if (profileError) throw profileError;
+      const { data: uploads, error: uploadError } = await admin.from("project_ledger_uploads")
+        .select("uploaded_by");
+      if (uploadError) throw uploadError;
       const { data: security } = await admin.from("security_settings")
         .select("captcha_enabled").eq("id", 1).maybeSingle();
       const byId = new Map((profiles || []).map((p) => [p.id, p]));
+      const uploadCounts = new Map<string, number>();
+      for (const upload of uploads || []) {
+        uploadCounts.set(upload.uploaded_by, (uploadCounts.get(upload.uploaded_by) || 0) + 1);
+      }
       return json({ captcha_enabled: security?.captcha_enabled !== false, users: (data.users || []).map((u) => ({
         id: u.id,
         email: u.email || "",
         username: byId.get(u.id)?.username || "",
         role: byId.get(u.id)?.role || "user",
         force_password_change: byId.get(u.id)?.force_password_change || false,
+        multiple_targets_enabled: byId.get(u.id)?.multiple_targets_enabled || false,
         banned_until: u.banned_until || null,
         last_sign_in_at: u.last_sign_in_at || null,
+        upload_count: uploadCounts.get(u.id) || 0,
       })) });
+    }
+
+    if (action === "list-uploads") {
+      const userId = String(body.user_id || "");
+      if (!userId) return json({ error: "User ID is required." }, 400);
+      const { data: uploads, error } = await admin.from("project_ledger_uploads")
+        .select("id, original_filename, uploaded_at")
+        .eq("uploaded_by", userId)
+        .order("uploaded_at", { ascending: false });
+      if (error) throw error;
+      return json({ uploads: uploads || [] });
+    }
+
+    if (action === "file-url") {
+      const uploadId = String(body.upload_id || "");
+      if (!uploadId) return json({ error: "Upload ID is required." }, 400);
+      const { data: upload, error: uploadError } = await admin.from("project_ledger_uploads")
+        .select("storage_path, original_filename")
+        .eq("id", uploadId)
+        .maybeSingle();
+      if (uploadError) throw uploadError;
+      if (!upload) return json({ error: "Upload not found." }, 404);
+      const download = body.download === true;
+      const { data: signed, error: signedError } = await admin.storage
+        .from(LEDGER_UPLOAD_BUCKET)
+        .createSignedUrl(upload.storage_path, 60, download ? { download: upload.original_filename } : undefined);
+      if (signedError) throw signedError;
+      return json({ url: signed.signedUrl });
     }
 
     if (action === "set-captcha") {
@@ -60,6 +99,14 @@ Deno.serve(async (request) => {
 
     const userId = String(body.user_id || "");
     if (!userId) return json({ error: "User ID is required." }, 400);
+
+    if (action === "set-multiple-targets") {
+      const enabled = body.enabled === true;
+      const { error } = await admin.from("profiles")
+        .update({ multiple_targets_enabled: enabled }).eq("id", userId);
+      if (error) throw error;
+      return json({ ok: true, multiple_targets_enabled: enabled });
+    }
 
     if (action === "reset-password") {
       const temporaryPassword = String(body.temporary_password || "");
