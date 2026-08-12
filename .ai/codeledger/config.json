@@ -54,5 +54,12 @@
     ".html",
     ".sql"
   ],
-  "follow_symlinks": false
+  "follow_symlinks": false,
+  "session_idle_seconds": 900,
+  "session_stale_seconds": 3600,
+  "checkpoint_threshold_pct": 80,
+  "evidence_ttl_seconds": {
+    "RUNTIME_PROBE": 3600,
+    "DEPLOY": 86400
+  }
 }

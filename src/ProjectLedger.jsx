@@ -283,12 +283,13 @@ async function loadManual() {
 }
 async function saveManualRow(id, values, oldValues, userId, username, changedFields) {
   if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
-  if (values.contract !== "" && values.contract !== null && toNum(values.contract) === null)
+  const hasContract = values.contract !== "" && values.contract !== null && values.contract !== undefined;
+  if (hasContract && toNum(values.contract) === null)
     throw new Error("Contract must be a numeric amount.");
   const { error } = await supabase.from("project_manual_updates").upsert({
     project_id: id,
     status: CLEAN(values.status) || null,
-    contract_amount: values.contract === "" || values.contract === null ? null : toNum(values.contract),
+    contract_amount: hasContract ? toNum(values.contract) : null,
     target_qty: values.target === "" || values.target === null ? null : toNum(values.target),
     unit: values.unit || null,
     start_date: values.start || null,
