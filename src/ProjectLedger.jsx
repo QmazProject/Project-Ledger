@@ -463,7 +463,6 @@ const INLINE_TARGET_COLS = [
   { k: "unit", label: "Unit", edit: "text", targetField: true, w: 80 },
   { k: "start_date", label: "Start date", edit: "date", targetField: true, w: 132 },
   { k: "target_completion", label: "Target completion", edit: "date", targetField: true, w: 132 },
-  { k: "actual_completion", label: "Actual completion", edit: "date", targetField: true, w: 132 },
   { k: "actual_output", label: "Actual output", edit: "qty", targetField: true, w: 96 },
 ];
 const INLINE_TARGET_FIELD_KEYS = new Set(INLINE_TARGET_COLS.map((column) => column.k));
@@ -490,7 +489,7 @@ const EXPORT_TARGET_COLS = [
   { k: "unit", label: "Unit" },
   { k: "start_date", label: "Start date" },
   { k: "target_completion", label: "Target completion" },
-  { k: "actual_completion", label: "Actual completion" },
+  { k: "actual_completion", label: "Completion date (automatic)" },
   { k: "actual_output", label: "Actual output" },
 ];
 
@@ -1524,9 +1523,10 @@ function TargetAnalysis({ rows }) {
         One row per target, so a project with several targets appears several times. On track means the target
         completion date is more than three days away and the target has not yet been reached. Critical means the
         deadline is within three days; overdue means the deadline has passed. A target counts as delivered when
-        Actual output reaches Target qty, and as <b>delivered on time</b> only when its Actual completion date is on
-        or before the Target completion date — leave that date blank and it stays <b>delivered</b>, since there is
-        nothing to prove it landed on time. Priority ranks overdue and critical targets first. <b>Balance to collect</b>
+        Actual output reaches Target qty. The system permanently records the date of the first qualifying Actual output
+        save and uses it to decide whether delivery was on or before the Target completion date. The Actual output audit
+        entry records the user, date, and time; later output corrections do not erase that completion. Priority ranks
+        overdue and critical targets first. <b>Balance to collect</b>
         belongs to the project, not the target: it repeats across a project's targets and is counted once in
         Collection at risk. Draft targets — no quantity and no deadline — are listed in Manage targets and tracked
         nowhere.
@@ -1547,7 +1547,6 @@ const TARGET_COLUMNS = [
   { k: "unit", label: "Unit", type: "text", w: 80 },
   { k: "start_date", label: "Start date", type: "date", w: 132 },
   { k: "target_completion", label: "Target completion", type: "date", w: 132 },
-  { k: "actual_completion", label: "Actual completion", type: "date", w: 132 },
   { k: "actual_output", label: "Actual output", type: "qty", w: 96 },
 ];
 

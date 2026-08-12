@@ -11,7 +11,7 @@
  * by the rows passed in, so it can be tested directly.
  */
 
-import { TARGET_FIELDS } from "./targets.js";
+import { TARGET_HISTORY_FIELDS } from "./targets.js";
 
 /* The event row a write function emits alongside its field rows. It carries the
  * action rather than a value, so it becomes the heading of a group and never a
@@ -33,8 +33,8 @@ export const ACTION_LABEL = {
  * Anything unrecognised sorts after the known fields instead of being dropped —
  * an audit row is a historical fact, and hiding one because a column was later
  * renamed would be a lie by omission. */
-const FIELD_ORDER = new Map(TARGET_FIELDS.map(([key], i) => [key, i]));
-const fieldRank = (key) => (FIELD_ORDER.has(key) ? FIELD_ORDER.get(key) : TARGET_FIELDS.length);
+const FIELD_ORDER = new Map(TARGET_HISTORY_FIELDS.map(([key], i) => [key, i]));
+const fieldRank = (key) => (FIELD_ORDER.has(key) ? FIELD_ORDER.get(key) : TARGET_HISTORY_FIELDS.length);
 
 const timeOf = (row) => {
   const t = Date.parse(row?.changed_at ?? "");

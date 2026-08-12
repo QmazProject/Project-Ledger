@@ -9,7 +9,7 @@ import {
   selectPrimaryTarget,
   assessTarget, assessTargets, assessProjectTargets,
   atRiskExposure, distinctProjectCount,
-  validateTarget, targetWarnings, AT_RISK_BUCKETS,
+  validateTarget, targetWarnings, AT_RISK_BUCKETS, TARGET_FIELDS, TARGET_HISTORY_FIELDS,
 } from "./targets.js";
 
 /* A fixed "today" so every standing is reproducible. */
@@ -338,20 +338,30 @@ test("no standing outside the known set, and 'Behind target' is gone", () => {
 
 /* ---------------- validation ---------------- */
 
+test("Actual completion is historical system data, not an editable target field", () => {
+  assert.equal(TARGET_FIELDS.some(([field]) => field === "actual_completion"), false);
+  assert.equal(TARGET_HISTORY_FIELDS.some(([field]) => field === "actual_completion"), true);
+});
+
 test("a new target must be named; a migrated one may keep a null scope", () => {
   assert.ok(validateTarget({ scope: "", target_qty: 10 }, { isNew: true }).scope);
   assert.deepEqual(validateTarget({ scope: null, target_qty: 10 }, { isNew: false }), {},
     "migrated targets have no scope and must stay editable");
 });
 
-test("numbers and dates are checked, and completion cannot precede the start", () => {
+test("editable numbers and dates are checked, and target completion cannot precede the start", () => {
   assert.ok(validateTarget({ scope: "A", target_qty: -5 }).target_qty);
   assert.ok(validateTarget({ scope: "A", actual_output: "abc" }).actual_output);
   assert.ok(validateTarget({ scope: "A", start_date: "2026-05-01", target_completion: "2026-04-01" }).target_completion);
-  assert.ok(validateTarget({ scope: "A", start_date: "2026-05-01", actual_completion: "2026-04-01" }).actual_completion);
   assert.deepEqual(validateTarget({ scope: "A", start_date: "2026-05-01", target_completion: "2026-06-01" }), {});
   assert.deepEqual(validateTarget({ scope: "A", target_qty: "", actual_output: "" }), {},
     "blank is legitimate for every optional field");
+});
+
+test("legacy actual completion is retained as read-only data, not validated as user input", () => {
+  assert.deepEqual(validateTarget({
+    scope: "A", start_date: "2026-05-01", actual_completion: "2026-04-01",
+  }), {});
 });
 
 test("over-delivery and zero quantity warn rather than block", () => {
@@ -359,6 +369,23 @@ test("over-delivery and zero quantity warn rather than block", () => {
   assert.equal(targetWarnings({ target_qty: 100, actual_output: 150 }).length, 1);
   assert.equal(targetWarnings({ target_qty: 0 }).length, 1);
   assert.equal(targetWarnings({ target_qty: 100, actual_output: 50 }).length, 0);
+});
+
+test("a zero target still needs an explicit Actual output save to complete", () => {
+  const blankOutput = assessTarget(project(), target({ target_qty: 0, actual_output: null }), TODAY);
+  const savedOutput = assessTarget(project(), target({ target_qty: 0, actual_output: 0 }), TODAY);
+
+  assert.equal(blankOutput.done, false);
+  assert.equal(savedOutput.done, true);
+});
+
+test("a recorded completion remains delivered after Actual output is reduced", () => {
+  const row = assessTarget(project(), target({
+    target_qty: 100, actual_output: 25, actual_completion: "2026-08-10",
+  }), TODAY);
+
+  assert.equal(row.done, true);
+  assert.equal(row.bucket, "Delivered on time");
 });
 
 /* ---------------- live standing in the modal ---------------- */

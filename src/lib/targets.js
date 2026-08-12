@@ -92,7 +92,8 @@ export function isDraft(target) {
  *  for the priority weight; none of its fields are copied onto the result. */
 export function assessTarget(project, t, today) {
   const target = num(t.target_qty);
-  const actual = num(t.actual_output) !== null ? num(t.actual_output) : (target !== null ? 0 : null);
+  const recordedActual = num(t.actual_output);
+  const actual = recordedActual !== null ? recordedActual : (target !== null ? 0 : null);
 
   const due = t.target_completion || "";
   const start = t.start_date || "";
@@ -104,7 +105,11 @@ export function assessTarget(project, t, today) {
   const gap = target !== null && actual !== null ? target - actual : null;
   const remaining = gap !== null ? Math.max(0, gap) : null;
   const progress = target ? Math.min(actual / target, 2) : null;
-  const done = target !== null && actual !== null && actual >= target;
+  /* Even a zero-quantity target needs an explicit Actual output save. This
+     keeps the standing aligned with the database event that supplies the
+     automatic completion timestamp. */
+  const done = Boolean(finish)
+    || (target !== null && recordedActual !== null && recordedActual >= target);
 
   /* Demonstrated capacity: what the crew has actually produced per day since
      starting. Multiplied by the days left and compared against the quantity
@@ -246,8 +251,17 @@ export const TARGET_FIELDS = [
   ["unit", "Unit"],
   ["start_date", "Start date"],
   ["target_completion", "Target completion"],
-  ["actual_completion", "Actual completion"],
   ["actual_output", "Actual output"],
+];
+
+/** Actual completion is no longer editable: the database records it when an
+ *  Actual output save first reaches Target qty. It remains in this history-only
+ *  list so dates entered before that change keep their original place and
+ *  label in the audit trail. */
+export const TARGET_HISTORY_FIELDS = [
+  ...TARGET_FIELDS.slice(0, 5),
+  ["actual_completion", "Actual completion"],
+  ...TARGET_FIELDS.slice(5),
 ];
 
 const blank = (v) => v === null || v === undefined || String(v).trim() === "";
@@ -270,7 +284,6 @@ export function validateTarget(values, { isNew = false } = {}) {
   for (const [field, label] of [
     ["start_date", "Start date"],
     ["target_completion", "Target completion"],
-    ["actual_completion", "Actual completion"],
   ]) {
     if (!blank(values[field]) && parseDay(values[field]) === null)
       errors[field] = `${label} is not a valid date.`;
@@ -281,9 +294,6 @@ export function validateTarget(values, { isNew = false } = {}) {
     if (!blank(values.target_completion) && !errors.target_completion
         && daysBetween(start, values.target_completion) < 0)
       errors.target_completion = "Target completion cannot fall before the start date.";
-    if (!blank(values.actual_completion) && !errors.actual_completion
-        && daysBetween(start, values.actual_completion) < 0)
-      errors.actual_completion = "Actual completion cannot fall before the start date.";
   }
 
   return errors;
@@ -296,6 +306,6 @@ export function targetWarnings(values) {
   if (qty !== null && out !== null && out > qty)
     warnings.push("Actual output is above the target quantity.");
   if (qty === 0)
-    warnings.push("A zero target quantity counts as delivered immediately.");
+    warnings.push("A zero target quantity is delivered when an Actual output is saved.");
   return warnings;
 }

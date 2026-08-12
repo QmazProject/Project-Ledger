@@ -66,12 +66,13 @@ test("separate saves stay separate even at the same instant", () => {
 test("fields follow the modal's column order, not the order rows arrive in", () => {
   const events = groupTargetHistory([
     row({ field_key: "actual_output", column_name: "Actual output" }),
+    row({ field_key: "actual_completion", column_name: "Actual completion" }),
     row({ field_key: "scope", column_name: "Scope" }),
     row({ field_key: "start_date", column_name: "Start date" }),
     row({ field_key: "target_qty", column_name: "Target qty" }),
   ]);
   assert.deepEqual(events[0].fields.map((f) => f.fieldKey),
-    ["scope", "target_qty", "start_date", "actual_output"]);
+    ["scope", "target_qty", "start_date", "actual_completion", "actual_output"]);
 });
 
 test("an unrecognised field is listed last rather than dropped", () => {
