@@ -557,7 +557,7 @@ function Meter({ label, segments, legend }) {
 
 /* ---------------- import panel ---------------- */
 
-function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onReload, onPrevious, reloading, forceOpen }) {
+function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, canRestorePrevious, forceOpen }) {
   const [open, setOpen] = useState(false);
   const [over, setOver] = useState(false);
   const inputRef = useRef(null);
@@ -573,17 +573,13 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onReload, onP
           {uploadedBy && <span style={{ color: T.inkFaint }}> · {uploadedBy}</span>}
         </div>
         <div className="flex items-center gap-2">
-          <button type="button" onClick={onPrevious} disabled={busy || reloading || !isConfigured}
+          {canRestorePrevious && <button type="button" onClick={onPrevious} disabled={busy || !isConfigured}
                   className="rounded-sm px-2.5 py-1 text-xs"
                   title="Restore the shared ledger as it was before an earlier Excel update"
                   style={{ border: `1px solid ${T.rule}`, color: T.inkSoft,
-                           opacity: busy || reloading || !isConfigured ? 0.6 : 1 }}>
+                           opacity: busy || !isConfigured ? 0.6 : 1 }}>
             Previous data
-          </button>
-          <button type="button" onClick={onReload} disabled={reloading} className="rounded-sm px-2.5 py-1 text-xs"
-                  style={{ border: `1px solid ${T.rule}`, color: T.inkSoft, opacity: reloading ? 0.6 : 1 }}>
-            {reloading ? "Reloading…" : "Reload saved data"}
-          </button>
+          </button>}
           {/* with no ledger loaded there is nothing to close back to, so the drop
               zone stays open and the toggle is left out */}
           {!forceOpen && (
@@ -921,6 +917,13 @@ function StatusChart({ rows }) {
 
 /* ---------------- table ---------------- */
 
+const PROJECT_STATUS_OPTIONS = ["ONGOING", "COMPLETED", "SUSPENDED"];
+const PROJECT_STATUS_TONE = {
+  ONGOING: { background: "#FFF4C2", border: "#D2A21C", color: "#765900" },
+  COMPLETED: { background: "#E4EFEC", border: T.collected, color: T.collected },
+  SUSPENDED: { background: "#FBEEEC", border: T.bad, color: T.bad },
+};
+
 function EditCell({ value, type, onChange }) {
   const [focus, setFocus] = useState(false);
   const v = value ?? "";
@@ -929,12 +932,39 @@ function EditCell({ value, type, onChange }) {
     ? (numericValue === null ? v : money(numericValue))
     : v;
 
+  if (type === "status") {
+    const current = CLEAN(v).toUpperCase();
+    const recognized = PROJECT_STATUS_OPTIONS.includes(current);
+    const tone = PROJECT_STATUS_TONE[current] || { background: T.paper2, border: T.rule, color: T.inkSoft };
+    return (
+      <select
+        aria-label="Project status"
+        value={recognized ? current : "__current__"}
+        onChange={(e) => onChange(e.target.value)}
+        onFocus={() => setFocus(true)}
+        onBlur={() => setFocus(false)}
+        onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
+        style={{
+          width: "100%", border: `1px solid ${focus ? T.ink : tone.border}`,
+          background: tone.background, color: tone.color, borderRadius: 2, padding: "2px 4px",
+          fontFamily: MONO, fontSize: 11.5, fontWeight: 700, outline: "none", cursor: "pointer",
+        }}
+      >
+        {!recognized && <option value="__current__" disabled>{current || "UNSPECIFIED"}</option>}
+        {PROJECT_STATUS_OPTIONS.map((status) => (
+          <option key={status} value={status} style={{ color: PROJECT_STATUS_TONE[status].color }}>
+            {status}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
   return (
     <input
       value={displayValue}
       type={type === "date" ? "date" : "text"}
       inputMode={type === "qty" || type === "amount" ? "decimal" : undefined}
-      list={type === "status" ? "project-status-suggestions" : undefined}
       onChange={(e) => onChange(type === "amount"
         ? e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
         : e.target.value)}
@@ -1075,7 +1105,7 @@ function TargetSummaryCell({ record, onOpen }) {
 }
 
 function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell,
-                      onManageTargets, multipleTargetsEnabled, dirtyIds, dirtyCount, savingIds, statusOptions = [] }) {
+                      onManageTargets, multipleTargetsEnabled, dirtyIds, dirtyCount, savingIds }) {
   const [showCollection, setShowCollection] = useState(false);
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
@@ -1136,9 +1166,6 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
         </button>
       </div>
     }>
-      <datalist id="project-status-suggestions">
-        {statusOptions.map((status) => <option key={status} value={status} />)}
-      </datalist>
       {data.length === 0 ? (
         <div className="py-10 text-center text-xs" style={{ color: T.inkFaint }}>No projects match these filters.</div>
       ) : (
@@ -1189,9 +1216,10 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                                       targetId: c.targetField ? r.primaryTarget?.id : null,
                                       field: c.k, value: v });
                       }} onClick={(e) => {
-                        if (e.target.tagName !== "INPUT") e.currentTarget.querySelector("input")?.focus();
+                        if (!e.target.matches("input, select")) e.currentTarget.querySelector("input, select")?.focus();
                       }}
-                          style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA", cursor: "text" }}>
+                          style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA",
+                                   cursor: c.edit === "status" ? "pointer" : "text" }}>
                         <EditCell value={v} type={c.edit} onChange={(nv) => onEdit(r.id, c.k, nv)}
                         />
                       </td>
@@ -1416,9 +1444,9 @@ function TargetAnalysis({ rows }) {
         <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 11.5 }}>
           <thead>
             <tr>
-              {[["#"], ["Project"], ["Scope"], ["District / engineer"], ["Standing"], ["Target qty", "right"],
+              {[["#"], ["Project"], ["District / engineer"], ["Standing"], ["Target qty", "right"],
                 ["Actual", "right"], ["Done", "right"], ["Pace", "right"], ["Due"], ["Remarks"],
-                ["Project balance", "right"], ["Priority"]].map(([hd, al]) => (
+                ["Balance to collect", "right"], ["Priority"]].map(([hd, al]) => (
                 <th key={hd} style={{ textAlign: al || "left", padding: "5px 8px",
                                       borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 9.5,
                                       textTransform: "uppercase", letterSpacing: ".06em", whiteSpace: "nowrap" }}>{hd}</th>
@@ -1431,12 +1459,6 @@ function TargetAnalysis({ rows }) {
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, color: T.inkFaint }}>
                   {p.done ? "\u2713" : p.bucket === "On track" ? "—" : i + 1}</td>
                 <td title={p.project.name} style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, fontWeight: 600, whiteSpace: "nowrap" }}>{p.projectId}</td>
-                {/* what the quantity on this row is actually for — without it two
-                    targets of one project are indistinguishable */}
-                <td title={p.scope || "No scope specified"} style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`,
-                             maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                             color: p.scope ? T.ink : T.inkFaint, fontStyle: p.scope ? "normal" : "italic" }}>
-                  {p.scope || "No scope specified"}</td>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {p.project.district} · <span style={{ color: T.inkSoft }}>{p.project.engineer}</span>
                 </td>
@@ -1479,9 +1501,9 @@ function TargetAnalysis({ rows }) {
                              maxWidth: 210, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                              color: p.project.note ? T.ink : T.inkFaint }}>
                   {p.project.note || "—"}</td>
-                {/* the project's balance, repeated per target and never summable —
-                    the column is named for the project for exactly that reason */}
-                <td title={`Balance for collection on project ${p.projectId} — one figure for the project, not per target`}
+                {/* The balance to collect belongs to the project, so it repeats
+                    for each of that project's target rows. */}
+                <td title={`Balance to collect on project ${p.projectId} — one figure for the project, not per target`}
                     style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, textAlign: "right", whiteSpace: "nowrap" }}>
                   {money(p.project.bal || 0)}</td>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, width: 90 }}>
@@ -1504,7 +1526,7 @@ function TargetAnalysis({ rows }) {
         deadline is within three days; overdue means the deadline has passed. A target counts as delivered when
         Actual output reaches Target qty, and as <b>delivered on time</b> only when its Actual completion date is on
         or before the Target completion date — leave that date blank and it stays <b>delivered</b>, since there is
-        nothing to prove it landed on time. Priority ranks overdue and critical targets first. <b>Project balance</b>
+        nothing to prove it landed on time. Priority ranks overdue and critical targets first. <b>Balance to collect</b>
         belongs to the project, not the target: it repeats across a project's targets and is counted once in
         Collection at risk. Draft targets — no quantity and no deadline — are listed in Manage targets and tracked
         nowhere.
@@ -2401,7 +2423,6 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [dataReady, setDataReady] = useState(false);
   const [log, setLog] = useState([]);
   const [busy, setBusy] = useState(false);
-  const [reloading, setReloading] = useState(false);
   const [datasetHistoryOpen, setDatasetHistoryOpen] = useState(false);
 
   /* Both loads carry their own outcome rather than defaulting to an empty Map.
@@ -2450,7 +2471,7 @@ export default function ProjectLedger({ user, onSignOut }) {
     return () => { alive = false; };
   }, [user]);
 
-  /* the shared dataset, applied on load and whenever somebody asks for a reload */
+  /* Apply the shared dataset on initial load and after an import or restore. */
   const applyDataset = (row) => {
     if (!row) {
       setStore(EMPTY_STORE);
@@ -2477,18 +2498,6 @@ export default function ProjectLedger({ user, onSignOut }) {
     });
     return () => { alive = false; };
   }, []);
-
-  const reloadDataset = async () => {
-    setReloading(true);
-    try {
-      applyDataset(await loadDataset());
-      setLog([]);
-    } catch (error) {
-      setLog([{ warn: true, text: `Could not reload the saved ledger: ${error.message}` }]);
-    } finally {
-      setReloading(false);
-    }
-  };
 
   const restorePreviousDataset = async (version) => {
     await restoreDatasetVersion(version.id);
@@ -2666,11 +2675,6 @@ export default function ProjectLedger({ user, onSignOut }) {
       return merged;
     });
   }, [importedRows, manual, drafts, targets, legacyAssignments, multipleTargetsEnabled]);
-  const statusOptions = useMemo(() => [...new Set([
-    "ONGOING", "SUSPENDED", "COMPLETED",
-    ...records.map((r) => r.status).filter(Boolean),
-  ])].sort((a, b) => String(a).localeCompare(String(b))), [records]);
-
   const handleFiles = async (files) => {
     setBusy(true);
     const out = [];
@@ -2861,8 +2865,8 @@ export default function ProjectLedger({ user, onSignOut }) {
         </header>
 
         <ImportPanel onLoad={handleFiles} sourceLabel={sourceLabel} uploadedBy={uploadedBy}
-                     log={log} busy={busy} onReload={reloadDataset}
-                     onPrevious={() => setDatasetHistoryOpen(true)} reloading={reloading}
+                     log={log} busy={busy} onPrevious={() => setDatasetHistoryOpen(true)}
+                     canRestorePrevious={role === "admin"}
                      forceOpen={dataReady && empty} />
 
         {empty ? <EmptyLedger loading={!dataReady} configured={isConfigured} /> : <>
@@ -2942,8 +2946,7 @@ export default function ProjectLedger({ user, onSignOut }) {
             <LedgerTable rows={rows} sort={sort} onSort={onSort} onExport={exportCsv} onEdit={editManual}
                          onSaveRow={saveRow} onSaveAll={saveAll} dirtyIds={dirtyIds} dirtyCount={dirtyCount}
                          savingIds={savingIds} onAuditCell={setAuditTarget}
-                         onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled}
-                         statusOptions={statusOptions} />
+                         onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled} />
 
             <TargetAnalysis rows={multipleTargetsEnabled ? rows : rows.map((record) => ({
               ...record,
@@ -2973,7 +2976,7 @@ export default function ProjectLedger({ user, onSignOut }) {
             }}
             onClose={() => setAdminOpen(false)} />
         )}
-        {datasetHistoryOpen && (
+        {role === "admin" && datasetHistoryOpen && (
           <DatasetHistoryModal onClose={() => setDatasetHistoryOpen(false)} onRestore={restorePreviousDataset} />
         )}
         {forcePasswordChange && <PasswordChangePanel onDone={() => setForcePasswordChange(false)} />}
