@@ -338,6 +338,44 @@ async function callTargetRpc(fn, args) {
   return data;
 }
 
+/* Administrator deletions.
+
+   Permanent, and the only writes in this file that destroy rather than add.
+   `isAdmin` in this browser decides whether the controls are drawn and nothing
+   more: the role is re-read from profiles inside each function, so a non-admin
+   who calls them directly is refused by the database rather than by the UI.
+
+   The reason is required by the database, not merely collected here. Once the
+   rows are gone it is the only remaining explanation of why. */
+async function deleteTargetPermanently(targetId, reason) {
+  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
+  const rows = await callTargetRpc("admin_delete_project_target", {
+    p_target_id: targetId, p_reason: reason,
+  });
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+async function deleteAuditEntries(auditIds, reason) {
+  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
+  return callTargetRpc("admin_delete_audit_entries", {
+    p_audit_ids: auditIds, p_reason: reason,
+  });
+}
+
+/* Shared by both deletion paths so the wording of the warning cannot drift
+   between them. Returns the typed reason, or null if the user backed out at
+   either step. */
+function confirmPermanentDelete(what, detail) {
+  if (!window.confirm(`Permanently delete ${what}?\n\n${detail}\n\nThis cannot be undone from the panel.`)) return null;
+  const reason = window.prompt(`Reason for deleting ${what}. This is stored in the purge log and is required.`, "");
+  if (reason === null) return null;
+  if (!reason.trim()) {
+    window.alert("A reason is required. Nothing was deleted.");
+    return null;
+  }
+  return reason.trim();
+}
+
 async function saveTargets({ projectId, creates = [], updates = [], archives = [], restores = [] }) {
   if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
   /* One batch id for the whole save, passed into every call, so the field rows
@@ -451,6 +489,11 @@ const COLS = [
      same project therefore render an identical ID, which is why the cell's
      tooltip below spells the year out. */
   { k: "displayId", label: "ID", stick: true, w: 92 },
+  /* The year the ID column stops showing. Two years of the same project render
+     an identical ID, so without this the only way to tell them apart was the
+     cell's tooltip. Same field the Project year filter selects on, so a filtered
+     view and this column can never disagree. */
+  { k: "yearStr", label: "Year", w: 66 },
   { k: "district", label: "District" },
   { k: "license", label: "License" },
   /* Hand-typed like Status and Contract: the workbook supplies it, but a
@@ -476,6 +519,13 @@ const COLS = [
   { k: "targetSummary", label: "Targets", targets: true, w: 178 },
   { k: "note", label: "Remarks", edit: "text", w: 190 },
 ];
+
+/* Columns that sort on a different field from the one they display. The summary
+   cell holds an object, so it orders by how many targets a project has; the year
+   is text on screen ("UNSPECIFIED" where there is none) but has to order as a
+   number, or 2022 and 2025 would sort beside the word rather than beside each
+   other. */
+const SORT_KEYS = { targetSummary: "targetCount", yearStr: "year" };
 
 const INLINE_TARGET_COLS = [
   /* The work itself, ahead of the numbers that measure it. Same field the
@@ -541,7 +591,13 @@ const EXPORT_COLS = [
      than a slightly longer column. */
   { k: "id", label: "ID" },
   { k: "name", label: "Project name" },
-  ...COLS.slice(1).filter((c) => !c.targets && c.k !== "note"),
+  /* `yearStr` is excluded, not overlooked. This list is built from the screen's
+     columns, so adding one to the table would otherwise shift every column after
+     it in a file the team reconciles against other records — and the year is
+     already in the `id` above, so the CSV loses nothing by leaving it out. Drop
+     the `yearStr` test to add a separate Year column, knowing it moves
+     everything to its right. */
+  ...COLS.slice(1).filter((c) => !c.targets && c.k !== "note" && c.k !== "yearStr"),
   { k: "targetCount", label: "Targets" },
   ...EXPORT_TARGET_COLS,
   { k: "note", label: "Remarks" },
@@ -1073,10 +1129,32 @@ function EditCell({ value, type, onChange }) {
   );
 }
 
-function AuditModal({ target, onClose }) {
+function AuditModal({ target, onClose, isAdmin }) {
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  /* Removed from the list as well as from the database, rather than reloading:
+     the query that filled this modal is keyed on the cell, and re-running it
+     after a delete would flicker the whole table for one removed row. */
+  const purge = async (ids, what) => {
+    const reason = confirmPermanentDelete(what, `${ids.length} audit entr${ids.length === 1 ? "y" : "ies"} for ${target.projectDisplayId || target.projectId}.`);
+    if (!reason) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      const deleted = await deleteAuditEntries(ids, reason);
+      const gone = new Set(ids);
+      setLogs((prev) => prev.filter((log) => !gone.has(log.id)));
+      setNotice(`${deleted} audit entr${deleted === 1 ? "y" : "ies"} deleted and recorded in the purge log.`);
+    } catch (deleteError) {
+      setNotice(`Not deleted: ${deleteError.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -1117,6 +1195,8 @@ function AuditModal({ target, onClose }) {
           {loading && <div style={{ color: T.inkFaint, fontSize: 12 }}>Loading audit history…</div>}
           {error && <div style={{ color: T.bad, fontSize: 12 }}>Could not load audit history: {error}</div>}
           {!loading && !error && !logs.length && <div style={{ color: T.inkFaint, fontSize: 12 }}>No saved changes for this cell yet.</div>}
+          {notice && <div style={{ marginBottom: 10, fontFamily: MONO, fontSize: 11,
+                                   color: notice.startsWith("Not deleted") ? T.bad : T.collected }}>{notice}</div>}
           {!loading && !error && logs.length > 0 && (
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
               <thead><tr>
@@ -1124,6 +1204,8 @@ function AuditModal({ target, onClose }) {
                   <th key={label} style={{ padding: "6px 7px", textAlign: align, borderBottom: `2px solid ${T.ink}`,
                                             fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{label}</th>
                 ))}
+                {isAdmin && <th style={{ padding: "6px 7px", textAlign: "right", borderBottom: `2px solid ${T.ink}`,
+                                         fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>Delete</th>}
               </tr></thead>
               <tbody>{logs.map((log) => (
                 <tr key={log.id}>
@@ -1137,9 +1219,39 @@ function AuditModal({ target, onClose }) {
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}` }}>{log.changed_by_username}</td>
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{auditValue(target.field, log.old_value)}</td>
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{auditValue(target.field, log.new_value)}</td>
+                  {isAdmin && (
+                    <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "right" }}>
+                      <button type="button" disabled={busy}
+                              onClick={() => purge([log.id], "this audit entry")}
+                              title="Permanently delete this audit entry"
+                              style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.bad,
+                                       borderRadius: 2, padding: "1px 6px", fontSize: 10.5,
+                                       cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1 }}>
+                        Delete
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}</tbody>
             </table>
+          )}
+          {/* Administrator-only, and deliberately below the table rather than
+              beside the close button: clearing a cell's whole history is not a
+              control anybody should reach for on the way out of the modal. */}
+          {isAdmin && !loading && !error && logs.length > 0 && (
+            <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${T.ruleSoft}`,
+                          display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+              <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
+                Deleted entries are copied to the purge log with your name and reason.
+              </span>
+              <button type="button" disabled={busy}
+                      onClick={() => purge(logs.map((log) => log.id), "the whole history for this cell")}
+                      style={{ border: `1px solid ${T.bad}`, background: T.panel, color: T.bad,
+                               borderRadius: 2, padding: "3px 9px", fontSize: 11,
+                               cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1 }}>
+                {busy ? "Deleting…" : `Delete all ${logs.length} shown`}
+              </button>
+            </div>
           )}
         </div>
       </div>
@@ -1254,9 +1366,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
   const data = useMemo(() => {
     const d = rows.slice();
     const { dir } = sort;
-    /* the summary cell holds an object, so sorting that column sorts on how
-       many targets a project has */
-    const key = sort.key === "targetSummary" ? "targetCount" : sort.key;
+    const key = SORT_KEYS[sort.key] || sort.key;
     d.sort((a, b) => {
       const x = a[key], y = b[key];
       if (typeof x === "number" || typeof y === "number") return ((x ?? -Infinity) - (y ?? -Infinity)) * dir;
@@ -1890,7 +2000,7 @@ function TargetHistoryModal({ project, targets, focusTargetId = null, onClose })
   );
 }
 
-function TargetsModal({ project, onClose, onSaved }) {
+function TargetsModal({ project, onClose, onSaved, isAdmin }) {
   const stored = useMemo(() => project.targets || [], [project.targets]);
   const originals = useMemo(() => new Map(stored.map((t) => [t.id, t])), [stored]);
 
@@ -1924,8 +2034,9 @@ function TargetsModal({ project, onClose, onSaved }) {
   };
 
   /* A new row has never been written, so discarding it is just dropping it.
-     A stored one is archived rather than deleted: nothing in this schema grants
-     DELETE, and its audit history references it. */
+     A stored one is archived: it stops counting towards tracking but stays on
+     record, which is the right answer for real work that ended. Deleting is a
+     separate control below, for administrators, and is not the default. */
   const removeTarget = (row) => {
     if (row._isNew) { setRows((prev) => prev.filter((r) => r.id !== row.id)); return; }
     const name = row.scope || "this target";
@@ -1935,6 +2046,31 @@ function TargetsModal({ project, onClose, onSaved }) {
   const restoreTarget = (row) =>
     setRows((prev) => prev.map((r) => (r.id === row.id
       ? { ...r, _restore: Boolean(r.archived_at) && !r._restore, _archive: false } : r)));
+
+  /* Unlike every other control here this one does not wait for Save. A delete
+     cannot be part of a batch that might be abandoned half-way: the row and its
+     history are gone the moment the database returns, so the modal reloads from
+     the server immediately rather than holding a list that no longer matches. */
+  const deleteTarget = async (row) => {
+    const name = row.scope || "this target";
+    const reason = confirmPermanentDelete(
+      `${name}`,
+      `The target and every audit entry recorded against it will be destroyed. Archiving keeps it on record instead.`,
+    );
+    if (!reason) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      const result = await deleteTargetPermanently(row.id, reason);
+      setRows((prev) => prev.filter((r) => r.id !== row.id));
+      await onSaved(`Deleted ${name} and ${result?.audit_rows_deleted ?? 0} audit entr${result?.audit_rows_deleted === 1 ? "y" : "ies"}. Recorded in the purge log.`);
+      onClose();
+    } catch (deleteError) {
+      setMessage(`Not deleted: ${deleteError.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   /* Live standing, computed from what is currently typed rather than from what
      was last saved, so the pill answers the row in front of you. */
@@ -2139,6 +2275,18 @@ function TargetsModal({ project, onClose, onSaved }) {
                                            padding: "0 2px", fontSize: 10, textDecoration: "underline",
                                            cursor: "pointer" }}>
                             History
+                          </button>
+                        )}
+                        {/* Administrators only, and last in the stack: Archive
+                            stays the obvious control and this one has to be
+                            reached for deliberately. */}
+                        {isAdmin && !row._isNew && (
+                          <button type="button" disabled={busy} onClick={() => deleteTarget(row)}
+                                  title="Permanently delete this target and its audit history"
+                                  style={{ border: "none", background: "none", color: T.bad,
+                                           padding: "0 2px", fontSize: 10, textDecoration: "underline",
+                                           cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1 }}>
+                            Delete
                           </button>
                         )}
                         </div>
@@ -3111,6 +3259,7 @@ export default function ProjectLedger({ user, onSignOut }) {
               targets: record.primaryTarget ? [record.primaryTarget] : [],
             }))} />
             {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
+                                        isAdmin={role === "admin"}
                                         onClose={() => setAuditTarget(null)} />}
             {multipleTargetsEnabled && manageTarget && (
               <TargetsModal
@@ -3119,6 +3268,7 @@ export default function ProjectLedger({ user, onSignOut }) {
                    target list, including one it has just saved */
                 project={records.find((r) => r.id === manageTarget.id) || manageTarget}
                 onSaved={refreshTargets}
+                isAdmin={role === "admin"}
                 onClose={() => setManageTarget(null)} />
             )}
         </div>
