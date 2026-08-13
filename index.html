@@ -10,6 +10,11 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- Self-hosted. Loaded here rather than by an @import inside a React-injected
+         <style>, so the browser starts fetching on first parse instead of after the
+         bundle has executed, and so nothing depends on fonts.gstatic.com filenames
+         that Google rotates underneath a cached stylesheet. -->
+    <link rel="stylesheet" href="/fonts/fonts.css" />
     <title>Project Ledger System</title>
   </head>
   <body>

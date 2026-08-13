@@ -1,4 +1,11 @@
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+/* The three families are self-hosted in /fonts and linked from index.html.
+   They used to be pulled from Google here. Two things were wrong with that: the
+   hashed filenames on fonts.gstatic.com are rotated by Google, so any browser
+   holding the previous stylesheet requested files that no longer existed and
+   filled the console with 404s while falling back to system fonts; and an
+   @import nested inside a bundled stylesheet is only discovered after that
+   stylesheet has been fetched and parsed, which is later than a <link> in the
+   document head. */
 @import "tailwindcss";
 
 .pwa-splash {

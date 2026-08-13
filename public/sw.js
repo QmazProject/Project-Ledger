@@ -1,4 +1,4 @@
-const VERSION = "project-ledger-shell-v2";
+const VERSION = "project-ledger-shell-v3";
 const SHELL_CACHE = VERSION;
 const APP_SHELL = [
   "/",
@@ -48,6 +48,10 @@ self.addEventListener("fetch", (event) => {
 
   const isStaticAsset = url.pathname.startsWith("/assets/")
     || url.pathname.startsWith("/icons/")
+    /* Self-hosted since the Google copies 404'd whenever their hashed names
+       rotated. Same-origin now, so they are cacheable here and the installed
+       app keeps its typography with no network at all. */
+    || url.pathname.startsWith("/fonts/")
     || url.pathname === "/manifest.webmanifest"
     || url.pathname === "/favicon.svg"
     || url.pathname === "/favicon.png";
