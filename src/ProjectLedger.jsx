@@ -1446,6 +1446,68 @@ function DeleteProjectModal({ project, onCancel, onConfirm, busy }) {
   );
 }
 
+/* Raised when somebody presses F5 or Ctrl+R with typed values still unsaved.
+   The browser's own refresh warning cannot offer to save — this one can, which
+   is the whole reason it exists. It names the rows at stake rather than saying
+   "you have unsaved changes", because the first question anybody asks is which
+   ones. */
+/* `cellCount` and `rowIds.length` are different numbers — one row can hold
+   several edited cells — so both are named rather than picking one and letting
+   the reader assume it was the other. */
+function UnsavedReloadModal({ cellCount, rowIds, saving, onSave, onDiscard, onCancel }) {
+  const shown = rowIds.slice(0, 8);
+  return (
+    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !saving) onCancel(); }}
+         style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(22,33,28,.45)",
+                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="reload-title"
+           style={{ width: "min(520px, 100%)", background: T.panel, border: `2px solid ${T.works}`,
+                    borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.3)" }}>
+        <div style={{ padding: "12px 16px", background: "#FDF3EA", borderBottom: `1px solid ${T.works}55` }}>
+          <h2 id="reload-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 800,
+                                         textTransform: "uppercase", color: T.works }}>
+            Unsaved changes
+          </h2>
+          <div style={{ marginTop: 4, fontSize: 12, color: T.ink, lineHeight: 1.45 }}>
+            You have <b>{cellCount} unsaved change{cellCount === 1 ? "" : "s"}</b> across{" "}
+            <b>{rowIds.length} row{rowIds.length === 1 ? "" : "s"}</b>. Reloading now discards them —
+            typing in a cell stores nothing until it is saved.
+          </div>
+        </div>
+        <div style={{ padding: 16, fontSize: 12 }}>
+          <div style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+                        letterSpacing: ".06em", color: T.inkSoft, marginBottom: 4 }}>
+            Rows with unsaved edits
+          </div>
+          <div style={{ fontFamily: MONO, fontSize: 11, color: T.ink, lineHeight: 1.6 }}>
+            {shown.join(", ")}{rowIds.length > shown.length ? ` … and ${rowIds.length - shown.length} more` : ""}
+          </div>
+          <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+            <button type="button" onClick={onCancel} disabled={saving}
+                    style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
+                             borderRadius: 2, padding: "5px 12px", fontSize: 12,
+                             cursor: saving ? "default" : "pointer" }}>
+              Cancel
+            </button>
+            <button type="button" onClick={onDiscard} disabled={saving}
+                    style={{ border: `1px solid ${T.bad}`, background: T.panel, color: T.bad,
+                             borderRadius: 2, padding: "5px 12px", fontSize: 12,
+                             cursor: saving ? "default" : "pointer" }}>
+              Reload and lose them
+            </button>
+            <button type="button" onClick={onSave} disabled={saving} autoFocus
+                    style={{ border: `1px solid ${T.collected}`, background: T.collected, color: T.paper2,
+                             borderRadius: 2, padding: "5px 12px", fontSize: 12, fontWeight: 600,
+                             cursor: saving ? "default" : "pointer" }}>
+              {saving ? "Saving…" : "Save, then reload"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* The one cell that stands in for the six target columns. It has to read at a
    glance, so it leads with the count and names only the worst standing — that
    is the part that decides whether somebody needs to open it. */
@@ -1511,6 +1573,13 @@ const SavedGlyph = () => (
     <path d="M5 12.5 10 17.5 19 7" />
   </svg>
 );
+
+/* Named in the Save tooltip so the shortcut is discoverable rather than folklore.
+   Mac keyboards send the same event through metaKey, and a tooltip promising
+   Ctrl+S to somebody holding Cmd is worse than saying nothing. */
+const SAVE_SHORTCUT_LABEL = typeof navigator !== "undefined"
+  && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "")
+  ? "⌘S" : "Ctrl+S";
 
 /* narrow enough to sit against Remarks: the table is width:100%, so any column
    left unbounded absorbs the slack and drifts away from its neighbour */
@@ -1585,7 +1654,8 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
         </button>
         <button onClick={onSaveAll} disabled={!dirtyCount || savingIds.size > 0}
                 className="project-save-action rounded-sm px-2.5 py-1 text-xs"
-                aria-label="Save changes" title="Save changes"
+                aria-label={`Save changes (${SAVE_SHORTCUT_LABEL})`}
+                title={`Save changes (${SAVE_SHORTCUT_LABEL}) — saves every row with unsaved edits`}
                 style={{ border: `1px solid ${dirtyCount ? T.collected : T.rule}`,
                          background: dirtyCount ? T.collected : T.paper2,
                          color: dirtyCount ? T.paper2 : T.inkFaint,
@@ -1899,7 +1969,7 @@ function TargetAnalysis({ rows }) {
           <thead>
             <tr>
               {[["#"], ["Project"], ["District / engineer"], ["Standing"], ["Target qty", "right"],
-                ["Actual", "right"], ["Done", "right"], ["Pace", "right"], ["Due"], ["Remarks"],
+                ["Actual", "right"], ["Done", "right"], ["Pace", "right"], ["Due"], [SCOPE_LABEL],
                 ["Balance to collect", "right"], ["Priority"]].map(([hd, al]) => (
                 <th key={hd} style={{ textAlign: al || "left", padding: "5px 8px",
                                       borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 9.5,
@@ -1948,13 +2018,18 @@ function TargetAnalysis({ rows }) {
                     <span style={{ color: T.inkFaint }}> · {p.days < 0 ? Math.abs(p.days) + "d late" : p.days + "d left"}</span>
                   )}
                 </td>
-                {/* Remarks belongs to the project, so every target of one project
-                    shows the same value. It is read through the reference, never
-                    copied onto the target. */}
-                <td title={p.project.note || ""} style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`,
+                {/* The target's own Balance Work, which is what this row is
+                    actually about. This column used to show the project's
+                    Remarks: that belongs to the project, so every target of one
+                    project repeated the same sentence, and the sentence had
+                    nothing to do with the deliverable being ranked. Remarks
+                    stays a project note in the Projects table and is not part of
+                    target tracking. */}
+                <td title={p.scope || `No ${SCOPE_LABEL} specified for this target`}
+                    style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`,
                              maxWidth: 210, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                             color: p.project.note ? T.ink : T.inkFaint }}>
-                  {p.project.note || "—"}</td>
+                             color: p.scope ? T.ink : T.inkFaint }}>
+                  {p.scope || "—"}</td>
                 {/* The balance to collect belongs to the project, so it repeats
                     for each of that project's target rows. */}
                 <td title={`Balance to collect on project ${p.projectId} — one figure for the project, not per target`}
@@ -2933,6 +3008,7 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [adminOpen, setAdminOpen] = useState(false);
   const [auditTarget, setAuditTarget] = useState(null);
   const [deletingProject, setDeletingProject] = useState(null);
+  const [reloadPrompt, setReloadPrompt] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -3017,8 +3093,11 @@ export default function ProjectLedger({ user, onSignOut }) {
   const dirtyCount = useMemo(() => Object.values(drafts)
     .reduce((count, row) => count + Object.keys(row).length, 0), [drafts]);
 
+  /* Reports whether the draft was actually cleared, so a caller that intends
+     to reload afterwards can tell a save that failed from one that worked.
+     Every existing caller ignores it and is unaffected. */
   const saveRow = async (id) => {
-    if (!drafts[id] || savingIds.has(id)) return;
+    if (!drafts[id] || savingIds.has(id)) return false;
     const draft = drafts[id];
     const manualDraft = {};
     const targetDraft = {};
@@ -3034,13 +3113,13 @@ export default function ProjectLedger({ user, onSignOut }) {
       manual, id, key, draft: manualDraft, importedRow,
       entry: isReady(manual) ? resolvedEntry(manual.value, importedRow, legacyAssignments) : undefined,
     }) : null;
-    if (manualPlan && !manualPlan.ok) { setSaveMessage(`Could not save ${id}: ${manualPlan.reason}`); return; }
+    if (manualPlan && !manualPlan.ok) { setSaveMessage(`Could not save ${id}: ${manualPlan.reason}`); return false; }
 
     let targetPlan = null;
     if (hasTargetChanges) {
       if (!isReady(targets)) {
         setSaveMessage(`Could not save ${id}: targets are unavailable. Reload the page and try again.`);
-        return;
+        return false;
       }
       const current = records.find((record) => record.id === id);
       const primary = current?.primaryTarget || null;
@@ -3051,7 +3130,7 @@ export default function ProjectLedger({ user, onSignOut }) {
       const errors = validateTarget(after, { isNew: !primary });
       if (Object.keys(errors).length) {
         setSaveMessage(`Could not save ${id}: ${Object.values(errors)[0]}`);
-        return;
+        return false;
       }
       targetPlan = primary
         ? { projectId: id, updates: [{ id: primary.id, before: primary, after }] }
@@ -3073,8 +3152,10 @@ export default function ProjectLedger({ user, onSignOut }) {
       const targetsReloaded = targetPlan ? await refreshTargets() : true;
       setDrafts((prev) => { const next = { ...prev }; delete next[id]; return next; });
       if (targetsReloaded) setSaveMessage(`Saved changes for ${id}.`);
+      return true;
     } catch (error) {
       setSaveMessage(`Could not save ${id}: ${error.message}`);
+      return false;
     } finally {
       setSavingIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
     }
@@ -3145,10 +3226,15 @@ export default function ProjectLedger({ user, onSignOut }) {
     }
   };
 
+  /* Returns how many rows did not save, so "save and reload" can refuse to
+     reload over a failure. saveRow has already put the reason on screen. */
   const saveAll = async () => {
     const ids = [...dirtyIds];
-    for (const id of ids) await saveRow(id);
+    let failed = 0;
+    for (const id of ids) if (!(await saveRow(id))) failed++;
+    return failed;
   };
+
 
   const [filters, setFilters] = useState(() => { const o = {}; DIMS.forEach((d) => (o[d.k] = new Set())); return o; });
   const [q, setQ] = useState("");
@@ -3227,6 +3313,98 @@ export default function ProjectLedger({ user, onSignOut }) {
       return merged;
     });
   }, [importedRows, manual, drafts, targets, legacyAssignments, multipleTargetsEnabled]);
+
+  /* Ctrl+S (Cmd+S on a Mac) saves every pending change — the same work the Save
+     changes button does, and nothing the buttons cannot already do. Both of
+     those stay exactly as they are; this is a third way to reach them, which is
+     what makes it safe to add.
+
+     On the window rather than on the table, because the caret is almost always
+     inside a cell when somebody reaches for it, and a listener on the table
+     would miss the keystroke the moment focus sat anywhere else. The cells call
+     onChange on every keystroke, so the draft already holds the character just
+     typed — there is no need to blur first and no risk of saving a stale value.
+
+     The browser's own Save Page is suppressed only when the panel is going to
+     act on the key. While a dialog is open the dialog owns saving, so the event
+     is left alone and Ctrl+S keeps its normal browser meaning rather than
+     silently saving the table hidden behind it. */
+  const dialogOpen = Boolean(auditTarget || manageTarget || deletingProject
+    || adminOpen || datasetHistoryOpen || forcePasswordChange || reloadPrompt);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key !== "s" && event.key !== "S") return;
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+      if (dialogOpen) return;
+
+      event.preventDefault();
+      /* Saying nothing here reads as a broken shortcut, so each case that
+         declines to save says why in the same place a save would report. */
+      if (!isConfigured) { setSaveMessage("Could not save: Supabase is not configured."); return; }
+      if (busy || savingIds.size) return;
+      if (!dirtyCount) { setSaveMessage("No unsaved changes."); return; }
+      saveAll();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen, busy, savingIds, dirtyCount, dirtyIds, drafts]);
+
+  /* Losing typed values to a refresh.
+
+     Two layers, because no single one can do the whole job. A page cannot put
+     its own buttons in the dialog a refresh raises: the wording and the choices
+     in `beforeunload` belong to the browser, and custom text was removed from
+     every major engine years ago. What it shows is roughly "Leave site? Changes
+     you made may not be saved", with Leave and Cancel, and that cannot be
+     changed from here.
+
+     So beforeunload is the guarantee — it covers the reload button, closing the
+     tab, a typed URL, a back navigation, and it is the only thing that can stop
+     any of them. And the keyboard reload is intercepted first, where a real
+     dialog offering Save is possible. If a browser refuses to let that key be
+     cancelled, beforeunload still fires behind it, so the worst case is the
+     plain browser warning rather than silent loss. */
+  const allowUnload = useRef(false);
+
+  useEffect(() => {
+    if (!dirtyCount) return undefined;
+    const onBeforeUnload = (event) => {
+      /* Set only by a choice that has already accounted for the edits: either
+         they were saved, or the user was asked and chose to discard them.
+         Without this the user would answer two dialogs for one decision. */
+      if (allowUnload.current) return;
+      event.preventDefault();
+      event.returnValue = "";   // Chrome raises the dialog only if this is set
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirtyCount]);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      const reloadKey = event.key === "F5"
+        || ((event.ctrlKey || event.metaKey) && (event.key === "r" || event.key === "R"));
+      if (!reloadKey || !dirtyCount || reloadPrompt) return;
+      event.preventDefault();
+      setReloadPrompt(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [dirtyCount, reloadPrompt]);
+
+  const reloadNow = () => { allowUnload.current = true; window.location.reload(); };
+
+  const saveThenReload = async () => {
+    const failed = await saveAll();
+    /* saveRow has already said which row failed and why. Reloading now would
+       throw away the very edit that could not be stored, so the dialog closes
+       and leaves the message on screen instead. */
+    if (failed) { setReloadPrompt(false); return; }
+    reloadNow();
+  };
+
   const handleFiles = async (files) => {
     setBusy(true);
     const out = [];
@@ -3528,6 +3706,15 @@ export default function ProjectLedger({ user, onSignOut }) {
             {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
                                         isAdmin={role === "admin"}
                                         onClose={() => setAuditTarget(null)} />}
+            {reloadPrompt && (
+              <UnsavedReloadModal
+                cellCount={dirtyCount}
+                rowIds={[...dirtyIds]}
+                saving={savingIds.size > 0}
+                onSave={saveThenReload}
+                onDiscard={reloadNow}
+                onCancel={() => setReloadPrompt(false)} />
+            )}
             {deletingProject && (
               <DeleteProjectModal
                 key={deletingProject.identity}
