@@ -249,7 +249,14 @@ export function assembleProjects(collectionRows = [], masterDimensions = new Map
     const year = dimension.year || collection?.year || null;
     const rawId = dimension.rawId || collection?.id || baseKey;
     const row = {
+      /* `id` carries the year and must keep carrying it: it is not a label, it
+         is the join key. `projectKey(r.id)` produces project_targets.project_key,
+         it is what `project_manual_updates.project_id` was written under, and it
+         keys the drafts map and every audit row. Stripping the year from it
+         would orphan every hand-typed value and every target in the database.
+         `displayId` is the year-free spelling, and is for rendering only. */
       identity, baseKey, rawId, year, id: displayProjectId(rawId, year),
+      displayId: cleanText(rawId),
       isLatestYear: latestByBase.get(baseKey) === identity,
       inQmb: Boolean(dimension.inQmb), inLicenses: Boolean(dimension.inLicenses),
       qmbOverlap: Boolean(dimension.inQmb && dimension.inLicenses),

@@ -9,7 +9,7 @@ import {
   selectPrimaryTarget,
   assessTarget, assessTargets, assessProjectTargets,
   atRiskExposure, distinctProjectCount,
-  validateTarget, targetWarnings, AT_RISK_BUCKETS, TARGET_FIELDS, TARGET_HISTORY_FIELDS,
+  validateTarget, targetWarnings, AT_RISK_BUCKETS, TARGET_FIELDS, TARGET_HISTORY_FIELDS, SCOPE_LABEL,
 } from "./targets.js";
 
 /* A fixed "today" so every standing is reproducible. */
@@ -341,6 +341,18 @@ test("no standing outside the known set, and 'Behind target' is gone", () => {
 test("Actual completion is historical system data, not an editable target field", () => {
   assert.equal(TARGET_FIELDS.some(([field]) => field === "actual_completion"), false);
   assert.equal(TARGET_HISTORY_FIELDS.some(([field]) => field === "actual_completion"), true);
+});
+
+/* The column is headed "Balance Work". The audit trail files that field under
+   "Scope", because the database functions write that string themselves and the
+   history is read back by matching on it. Renaming the stored label to agree
+   with the heading is the tempting, silent way to lose every scope change ever
+   recorded — this test is here to make that failure loud. */
+test("renaming the Balance Work heading must not rename what the audit trail stores", () => {
+  assert.equal(SCOPE_LABEL, "Balance Work", "the heading the panel shows");
+  assert.deepEqual(TARGET_FIELDS[0], ["scope", "Scope"],
+    "the name the RPCs write into project_manual_update_audit.column_name — follows the database, not the UI");
+  assert.equal(TARGET_HISTORY_FIELDS[0][1], "Scope", "and history reads back under the same stored name");
 });
 
 test("a new target must be named; a migrated one may keep a null scope", () => {

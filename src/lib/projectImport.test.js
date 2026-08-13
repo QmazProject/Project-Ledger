@@ -118,3 +118,52 @@ test("Excel audit diff records changed fields only", () => {
   assert.equal(importedChanges([], [{ id: "NEW - 2025", district: "UNSPECIFIED", office: "NONE" }]).length, 0,
     "derived placeholders are not claimed as values supplied by Excel");
 });
+
+/* The Senior engineer can now be typed over in the panel. The override lives in
+   project_manual_updates and is merged in only at render, so an import neither
+   sees it nor can overwrite it — but the workbook's own value still changed,
+   and the audit trail has to say so. This diff reads the imported rows alone,
+   which is exactly what makes both halves of that true at once. */
+test("a changed Senior engineer is audited from the workbook, override or not", () => {
+  const before = [{ id: "QMB-001 - 2025", engineer: "R. CRUZ" }];
+  const after = [{ id: "QMB-001 - 2025", engineer: "L. DELA PENA" }];
+
+  assert.deepEqual(importedChanges(before, after), [{
+    project_id: "QMB-001 - 2025", field_key: "engineer", column_name: "Senior engineer",
+    old_value: "R. CRUZ", new_value: "L. DELA PENA",
+  }]);
+  assert.deepEqual(importedChanges(before, before), [],
+    "a workbook that repeats the same engineer records nothing");
+});
+
+test("a changed SWA % is audited from the workbook, override or not", () => {
+  const changes = importedChanges(
+    [{ id: "QMB-001 - 2025", swa: 0.55 }],
+    [{ id: "QMB-001 - 2025", swa: 0.62 }],
+  );
+
+  assert.deepEqual(changes, [{
+    project_id: "QMB-001 - 2025", field_key: "swa", column_name: "SWA %",
+    old_value: "0.55", new_value: "0.62",
+  }], "recorded as the stored fraction; the panel renders it as a percentage");
+});
+
+/* The ID shown on screen dropped its year, but the ID everything joins on did
+   not. These are the assertions that keep those two apart: `projectKey(r.id)`
+   is project_targets.project_key, and `r.id` is what project_manual_updates
+   rows were written under, so a well-meaning "the display already has it,
+   reuse that" would silently orphan every hand-typed value and every target
+   for a project whose base ID repeats across years. */
+test("displayId drops the year for display while id keeps it for joining", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const rows = assembleProjects([], dim);
+  const y2022 = rows.find((row) => row.id === "QMB-001 - 2022");
+  const y2025 = rows.find((row) => row.id === "QMB-001 - 2025");
+
+  assert.equal(y2022.displayId, "QMB-001", "the year is not shown");
+  assert.equal(y2025.displayId, "QMB-001");
+  assert.equal(y2022.id, "QMB-001 - 2022", "the join key still carries the year");
+  assert.notEqual(y2022.id, y2025.id, "two years remain distinct rows to the database");
+  assert.equal(y2022.year, 2022, "and the year is still available to print in a tooltip");
+  assert.equal(y2025.year, 2025);
+});

@@ -152,6 +152,11 @@ export function assessTarget(project, t, today) {
   return {
     id: t.id,
     projectId: project.id,
+    /* What to print. `projectId` keeps the year because it is the join key and
+       what the audit trail is filed under; this is the short spelling the
+       panel shows. Falls back to the full ID for any caller that builds a
+       project row without one. */
+    projectDisplayId: project.displayId || project.id,
     projectKey: projectKey(project.id),
     project,                      // reference, never spread
     scope: t.scope || "",
@@ -245,6 +250,17 @@ export function distinctProjectCount(tracked) {
 
 /* ---------------- validation ---------------- */
 
+/** What the panel calls `scope` on screen.
+ *
+ *  Deliberately not the label in TARGET_FIELDS below. That one is the string
+ *  written into project_manual_update_audit.column_name — by the database
+ *  functions, in SQL — and the audit trail is read back by matching on it.
+ *  Renaming it would orphan every scope change ever recorded and every one
+ *  recorded from here on, because the RPCs would keep writing 'Scope'. So the
+ *  stored name stays, and only the display name changes. */
+export const SCOPE_LABEL = "Balance Work";
+
+/* field key -> the name this field is *stored* under in the audit trail */
 export const TARGET_FIELDS = [
   ["scope", "Scope"],
   ["target_qty", "Target qty"],
@@ -272,7 +288,7 @@ const blank = (v) => v === null || v === undefined || String(v).trim() === "";
 export function validateTarget(values, { isNew = false } = {}) {
   const errors = {};
 
-  if (isNew && blank(values.scope)) errors.scope = "Scope is required for a new target.";
+  if (isNew && blank(values.scope)) errors.scope = `${SCOPE_LABEL} is required for a new target.`;
 
   for (const [field, label] of [["target_qty", "Target qty"], ["actual_output", "Actual output"]]) {
     if (blank(values[field])) continue;

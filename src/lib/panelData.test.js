@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import {
   LOAD, settleLoad, loadingState, isReady, hasFailed,
   projectTargets, targetsLabel, TARGETS_UNKNOWN,
-  buildManualSave, MANUAL_UNAVAILABLE_REASON,
+  buildManualSave, MANUAL_UNAVAILABLE_REASON, normalizeManualValue,
+  fractionFromPercent, percentFromFraction,
 } from "./panelData.js";
 
 /* The panel's real starting point: one project with hand-typed values already
@@ -11,15 +12,23 @@ import {
 const STORED_STATUS = "ONGOING";
 const STORED_CONTRACT = 4500000;
 const STORED_REMARKS = "Retention released March";
+const STORED_ENGINEER = "J. SANTOS";
+const STORED_SWA = 0.62;
+/* what the workbook says, which the stored values above are deliberately
+   different from — an override only means anything when the two disagree */
+const IMPORTED_ENGINEER = "R. CRUZ";
+const IMPORTED_SWA = 0.55;
 
 const manualMap = () => new Map([
   ["CIP-2024-014", {
     storedId: "cip-2024-014",
-    values: { status: STORED_STATUS, contract: STORED_CONTRACT, note: STORED_REMARKS },
+    values: { status: STORED_STATUS, contract: STORED_CONTRACT, note: STORED_REMARKS,
+      engineer: STORED_ENGINEER, swa: STORED_SWA },
   }],
 ]);
 
-const importedRow = { id: "CIP-2024-014", bal: 1200000, status: "", contract: null, note: "" };
+const importedRow = { id: "CIP-2024-014", bal: 1200000, status: "", contract: null, note: "",
+  engineer: IMPORTED_ENGINEER, swa: IMPORTED_SWA };
 
 /* How the panel loads: both requests are settled independently, so one
    rejecting cannot discard the other's result. */
@@ -176,6 +185,120 @@ test("a draft is never mutated by building a save from it", () => {
   });
   save.values.note = "changed afterwards";
   assert.equal(draft.note, "typed");
+});
+
+/* ---------------- the hand-typed Senior engineer ---------------- */
+
+test("a hand-typed Senior engineer is not sent as null by an unrelated edit", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: manualMap() }),
+    id: "CIP-2024-014", key: "CIP-2024-014", draft: { note: "Updated remark" }, importedRow,
+  });
+
+  assert.equal(save.ok, true);
+  assert.equal(save.values.engineer, STORED_ENGINEER,
+    "the save writes every column, so a field nobody touched must carry its stored value");
+  assert.deepEqual([...save.changedFields], ["note"],
+    "and must not be audited as an edit either");
+});
+
+test("the first hand-typed Senior engineer audits against the imported one", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: new Map() }),
+    id: "CIP-2024-014", key: "CIP-2024-014", draft: { engineer: "M. REYES" }, importedRow,
+  });
+
+  assert.equal(save.ok, true);
+  assert.equal(save.values.engineer, "M. REYES");
+  assert.equal(save.previous.engineer, IMPORTED_ENGINEER,
+    "with no override stored yet, what is being replaced is the workbook's value");
+  assert.deepEqual([...save.changedFields], ["engineer"]);
+});
+
+test("a stored Senior engineer, not the imported one, is what a later edit replaces", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: manualMap() }),
+    id: "CIP-2024-014", key: "CIP-2024-014", draft: { engineer: "M. REYES" }, importedRow,
+  });
+
+  assert.equal(save.previous.engineer, STORED_ENGINEER,
+    "an import that changed the workbook's engineer must not be recorded as this user's old value");
+});
+
+test("a lowercase Senior engineer is stored uppercase", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: new Map() }),
+    id: "CIP-2024-014", key: "CIP-2024-014", draft: { engineer: "  m.   reyes " }, importedRow,
+  });
+
+  assert.equal(save.values.engineer, "M. REYES",
+    "the column is filtered and grouped on, so casing cannot be allowed to split one engineer into two");
+});
+
+test("retyping the same engineer in another case is not a change to audit", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: manualMap() }),
+    id: "CIP-2024-014", key: "CIP-2024-014", draft: { engineer: "j. santos" }, importedRow,
+  });
+
+  /* saveManualRow only writes an audit row where old and new differ as strings,
+     so normalising before that comparison is what keeps the trail honest */
+  assert.equal(save.values.engineer, STORED_ENGINEER);
+  assert.equal(String(save.previous.engineer), String(save.values.engineer),
+    "nothing actually changed, so the audit comparison must find nothing");
+});
+
+test("normalisation leaves the fields that have no rule alone", () => {
+  assert.equal(normalizeManualValue("note", "  keep as typed  "), "  keep as typed  ");
+  assert.equal(normalizeManualValue("status", "ONGOING"), "ONGOING");
+  assert.equal(normalizeManualValue("engineer", null), "", "a cleared override is blank, not the word null");
+});
+
+/* ---------------- the hand-typed SWA % ---------------- */
+
+test("typing the percentage stores the fraction the workbook would have supplied", () => {
+  assert.equal(fractionFromPercent("10.1"), 0.101, "and not 0.10100000000000001");
+  assert.equal(fractionFromPercent("100"), 1);
+  assert.equal(fractionFromPercent("0"), 0, "zero percent is a value, not a cleared cell");
+  assert.equal(fractionFromPercent(""), "", "a cleared cell is what removes the override");
+  assert.equal(fractionFromPercent("."), "", "a half-typed number is not yet a value");
+});
+
+test("the stored fraction reads back as the number that was typed", () => {
+  assert.equal(percentFromFraction(0.101), "10.1", "and not 10.100000000000001");
+  assert.equal(percentFromFraction(0.0525), "5.25");
+  assert.equal(percentFromFraction(1), "100");
+  assert.equal(percentFromFraction(0), "0");
+  assert.equal(percentFromFraction(null), "");
+});
+
+test("an edited SWA survives a redisplay unchanged", () => {
+  /* focus, type, blur, focus again: the cell must offer back exactly what was
+     typed, or a row nobody edited drifts every time somebody clicks into it */
+  for (const typedPercent of ["10.1", "0.5", "99.99", "33.33", "7"])
+    assert.equal(percentFromFraction(fractionFromPercent(typedPercent)), typedPercent);
+});
+
+test("a hand-typed SWA is not sent as null by an unrelated edit", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: manualMap() }),
+    id: "CIP-2024-014", key: "CIP-2024-014", draft: { note: "Updated remark" }, importedRow,
+  });
+
+  assert.equal(save.values.swa, STORED_SWA);
+  assert.deepEqual([...save.changedFields], ["note"]);
+});
+
+test("the first hand-typed SWA audits against the imported one", () => {
+  const save = buildManualSave({
+    manual: settleLoad({ status: "fulfilled", value: new Map() }),
+    id: "CIP-2024-014", key: "CIP-2024-014",
+    draft: { swa: fractionFromPercent("42.5") }, importedRow,
+  });
+
+  assert.equal(save.values.swa, 0.425);
+  assert.equal(save.previous.swa, IMPORTED_SWA,
+    "what a first override replaces is whatever the workbook last said");
 });
 
 test("previous values read imported first, then whatever was stored over them", () => {

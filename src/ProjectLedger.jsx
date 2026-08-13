@@ -4,12 +4,12 @@ import { supabase, isConfigured } from "./lib/supabase";
 import {
   projectKey, todayMs, assessTargets, assessProjectTargets, assessTarget,
   atRiskExposure, distinctProjectCount, isTrackable, isArchived,
-  validateTarget, targetWarnings, selectPrimaryTarget, TARGET_FIELDS,
+  validateTarget, targetWarnings, selectPrimaryTarget, TARGET_FIELDS, SCOPE_LABEL,
 } from "./lib/targets";
 import { groupTargetHistory, actionLabel, isEventOnly, isBlankValue } from "./lib/targetHistory";
 import {
   settleLoad, loadingState, isReady, hasFailed, projectTargets, targetsLabel,
-  buildManualSave,
+  buildManualSave, normalizeManualValue, fractionFromPercent, percentFromFraction,
 } from "./lib/panelData";
 import {
   normalizeText, cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook,
@@ -210,13 +210,18 @@ async function insertAudit(rows) {
 async function loadManual() {
   if (!isConfigured || !supabase) return new Map();
   const { data, error } = await supabase.from("project_manual_updates")
-    .select("project_id, status, contract_amount, remarks");
+    .select("project_id, status, contract_amount, remarks, engineer, swa");
   if (error) throw error;
   const byKey = new Map();
   for (const row of data || []) {
     const values = { note: row.remarks };
     if (row.status !== null && row.status !== undefined) values.status = row.status;
     if (row.contract_amount !== null && row.contract_amount !== undefined) values.contract = row.contract_amount;
+    /* An absent override must not become a value. These are merged over the
+       imported row, so carrying a null here would blank out the Senior engineer
+       the workbook supplied for every project nobody has typed one against. */
+    if (row.engineer !== null && row.engineer !== undefined && row.engineer !== "") values.engineer = row.engineer;
+    if (row.swa !== null && row.swa !== undefined) values.swa = row.swa;
     byKey.set(projectKey(row.project_id), { storedId: row.project_id, values });
   }
   return byKey;
@@ -272,13 +277,20 @@ async function saveManualRow(id, values, oldValues, userId, username, changedFie
     status: CLEAN(values.status) || null,
     contract_amount: numOrNull(values.contract),
     remarks: values.note || null,
+    /* Cleared back to blank means "no override", not "this project has no
+       engineer" — the imported value comes back on the next load. Normalised
+       through the same function the panel used, so what is stored is what is on
+       screen and what the audit compared against. */
+    engineer: normalizeManualValue("engineer", values.engineer) || null,
+    swa: numOrNull(values.swa),
     updated_by: userId,
     updated_at: new Date().toISOString(),
   }, { onConflict: "project_id" });
   if (error) throw error;
 
   const batchId = newBatchId();
-  const auditFields = [["status", "Status"], ["contract", "Contract"], ["note", "Remarks"]];
+  const auditFields = [["status", "Status"], ["contract", "Contract"], ["note", "Remarks"],
+    ["engineer", "Senior engineer"], ["swa", "SWA %"]];
   const changes = auditFields
     .filter(([field]) => !changedFields || changedFields.has(field))
     .filter(([field]) => String(oldValues?.[field] ?? "") !== String(values?.[field] ?? ""))
@@ -435,15 +447,23 @@ const pct = (n) => (n === null || n === undefined || !isFinite(n) ? "—" : (n *
 const sum = (rows, k) => rows.reduce((t, r) => t + (r[k] || 0), 0);
 
 const COLS = [
-  { k: "id", label: "ID", stick: true, w: 92 },
+  /* The year-free spelling. `id` still holds "QMB-014 - 2025" and still does
+     every join; this column only decides what the eye sees. Two years of the
+     same project therefore render an identical ID, which is why the cell's
+     tooltip below spells the year out. */
+  { k: "displayId", label: "ID", stick: true, w: 92 },
   { k: "district", label: "District" },
   { k: "license", label: "License" },
-  { k: "engineer", label: "Senior engineer" },
+  /* Hand-typed like Status and Contract: the workbook supplies it, but a
+     correction typed here outlives every later import of it. */
+  { k: "engineer", label: "Senior engineer", edit: "text", w: 180 },
   { k: "category", label: "Category" },
   { k: "location", label: "Location" },
   { k: "status", label: "Status", edit: "status", w: 160 },
   { k: "contract", label: "Contract", edit: "amount", money: true, w: 101 },
-  { k: "swa", label: "SWA %", pct: true },
+  /* no `pct: true`: an editable cell formats itself, and two formatters on one
+     column is how they drift apart */
+  { k: "swa", label: "SWA %", edit: "pct", w: 92 },
   { k: "billpct", label: "Billed %", pct: true },
   { k: "net", label: "Collected (net)", money: true, group: "collection" },
   { k: "cg", label: "Balance works", money: true, group: "collection" },
@@ -459,6 +479,9 @@ const COLS = [
 ];
 
 const INLINE_TARGET_COLS = [
+  /* The work itself, ahead of the numbers that measure it. Same field the
+     Manage Targets modal edits, so the two are one value and not two. */
+  { k: "scope", label: SCOPE_LABEL, edit: "text", targetField: true, w: 190 },
   { k: "target_qty", label: "Target qty", edit: "qty", targetField: true, w: 92 },
   { k: "unit", label: "Unit", edit: "text", targetField: true, w: 80 },
   { k: "start_date", label: "Start date", edit: "date", targetField: true, w: 132 },
@@ -467,11 +490,29 @@ const INLINE_TARGET_COLS = [
 ];
 const INLINE_TARGET_FIELD_KEYS = new Set(INLINE_TARGET_COLS.map((column) => column.k));
 
+/* The name each field is stored under in the audit trail. This is what the
+   history query matches on, so it follows the database and not the column
+   heading — see SCOPE_LABEL. */
 const AUDIT_FIELD_LABELS = Object.fromEntries([
   ...IMPORT_AUDIT_FIELDS,
   ...TARGET_FIELDS,
   ["note", "Remarks"],
 ]);
+
+/* ...and the name to show above that history, which is the one on the column. */
+const AUDIT_DISPLAY_LABELS = { ...AUDIT_FIELD_LABELS, scope: SCOPE_LABEL };
+
+/* The trail stores what was stored. SWA is a fraction there — from Excel and
+   from the panel alike — so it has to be rendered the way the column renders
+   it, or every row reads as a hundredfold error. Formatting on the way out
+   rather than on the way in also covers the history written before the column
+   was editable. */
+const AUDIT_VALUE_FORMATTERS = {
+  swa: (raw) => { const n = toNum(raw); return n === null ? raw : pct(n); },
+};
+const auditValue = (field, raw) => raw === null || raw === undefined || raw === ""
+  ? "—"
+  : (AUDIT_VALUE_FORMATTERS[field] ? AUDIT_VALUE_FORMATTERS[field](raw) : raw);
 
 /* ---------------- export ----------------
    The export keeps one row per project, because everything downstream of it
@@ -484,7 +525,7 @@ const AUDIT_FIELD_LABELS = Object.fromEntries([
 ------------------------------------------------- */
 
 const EXPORT_TARGET_COLS = [
-  { k: "scope", label: "Scope" },
+  { k: "scope", label: SCOPE_LABEL },
   { k: "target_qty", label: "Target qty" },
   { k: "unit", label: "Unit" },
   { k: "start_date", label: "Start date" },
@@ -495,7 +536,11 @@ const EXPORT_TARGET_COLS = [
 
 /* the table hides the long project name; the export still carries it */
 const EXPORT_COLS = [
-  COLS[0],
+  /* Deliberately the full `id`, year and all, where the screen shows the short
+     one. The CSV is what the team reconciles against other records, and two
+     rows reading "QMB-014" with no way to tell 2024 from 2025 would be worse
+     than a slightly longer column. */
+  { k: "id", label: "ID" },
   { k: "name", label: "Project name" },
   ...COLS.slice(1).filter((c) => !c.targets && c.k !== "note"),
   { k: "targetCount", label: "Targets" },
@@ -916,29 +961,61 @@ function StatusChart({ rows }) {
 
 /* ---------------- table ---------------- */
 
-const PROJECT_STATUS_OPTIONS = ["ONGOING", "COMPLETED", "SUSPENDED"];
+/* Lifecycle order, not alphabetical: a project is unspecified before it is
+   bid, awarded before it runs, and suspended only after it has started. The
+   dropdown reads top to bottom the way the work actually moves. */
+const PROJECT_STATUS_OPTIONS = ["UNSPECIFIED", "NOT YET AWARDED", "ONGOING", "COMPLETED", "SUSPENDED"];
 const PROJECT_STATUS_TONE = {
+  /* Grey, and deliberately the flattest of the five: UNSPECIFIED is the
+     absence of an answer, so it must not compete with the statuses that carry
+     one. It is also what a blank status renders as — see below. */
+  UNSPECIFIED: { background: T.paper2, border: T.rule, color: T.inkFaint },
+  /* Blue, borrowed from the cash tone. Prospective work, distinct from
+     ONGOING's amber so the two are not read as the same stage at a glance. */
+  "NOT YET AWARDED": { background: "#E8F0F7", border: T.cash, color: T.cash },
   ONGOING: { background: "#FFF4C2", border: "#D2A21C", color: "#765900" },
   COMPLETED: { background: "#E4EFEC", border: T.collected, color: T.collected },
   SUSPENDED: { background: "#FBEEEC", border: T.bad, color: T.bad },
 };
 
+/* The SWA cell is percent on both sides of the keyboard — 10.1 in, "10.1%"
+   back, 0.101 stored (see fractionFromPercent). The typed text is held
+   separately while the cell has focus: deriving it from the stored fraction on
+   every keystroke would eat the dot the moment somebody typed "10.". */
 function EditCell({ value, type, onChange }) {
   const [focus, setFocus] = useState(false);
+  /* null means "not being typed into"; "" is a real value the user cleared */
+  const [typed, setTyped] = useState(null);
   const v = value ?? "";
   const numericValue = type === "amount" ? toNum(v) : null;
-  const displayValue = type === "amount" && !focus && v !== ""
-    ? (numericValue === null ? v : money(numericValue))
-    : v;
+  let displayValue = v;
+  if (type === "amount" && !focus && v !== "")
+    displayValue = numericValue === null ? v : money(numericValue);
+  else if (type === "pct") {
+    /* Focused and blurred must show the same number. pct() rounds to one
+       decimal, so a typed 58.45 read back as "58.5%" and the cell disagreed
+       with what the user had just entered. percentFromFraction is the exact
+       inverse of what the keystroke handler stored, so what comes back is
+       precisely what was typed — 58.4 stays 58.4%, 58.45 stays 58.45% — with
+       the % sign added on blur. */
+    const asPercent = percentFromFraction(v);
+    displayValue = focus ? (typed ?? asPercent) : (asPercent === "" ? "" : asPercent + "%");
+  }
 
   if (type === "status") {
     const current = CLEAN(v).toUpperCase();
-    const recognized = PROJECT_STATUS_OPTIONS.includes(current);
-    const tone = PROJECT_STATUS_TONE[current] || { background: T.paper2, border: T.rule, color: T.inkSoft };
+    /* A blank status *is* UNSPECIFIED, so it now selects the real option and
+       takes its colour rather than showing a disabled placeholder. Display
+       only — nothing is written until somebody picks a value, so a project
+       nobody has touched keeps its empty status in the data and in the chart
+       instead of being silently reclassified by a render. */
+    const effective = current || "UNSPECIFIED";
+    const recognized = PROJECT_STATUS_OPTIONS.includes(effective);
+    const tone = PROJECT_STATUS_TONE[effective] || { background: T.paper2, border: T.rule, color: T.inkSoft };
     return (
       <select
         aria-label="Project status"
-        value={recognized ? current : "__current__"}
+        value={recognized ? effective : "__current__"}
         onChange={(e) => onChange(e.target.value)}
         onFocus={() => setFocus(true)}
         onBlur={() => setFocus(false)}
@@ -949,7 +1026,10 @@ function EditCell({ value, type, onChange }) {
           fontFamily: MONO, fontSize: 11.5, fontWeight: 700, outline: "none", cursor: "pointer",
         }}
       >
-        {!recognized && <option value="__current__" disabled>{current || "UNSPECIFIED"}</option>}
+        {/* Only an unrecognised *non-blank* status still needs this — a value
+            some older import wrote that is not one of the five. Blank is now
+            handled by UNSPECIFIED above. */}
+        {!recognized && <option value="__current__" disabled>{current}</option>}
         {PROJECT_STATUS_OPTIONS.map((status) => (
           <option key={status} value={status} style={{ color: PROJECT_STATUS_TONE[status].color }}>
             {status}
@@ -963,18 +1043,27 @@ function EditCell({ value, type, onChange }) {
     <input
       value={displayValue}
       type={type === "date" ? "date" : "text"}
-      inputMode={type === "qty" || type === "amount" ? "decimal" : undefined}
-      onChange={(e) => onChange(type === "amount"
-        ? e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
-        : e.target.value)}
+      inputMode={type === "qty" || type === "amount" || type === "pct" ? "decimal" : undefined}
+      title={type === "pct" ? "Type the percentage itself — 10.1 is 10.1%" : undefined}
+      onChange={(e) => {
+        if (type === "pct") {
+          const text = e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1");
+          setTyped(text);
+          onChange(fractionFromPercent(text));
+          return;
+        }
+        onChange(type === "amount"
+          ? e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
+          : e.target.value);
+      }}
       onFocus={() => setFocus(true)}
-      onBlur={() => setFocus(false)}
+      onBlur={() => { setFocus(false); setTyped(null); }}
       onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
       style={{
         width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
         background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
         fontFamily: type === "text" ? BODY : MONO, fontSize: 11.5, color: T.ink,
-        textAlign: type === "qty" || type === "amount" ? "right" : "left", outline: "none",
+        textAlign: type === "qty" || type === "amount" || type === "pct" ? "right" : "left", outline: "none",
       }}
     />
   );
@@ -1013,9 +1102,9 @@ function AuditModal({ target, onClose }) {
         <div className="flex items-center justify-between gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
           <div>
             <h2 id="audit-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 700, textTransform: "uppercase" }}>
-              Audit trail · {AUDIT_FIELD_LABELS[target.field]}
+              Audit trail · {AUDIT_DISPLAY_LABELS[target.field]}
             </h2>
-            <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>Project ID: {target.projectId}</div>
+            <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>Project ID: {target.projectDisplayId || target.projectId}</div>
           </div>
           <button type="button" onClick={onClose} aria-label="Close audit trail"
                   style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink, padding: "3px 8px", cursor: "pointer" }}>×</button>
@@ -1042,8 +1131,8 @@ function AuditModal({ target, onClose }) {
                     {log.source === "excel" ? "Excel updated" : "Manual edit"}
                   </td>
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}` }}>{log.changed_by_username}</td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{log.old_value ?? "—"}</td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{log.new_value ?? "—"}</td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{auditValue(target.field, log.old_value)}</td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{auditValue(target.field, log.new_value)}</td>
                 </tr>
               ))}</tbody>
             </table>
@@ -1103,8 +1192,54 @@ function TargetSummaryCell({ record, onOpen }) {
   );
 }
 
+/* Two glyphs rather than one that dims. Scanning a long column for the rows
+   that still need saving is the actual job, and a change of colour alone does
+   not survive that scan — a disk means "there is something to click here", a
+   tick means there is not. */
+const SAVE_ICON_SIZE = 13;
+const glyph = { width: SAVE_ICON_SIZE, height: SAVE_ICON_SIZE, viewBox: "0 0 24 24", fill: "none",
+  stroke: "currentColor", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" };
+const UnsavedGlyph = () => (
+  <svg {...glyph} strokeWidth="1.9" style={{ display: "block" }}>
+    <path d="M4 4h11l5 5v11H4z" /><path d="M8 4v5h7" /><path d="M8 20v-6h8v6" />
+  </svg>
+);
+const SavedGlyph = () => (
+  <svg {...glyph} strokeWidth="2" style={{ display: "block" }}>
+    <path d="M5 12.5 10 17.5 19 7" />
+  </svg>
+);
+
+/* narrow enough to sit against Remarks: the table is width:100%, so any column
+   left unbounded absorbs the slack and drifts away from its neighbour */
+const SAVE_COL_W = 46;
+const saveColWidth = { width: SAVE_COL_W, minWidth: SAVE_COL_W, maxWidth: SAVE_COL_W };
+
+function SaveCell({ id, unsaved, saving, onSave }) {
+  const label = saving ? `Saving ${id}…`
+    : unsaved ? `Save changes for ${id}`
+    : `No unsaved changes for ${id}`;
+  return (
+    <td style={{ padding: "3px 4px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center", ...saveColWidth }}>
+      <button type="button" title={label} aria-label={label}
+              onClick={() => onSave(id)} disabled={!unsaved || saving}
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center",
+                       width: 24, height: 22, borderRadius: 2, padding: 0,
+                       border: `1px solid ${unsaved ? T.collected : T.ruleSoft}`,
+                       background: unsaved ? "#E4EFEC" : "transparent",
+                       color: unsaved ? T.collected : T.inkFaint,
+                       /* a row with nothing to save should not look like a button at all */
+                       boxShadow: unsaved ? `0 1px 0 ${T.collected}22` : "none",
+                       cursor: unsaved && !saving ? "pointer" : "default",
+                       fontFamily: MONO, fontSize: 12, lineHeight: 1 }}>
+        {saving ? "…" : unsaved ? <UnsavedGlyph /> : <SavedGlyph />}
+      </button>
+    </td>
+  );
+}
+
 function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell,
-                      onManageTargets, multipleTargetsEnabled, dirtyIds, dirtyCount, savingIds }) {
+                      onManageTargets, multipleTargetsEnabled, isAdmin, dirtyIds, dirtyCount, savingIds }) {
   const [showCollection, setShowCollection] = useState(false);
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
@@ -1181,7 +1316,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                     {c.label}{c.edit && <span aria-hidden="true" style={{ color: T.bad, marginLeft: 3, fontWeight: 800 }}>*</span>} <span style={{ fontFamily: MONO, color: T.inkFaint }}>{sort.key === c.k ? (sort.dir > 0 ? "▲" : "▼") : "↕"}</span>
                   </th>
                 ))}
-                <th style={{ ...th, cursor: "default", width: 68, minWidth: 68 }}>Save</th>
+                <th style={{ ...th, cursor: "default", textAlign: "center", padding: "7px 4px", ...saveColWidth }}>Save</th>
               </tr>
             </thead>
             <tbody>
@@ -1230,27 +1365,25 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                     if (c.pill) return <td key={c.k} {...auditProps} style={base}>
                       <span className="inline-block rounded-full px-2 py-px text-[10.5px]"
                             style={{ border: `1px solid ${pillColor(v)}`, color: pillColor(v) }}>{v}</span></td>;
+                    /* No year in the hover text: the ID column dropped it and
+                       the tooltip is the same label, so repeating it there put
+                       back exactly what was asked to be removed. The overlap
+                       sentence is admin-only for the same reason the \u24d8 below
+                       is \u2014 showing the explanation while hiding the marker
+                       would leak the thing the marker signals. */
                     return <td key={c.k} {...auditProps} title={c.stick
-                      ? [v, r.name, r.qmbOverlap ? "Also exists in QMB PROJECTS; QM LICENSES values are used" : ""].filter(Boolean).join(" \u2014 ")
+                      ? [v, r.name,
+                         isAdmin && r.qmbOverlap ? "Also exists in QMB PROJECTS; QM LICENSES values are used" : ""].filter(Boolean).join(" \u2014 ")
                       : v} style={{ ...base,
                       ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w, overflow: "hidden", textOverflow: "ellipsis" } : {}),
                       ...(c.stick ? { ...stick, fontFamily: MONO, fontWeight: 600, whiteSpace: "nowrap", padding: "6px 8px", fontSize: 11.5 } : {}),
                       ...(c.wide ? { maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } : {}),
                       cursor: auditProps.onContextMenu ? "help" : undefined }}>{v}
-                      {c.stick && r.qmbOverlap && <span aria-label="Also exists in QMB Projects" title="Also exists in QMB PROJECTS; QM LICENSES values are used"
+                      {c.stick && isAdmin && r.qmbOverlap && <span aria-label="Also exists in QMB Projects" title="Also exists in QMB PROJECTS; QM LICENSES values are used"
                         style={{ marginLeft: 5, color: T.works, fontWeight: 800 }}>ⓘ</span>}
                     </td>;
                   })}
-                  <td style={{ padding: "3px 5px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center" }}>
-                    <button type="button" title={`Save changes for ${r.id}`} aria-label={`Save changes for ${r.id}`}
-                            onClick={() => onSaveRow(r.id)} disabled={!dirtyIds.has(r.id) || savingIds.has(r.id)}
-                            style={{ border: `1px solid ${dirtyIds.has(r.id) ? T.collected : T.rule}`,
-                                     background: dirtyIds.has(r.id) ? "#E4EFEC" : T.paper2,
-                                     color: dirtyIds.has(r.id) ? T.collected : T.inkFaint, borderRadius: 2,
-                                     padding: "2px 6px", cursor: dirtyIds.has(r.id) ? "pointer" : "default", fontSize: 13 }}>
-                      {savingIds.has(r.id) ? "…" : "▣"}
-                    </button>
-                  </td>
+                  <SaveCell id={r.id} unsaved={dirtyIds.has(r.id)} saving={savingIds.has(r.id)} onSave={onSaveRow} />
                 </tr>
               ))}
             </tbody>
@@ -1281,7 +1414,8 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                       : `${data.reduce((n, r) => n + r.targetCount, 0)} targets`}</td>;
                   return <td key={c.k} style={base} />;
                 })}
-                <td style={{ position: "sticky", bottom: 0, background: T.paper2, borderTop: `2px solid ${T.ink}` }} />
+                <td style={{ position: "sticky", bottom: 0, background: T.paper2, borderTop: `2px solid ${T.ink}`,
+                             ...saveColWidth }} />
               </tr>
             </tfoot>
           </table>
@@ -1457,7 +1591,7 @@ function TargetAnalysis({ rows }) {
               <tr key={p.id} style={p.done || p.bucket === "On track" ? { background: "#F7FAF6" } : undefined}>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, color: T.inkFaint }}>
                   {p.done ? "\u2713" : p.bucket === "On track" ? "—" : i + 1}</td>
-                <td title={p.project.name} style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, fontWeight: 600, whiteSpace: "nowrap" }}>{p.projectId}</td>
+                <td title={p.project.name} style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, fontWeight: 600, whiteSpace: "nowrap" }}>{p.projectDisplayId || p.projectId}</td>
                 <td style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`, maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {p.project.district} · <span style={{ color: T.inkSoft }}>{p.project.engineer}</span>
                 </td>
@@ -1542,7 +1676,7 @@ function TargetAnalysis({ rows }) {
 ------------------------------------------------- */
 
 const TARGET_COLUMNS = [
-  { k: "scope", label: "Scope", type: "text", w: 200 },
+  { k: "scope", label: SCOPE_LABEL, type: "text", w: 200 },
   { k: "target_qty", label: "Target qty", type: "qty", w: 92 },
   { k: "unit", label: "Unit", type: "text", w: 80 },
   { k: "start_date", label: "Start date", type: "date", w: 132 },
@@ -1591,7 +1725,7 @@ const historyValue = (fieldKey, value) => {
 };
 
 const targetLabel = (target) =>
-  target?.scope || (target?.archived_at ? "Archived target" : "Target with no scope");
+  target?.scope || (target?.archived_at ? "Archived target" : `Target with no ${SCOPE_LABEL}`);
 
 function TargetHistoryModal({ project, targets, focusTargetId = null, onClose }) {
   const stored = useMemo(() => (targets || []).filter((t) => t && t.id && !String(t.id).startsWith("new:")),
@@ -1639,7 +1773,7 @@ function TargetHistoryModal({ project, targets, focusTargetId = null, onClose })
               Target history
             </h2>
             <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>
-              {project.id}{project.name ? ` — ${project.name}` : ""}
+              {project.displayId || project.id}{project.name ? ` — ${project.name}` : ""}
             </div>
           </div>
           <button type="button" onClick={onClose} aria-label="Close target history"
@@ -1885,7 +2019,7 @@ function TargetsModal({ project, onClose, onSaved }) {
                 Manage targets
               </h2>
               <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 12, color: T.ink, fontWeight: 600 }}>
-                {project.id}{project.name ? ` — ${project.name}` : ""}
+                {project.displayId || project.id}{project.name ? ` — ${project.name}` : ""}
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -1957,7 +2091,7 @@ function TargetsModal({ project, onClose, onSaved }) {
                               rather than inventing one */}
                           {c.k === "scope" && !archived && !row._isNew && !row.scope && !rowErrors.scope && (
                             <div style={{ color: T.inkFaint, fontSize: 10, fontStyle: "italic", padding: "1px 4px" }}>
-                              No scope specified
+                              No {SCOPE_LABEL} specified
                             </div>
                           )}
                         </td>
@@ -2022,7 +2156,7 @@ function TargetsModal({ project, onClose, onSaved }) {
               </label>
             )}
             <span className="text-[10.5px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-              Scope is required for a new target. A target with no quantity and no completion date stays a draft
+              {SCOPE_LABEL} is required for a new target. A target with no quantity and no completion date stays a draft
               and is not tracked.
             </span>
           </div>
@@ -2660,16 +2794,16 @@ export default function ProjectLedger({ user, onSignOut }) {
         ? merged.targetSummary.active
         : (merged.primaryTarget ? 1 : 0);
       merged.hasTarget = targetsLabel(targetsOf.unavailable, merged.targetCount);
-      merged.scope = merged.primaryTarget?.scope ?? "";
+      /* scope is one of these now, so it no longer needs lifting separately */
       for (const column of INLINE_TARGET_COLS)
         merged[column.k] = merged.primaryTarget?.[column.k] ?? "";
       if (draft) Object.assign(merged, draft);
 
-      /* Scope is searchable — it is the one target field somebody would look a
-         project up by. Remarks stays the project's own field. */
+      /* Balance Work is searchable — it is the one target field somebody would
+         look a project up by. Remarks stays the project's own field. */
       const scopes = merged.targets.filter((t) => !isArchived(t)).map((t) => t.scope).filter(Boolean);
       if (m || draft || scopes.length)
-        merged._hay = [r._hay, merged.status, merged.contract, merged.note, ...scopes]
+        merged._hay = [r._hay, merged.status, merged.contract, merged.note, merged.engineer, ...scopes]
           .filter(set).join(" ").toLowerCase();
       return merged;
     });
@@ -2945,7 +3079,8 @@ export default function ProjectLedger({ user, onSignOut }) {
             <LedgerTable rows={rows} sort={sort} onSort={onSort} onExport={exportCsv} onEdit={editManual}
                          onSaveRow={saveRow} onSaveAll={saveAll} dirtyIds={dirtyIds} dirtyCount={dirtyCount}
                          savingIds={savingIds} onAuditCell={setAuditTarget}
-                         onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled} />
+                         onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled}
+                         isAdmin={role === "admin"} />
 
             <TargetAnalysis rows={multipleTargetsEnabled ? rows : rows.map((record) => ({
               ...record,

@@ -70,6 +70,59 @@ export const TARGETS_UNKNOWN = "Targets unavailable";
 export const targetsLabel = (unavailable, count) =>
   unavailable ? TARGETS_UNKNOWN : count > 0 ? "With target" : "No target";
 
+/* ---------------- percentages ----------------
+   SWA is stored as a fraction: 10.1% is 0.101. That is what the workbook
+   supplies, what the contract-weighted total below the table divides by, and
+   what the audit rows already hold — but it is not what anybody types. These
+   two convert between the stored value and the typed one, and they have to
+   round: 10.1 / 100 is 0.10100000000000001 in binary floating point, and
+   0.101 * 100 is 10.100000000000001, so a cell left alone through one
+   edit-and-redisplay cycle would otherwise accumulate digits nobody entered.
+------------------------------------------------- */
+
+const toNumber = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(String(value).replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? n : null;
+};
+
+export const fractionFromPercent = (text) => {
+  const n = toNumber(text);
+  return n === null ? "" : Number((n / 100).toFixed(10));
+};
+
+export const percentFromFraction = (value) => {
+  const n = toNumber(value);
+  return n === null ? "" : String(Number((n * 100).toFixed(4)));
+};
+
+/**
+ * How a hand-typed value is stored, whatever the user typed.
+ *
+ * Applied here rather than at the database write so that one value goes to
+ * three places at once: the row that is stored, the row the panel keeps on
+ * screen without reloading, and the comparison that decides whether an audit
+ * entry is warranted. Normalising only at the write would let the panel show
+ * "j. santos" against a stored "J. SANTOS", and would record a change in the
+ * audit trail every time somebody retyped the same name in different case.
+ *
+ * Senior engineer is uppercased because it is a column people filter and group
+ * by: "J. Santos" and "J. SANTOS" would otherwise be two engineers.
+ */
+export const MANUAL_NORMALIZERS = {
+  engineer: (value) => value === null || value === undefined
+    ? "" : String(value).replace(/\s+/g, " ").trim().toUpperCase(),
+};
+
+export const normalizeManualValue = (field, value) =>
+  MANUAL_NORMALIZERS[field] ? MANUAL_NORMALIZERS[field](value) : value;
+
+const normalizeManualDraft = (draft) => {
+  const out = {};
+  for (const [field, value] of Object.entries(draft || {})) out[field] = normalizeManualValue(field, value);
+  return out;
+};
+
 export const MANUAL_UNAVAILABLE_REASON =
   "Saved project updates could not be loaded, so saving is blocked — a save now would overwrite stored values with blanks. Reload the page and try again.";
 
@@ -89,6 +142,7 @@ export function buildManualSave({ manual, id, key, draft, importedRow, entry: re
   }
   const entry = resolved || manual.value.get(key);
   const stored = entry?.values || {};
+  const typed = normalizeManualDraft(draft);
   return {
     ok: true,
     /* write back to the row this project's values were actually loaded from —
@@ -97,8 +151,8 @@ export function buildManualSave({ manual, id, key, draft, importedRow, entry: re
     storedId: entry?.storedId || id,
     /* stored values first, then what was typed: every field the user did not
        touch keeps the value that is in the database */
-    values: { ...stored, ...(draft || {}) },
+    values: { ...stored, ...typed },
     previous: { ...(importedRow || {}), ...stored },
-    changedFields: new Set(Object.keys(draft || {})),
+    changedFields: new Set(Object.keys(typed)),
   };
 }
