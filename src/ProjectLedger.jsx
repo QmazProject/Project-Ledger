@@ -15,7 +15,8 @@ import {
   cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook,
   assembleProjects, extendLegacyAssignments, resolvedEntry, importedChanges,
   IMPORT_AUDIT_FIELDS, IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
-  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore,
+  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore, duplicateProjectIds,
+  buildManualProject, addProjectToStore, displayProjectId, appendDatasetNote,
 } from "./lib/projectImport";
 
 /* ==================================================================
@@ -388,6 +389,84 @@ function confirmPermanentDelete(what, detail) {
     return null;
   }
   return reason.trim();
+}
+
+/* ---------------- access ----------------
+   The named permissions an administrator can grant one at a time. An admin holds
+   all of them implicitly, so this list is only consulted for everybody else.
+   Kept in step with the check constraint in
+   20260831000000_ledger_access_permissions.sql — a key here the database rejects
+   would look like a permission nobody can hold. */
+const LEDGER_PERMISSIONS = [
+  { k: "add_project", label: "Add project",
+    detail: "Create a project by hand in the Projects panel.",
+    enforced: false,
+    note: "Hides the form only. Writing to the shared dataset is something every signed-in user can already do in order to import a workbook, so this is not a security boundary." },
+  { k: "delete_project", label: "Delete project",
+    detail: "Permanently delete a project, its targets, audit history and hand-typed values. Also covers deleting a single target.",
+    enforced: true },
+  { k: "delete_audit", label: "Delete audit trail",
+    detail: "Delete individual audit entries, or a whole cell's history.",
+    enforced: true },
+  { k: "view_presence", label: "See who is signed in",
+    detail: "Show the list of users with the panel open, in the header.",
+    enforced: true },
+  { k: "view_duplicates", label: "View duplicate Project IDs",
+    detail: "Right-click the ID column or header to list Project IDs appearing more than once.",
+    enforced: false,
+    note: "Arithmetic over rows the user can already see, done in the browser. There is nothing to enforce server-side." },
+  { k: "previous_data", label: "Previous data",
+    detail: "Restore the shared ledger to an earlier saved state.",
+    enforced: true },
+];
+
+async function loadMyPermissions() {
+  if (!isConfigured || !supabase) return [];
+  const { data, error } = await supabase.rpc("my_ledger_permissions");
+  if (error) throw new Error(error.message || "Could not read your access.");
+  return data || [];
+}
+
+/* ---------------- presence ----------------
+   How often each browser says "still here", and how long a heartbeat counts for.
+   The window is deliberately more than twice the beat: one missed request — a
+   sleeping laptop, a phone switching network, a slow response — must not drop
+   somebody off the list who is sitting right there. */
+const PRESENCE_BEAT_MS = 45_000;
+const PRESENCE_WINDOW_S = 150;
+const PRESENCE_POLL_MS = 30_000;
+
+let presenceBeatWarned = false;
+
+async function recordPresence() {
+  if (!isConfigured || !supabase) return;
+  /* Not shown to the user, on purpose: a failed heartbeat changes nothing they
+     are doing, the next beat is 45 seconds away, and it is not a feature they
+     asked for or can act on. Not invisible either — a heartbeat that never
+     works presents as "nobody is signed in", which reads as an answer rather
+     than a fault. One console warning gives that a trail without turning a
+     background task into an interruption.
+
+     supabase.rpc RETURNS its error rather than throwing, so the error field has
+     to be read; a bare try/catch around this call would catch nothing. */
+  let failure = "";
+  try {
+    const { error } = await supabase.rpc("record_ledger_presence");
+    if (error) failure = error.message || "unknown error";
+  } catch (thrown) {
+    failure = thrown.message || "request failed";   // network, not PostgREST
+  }
+  if (failure && !presenceBeatWarned) {
+    presenceBeatWarned = true;
+    console.warn(`Project Ledger: presence heartbeat failed — the admin header will show nobody signed in. ${failure}`);
+  }
+}
+
+async function listPresence() {
+  if (!isConfigured || !supabase) return [];
+  const { data, error } = await supabase.rpc("list_ledger_presence", { p_within_seconds: PRESENCE_WINDOW_S });
+  if (error) throw new Error(error.message || "Could not read who is signed in.");
+  return data || [];
 }
 
 async function saveTargets({ projectId, creates = [], updates = [], archives = [], restores = [] }) {
@@ -846,23 +925,30 @@ function FilterDropdown({ dim, counts, selected, onToggle, onClearOne, open, onO
   );
 }
 
-function FilterBar({ q, setQ, filters, countsFor, onToggle, onClearOne, onClearAll, anyActive }) {
+function FilterBar({ q, setQ, filters, countsFor, onToggle, onClearOne, onClearAll, anyActive, disabled }) {
   const [open, setOpen] = useState(null);
   const ref = useRef(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || disabled) return;
     const away = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(null); };
     const esc = (e) => { if (e.key === "Escape") setOpen(null); };
     document.addEventListener("mousedown", away);
     document.addEventListener("keydown", esc);
     return () => { document.removeEventListener("mousedown", away); document.removeEventListener("keydown", esc); };
-  }, [open]);
+  }, [open, disabled]);
 
   return (
     <div ref={ref} className="project-filter-bar sticky top-0 z-20 mb-3 rounded-sm px-3 pb-3 pt-2.5"
          style={{ background: T.panel, border: `1px solid ${T.rule}`, boxShadow: "0 10px 26px -22px rgba(22,33,28,.7)" }}>
-      <div className="project-filter-controls flex flex-wrap items-end gap-2">
+      {/* Inert rather than removed. Taking the bar off the screen would move
+          everything below it and lose the reader's place; leaving it visible but
+          plainly unusable says the selections are still there and will apply
+          again the moment the duplicate view is closed. */}
+      <div className="project-filter-controls flex flex-wrap items-end gap-2"
+           inert={disabled ? "" : undefined}
+           aria-hidden={disabled || undefined}
+           style={disabled ? { opacity: 0.45, filter: "grayscale(1)", pointerEvents: "none" } : undefined}>
         <div className="project-filter-search relative" style={{ width: 220, minWidth: 160, flex: "1 1 auto", maxWidth: 320 }}>
           <div className="mb-1 text-[9.5px] uppercase"
                style={{ fontFamily: DISPLAY, fontWeight: 600, letterSpacing: ".09em", color: T.inkSoft }}>Search</div>
@@ -1173,11 +1259,15 @@ function AuditModal({ target, onClose, isAdmin }) {
 
   useEffect(() => {
     let alive = true;
+    /* With no `field`, this is the whole project's history rather than one
+       cell's: that is the only place a project-level event — "created by hand",
+       a target archived — can be read at all, because those are not filed under
+       any editable column. */
     let query = supabase.from("project_manual_update_audit")
-      .select("id, column_name, old_value, new_value, source, action, changed_by_username, changed_at")
+      .select("id, column_name, field_key, old_value, new_value, source, action, changed_by_username, changed_at")
       .in("project_id", target.projectIds?.length ? target.projectIds : [target.projectId])
-      .eq("column_name", AUDIT_FIELD_LABELS[target.field])
       .order("changed_at", { ascending: false });
+    if (target.field) query = query.eq("column_name", AUDIT_FIELD_LABELS[target.field]);
     if (target.targetId) query = query.eq("target_id", target.targetId);
     query
       .then(({ data, error: queryError }) => {
@@ -1199,7 +1289,7 @@ function AuditModal({ target, onClose, isAdmin }) {
         <div className="flex items-center justify-between gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
           <div>
             <h2 id="audit-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 700, textTransform: "uppercase" }}>
-              Audit trail · {AUDIT_DISPLAY_LABELS[target.field]}
+              Audit trail · {target.field ? AUDIT_DISPLAY_LABELS[target.field] : "Whole project"}
             </h2>
             <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>Project ID: {target.projectDisplayId || target.projectId}</div>
           </div>
@@ -1209,13 +1299,15 @@ function AuditModal({ target, onClose, isAdmin }) {
         <div style={{ padding: 16 }}>
           {loading && <div style={{ color: T.inkFaint, fontSize: 12 }}>Loading audit history…</div>}
           {error && <div style={{ color: T.bad, fontSize: 12 }}>Could not load audit history: {error}</div>}
-          {!loading && !error && !logs.length && <div style={{ color: T.inkFaint, fontSize: 12 }}>No saved changes for this cell yet.</div>}
+          {!loading && !error && !logs.length && <div style={{ color: T.inkFaint, fontSize: 12 }}>
+            {target.field ? "No saved changes for this cell yet." : "Nothing has been recorded against this project yet."}
+          </div>}
           {notice && <div style={{ marginBottom: 10, fontFamily: MONO, fontSize: 11,
                                    color: notice.startsWith("Not deleted") ? T.bad : T.collected }}>{notice}</div>}
           {!loading && !error && logs.length > 0 && (
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
               <thead><tr>
-                {[["When", "left"], ["Activity", "left"], ["User", "left"], ["Previous value", "left"], ["New value", "left"]].map(([label, align]) => (
+                {[["When", "left"], ...(target.field ? [] : [["Column", "left"]]), ["Activity", "left"], ["User", "left"], ["Previous value", "left"], ["New value", "left"]].map(([label, align]) => (
                   <th key={label} style={{ padding: "6px 7px", textAlign: align, borderBottom: `2px solid ${T.ink}`,
                                             fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{label}</th>
                 ))}
@@ -1227,13 +1319,21 @@ function AuditModal({ target, onClose, isAdmin }) {
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap", fontFamily: MONO, fontSize: 10.5 }}>
                     {new Date(log.changed_at).toLocaleString()}
                   </td>
+                  {!target.field && (
+                    <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap",
+                                 fontFamily: MONO, fontSize: 10.5 }}>
+                      {AUDIT_DISPLAY_LABELS[log.field_key] || log.column_name}
+                    </td>
+                  )}
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap",
-                               color: log.source === "excel" ? T.works : T.inkSoft, fontWeight: 600 }}>
-                    {log.source === "excel" ? "Excel updated" : "Manual edit"}
+                               color: log.action === "create" ? T.collected
+                                 : log.source === "excel" ? T.works : T.inkSoft, fontWeight: 600 }}>
+                    {log.action === "create" && log.field_key === "project" ? "Project created"
+                      : log.source === "excel" ? "Excel updated" : "Manual edit"}
                   </td>
                   <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}` }}>{log.changed_by_username}</td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{auditValue(target.field, log.old_value)}</td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{auditValue(target.field, log.new_value)}</td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{auditValue(target.field || log.field_key, log.old_value)}</td>
+                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{auditValue(target.field || log.field_key, log.new_value)}</td>
                   {isAdmin && (
                     <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "right" }}>
                       <button type="button" disabled={busy}
@@ -1446,6 +1546,264 @@ function DeleteProjectModal({ project, onCancel, onConfirm, busy }) {
   );
 }
 
+/* Who has the panel open. Names rather than a count alone: "4 users online"
+   tells an administrator nothing they can act on, whereas a name tells them who
+   to ask before overwriting a shared dataset.
+
+   The list is a lower bound and the card says so. Presence expires by age, so
+   somebody who opened the panel and walked away still appears for a couple of
+   minutes, and somebody whose browser cannot reach the database never appears. */
+
+/* Green while the heartbeat is recent, amber once it is old enough that the
+   person may have closed the tab and not been noticed yet. The colour is the
+   difference between "is here" and "was here a minute ago", which is exactly
+   the distinction somebody deciding whether to interrupt needs. */
+const presenceTone = (secondsAgo) => (secondsAgo <= 75 ? T.collected : T.works);
+
+function PresenceDot({ secondsAgo, size = 7, pulse = true }) {
+  const tone = presenceTone(secondsAgo);
+  return (
+    <span style={{ position: "relative", display: "inline-flex", width: size, height: size, flex: "none" }}>
+      {pulse && (
+        <span className="ledger-pulse-ring" aria-hidden="true"
+              style={{ position: "absolute", inset: 0, borderRadius: "50%", background: tone }} />
+      )}
+      <span style={{ position: "relative", width: size, height: size, borderRadius: "50%",
+                     background: tone, boxShadow: `0 0 0 1.5px ${T.panel}` }} />
+    </span>
+  );
+}
+
+const UserGlyph = ({ size = 12 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none"
+       stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="8" r="3.4" />
+    <path d="M4.8 20a7.2 7.2 0 0 1 14.4 0" />
+  </svg>
+);
+
+const sinceLabel = (seconds) => (seconds < 60 ? "just now"
+  : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago`
+  : `${Math.floor(seconds / 3600)} h ago`);
+
+function PresenceStrip({ presence, currentUsername }) {
+  const { users, error } = presence;
+  const [open, setOpen] = useState(false);
+
+  if (error) {
+    return (
+      <div title={error} style={{ display: "flex", alignItems: "center", gap: 5,
+                                  fontFamily: MONO, fontSize: 10, color: T.bad }}>
+        <PresenceDot secondsAgo={99999} pulse={false} />
+        signed in: unavailable
+      </div>
+    );
+  }
+
+  /* Other people first. Leading with your own name would spend the one visible
+     slot on the one person the reader already knows is here. */
+  const others = users.filter((u) => u.username !== currentUsername);
+  const me = users.find((u) => u.username === currentUsername);
+  const ordered = [...others, ...(me ? [me] : [])];
+
+  if (!ordered.length) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 10, color: T.inkFaint }}>
+        <PresenceDot secondsAgo={0} pulse={false} />
+        <UserGlyph /> only you
+      </div>
+    );
+  }
+
+  const headline = others[0]?.username || currentUsername;
+  const extra = ordered.length - 1;
+  const freshest = Math.min(...ordered.map((u) => u.seconds_ago ?? 0));
+
+  return (
+    <div style={{ position: "relative" }}
+         onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <button type="button"
+              onFocus={() => setOpen(true)} onBlur={() => setOpen(false)}
+              onClick={() => setOpen((wasOpen) => !wasOpen)}
+              aria-expanded={open}
+              aria-label={`${ordered.length} signed in. ${ordered.map((u) => u.username).join(", ")}`}
+              style={{ display: "flex", alignItems: "center", gap: 6, cursor: "default",
+                       border: `1px solid ${open ? T.rule : "transparent"}`, borderRadius: 999,
+                       background: open ? T.panel : T.paper2, padding: "3px 9px 3px 7px",
+                       fontFamily: MONO, fontSize: 10.5, color: T.inkSoft, lineHeight: 1 }}>
+        <PresenceDot secondsAgo={freshest} />
+        <UserGlyph />
+        <span style={{ color: T.ink, fontWeight: 600, maxWidth: 130, overflow: "hidden",
+                       textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {headline}
+        </span>
+        {extra > 0 && (
+          <span style={{ color: T.inkSoft }}>+{extra} user{extra === 1 ? "" : "s"}</span>
+        )}
+      </button>
+
+      {open && (
+        <div role="status"
+             style={{ position: "absolute", right: 0, top: "calc(100% + 6px)", zIndex: 25,
+                      minWidth: 232, maxHeight: 300, overflowY: "auto", textAlign: "left",
+                      background: T.panel, border: `1px solid ${T.ink}`, borderRadius: 3,
+                      boxShadow: "0 14px 34px rgba(22,33,28,.22)" }}>
+          <div style={{ padding: "7px 10px", borderBottom: `1px solid ${T.ruleSoft}`,
+                        fontFamily: DISPLAY, fontSize: 9.5, fontWeight: 700, textTransform: "uppercase",
+                        letterSpacing: ".07em", color: T.inkSoft }}>
+            {ordered.length} signed in
+          </div>
+          <ul style={{ listStyle: "none", margin: 0, padding: "3px 0" }}>
+            {ordered.map((u) => (
+              <li key={u.user_id}
+                  style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 10px",
+                           fontFamily: MONO, fontSize: 11 }}>
+                <PresenceDot secondsAgo={u.seconds_ago ?? 0} pulse={false} />
+                <span style={{ color: T.ink, fontWeight: u.username === currentUsername ? 400 : 600,
+                               overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {u.username}
+                  {u.username === currentUsername && <span style={{ color: T.inkFaint }}> (you)</span>}
+                </span>
+                <span style={{ marginLeft: "auto", color: T.inkFaint, fontSize: 10, whiteSpace: "nowrap" }}>
+                  {sinceLabel(u.seconds_ago ?? 0)}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div style={{ padding: "6px 10px", borderTop: `1px solid ${T.ruleSoft}`,
+                        fontSize: 9.5, color: T.inkFaint, lineHeight: 1.45 }}>
+            Anyone whose browser cannot reach the database does not appear, so treat this as a minimum.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* The counterpart to deleting a project. Imports add and update but never
+   invent, so a project that exists in the world and not yet in any workbook had
+   no way in at all — the only route was to wait for the next Excel file.
+
+   Only Project ID and Year are required, because they are the identity every
+   target, audit row and manual value is filed under. Everything else is a value
+   a later import can supply, and leaving a field blank here leaves it for that
+   import rather than freezing a guess in place. */
+const ADD_PROJECT_FIELDS = [
+  { k: "name", label: "Project name", w: "100%" },
+  { k: "district", label: "District" },
+  { k: "license", label: "License" },
+  { k: "engineer", label: "Senior engineer" },
+  { k: "category", label: "Category" },
+  { k: "location", label: "Location" },
+  { k: "contract", label: "Contract amount", numeric: true },
+  { k: "swa", label: "SWA %", numeric: true },
+];
+
+function AddProjectModal({ onCancel, onCreate, busy, currentYear }) {
+  const [values, setValues] = useState({ projectId: "", year: String(currentYear), status: "UNSPECIFIED" });
+  const [error, setError] = useState("");
+  const set = (k, v) => setValues((prev) => ({ ...prev, [k]: v }));
+
+  const submit = async () => {
+    setError("");
+    const message = await onCreate(values);
+    if (message) setError(message);
+  };
+
+  const field = { border: `1px solid ${T.rule}`, borderRadius: 2, padding: "5px 7px",
+                  fontSize: 12, fontFamily: BODY, width: "100%", background: T.panel };
+  const label = { fontFamily: DISPLAY, fontSize: 9.5, fontWeight: 700, textTransform: "uppercase",
+                  letterSpacing: ".08em", color: T.inkSoft, display: "block", marginBottom: 3 };
+
+  return (
+    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}
+         style={{ position: "fixed", inset: 0, zIndex: 30, background: "rgba(22,33,28,.45)",
+                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="add-project-title"
+           style={{ width: "min(640px, 100%)", maxHeight: "88vh", overflow: "auto", background: T.panel,
+                    border: `1px solid ${T.ink}`, borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.28)" }}>
+        <div style={{ padding: "12px 16px", borderBottom: `1px solid ${T.rule}` }}>
+          <h2 id="add-project-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 800, textTransform: "uppercase" }}>
+            Add a project
+          </h2>
+          <div style={{ marginTop: 4, fontSize: 11.5, color: T.inkSoft, lineHeight: 1.45 }}>
+            Entered by hand. A later workbook containing this Project ID and Year updates the columns you leave
+            blank; the ones you fill in stay on screen, and the workbook's own value is recorded in that
+            column's audit trail instead.
+          </div>
+        </div>
+
+        <div style={{ padding: 16 }}>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 220px" }}>
+              <label style={label} htmlFor="add-project-id">Project ID *</label>
+              <input id="add-project-id" autoFocus value={values.projectId} disabled={busy}
+                     onChange={(e) => set("projectId", e.target.value)}
+                     placeholder="e.g. 26HD0023" style={{ ...field, fontFamily: MONO }} />
+            </div>
+            <div style={{ flex: "0 0 110px" }}>
+              <label style={label} htmlFor="add-project-year">Year *</label>
+              <input id="add-project-year" value={values.year} disabled={busy} inputMode="numeric"
+                     onChange={(e) => set("year", e.target.value.replace(/[^0-9]/g, ""))}
+                     style={{ ...field, fontFamily: MONO }} />
+            </div>
+            <div style={{ flex: "1 1 160px" }}>
+              <label style={label} htmlFor="add-project-status">Status</label>
+              <select id="add-project-status" value={values.status} disabled={busy}
+                      onChange={(e) => set("status", e.target.value)} style={field}>
+                {PROJECT_STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {ADD_PROJECT_FIELDS.map((f) => (
+              <div key={f.k} style={{ flex: f.w === "100%" ? "1 1 100%" : "1 1 180px" }}>
+                <label style={label} htmlFor={`add-project-${f.k}`}>{f.label}</label>
+                <input id={`add-project-${f.k}`} value={values[f.k] ?? ""} disabled={busy}
+                       inputMode={f.numeric ? "decimal" : undefined}
+                       onChange={(e) => set(f.k, f.numeric ? e.target.value.replace(/[^0-9.]/g, "") : e.target.value)}
+                       style={{ ...field, fontFamily: f.numeric ? MONO : BODY,
+                                textAlign: f.numeric ? "right" : "left" }} />
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 10.5, color: T.inkFaint, lineHeight: 1.45 }}>
+            District, License, Senior engineer, Category and Location are stored in upper case, the way the
+            readers store them, so a typed project groups and filters with the imported ones instead of
+            beside them. SWA % is entered as a percentage.
+          </div>
+
+          {error && (
+            <div role="alert" style={{ marginTop: 12, padding: "7px 9px", background: "#FBEEEC",
+                                       border: `1px solid ${T.bad}55`, color: T.bad, fontSize: 12 }}>
+              {error}
+            </div>
+          )}
+
+          <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button type="button" onClick={onCancel} disabled={busy}
+                    style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
+                             borderRadius: 2, padding: "5px 12px", fontSize: 12,
+                             cursor: busy ? "default" : "pointer" }}>
+              Cancel
+            </button>
+            <button type="button" onClick={submit} disabled={busy || !values.projectId.trim() || !values.year}
+                    style={{ border: `1px solid ${T.collected}`,
+                             background: busy || !values.projectId.trim() || !values.year ? T.paper2 : T.collected,
+                             color: busy || !values.projectId.trim() || !values.year ? T.inkFaint : T.paper2,
+                             borderRadius: 2, padding: "5px 12px", fontSize: 12, fontWeight: 600,
+                             cursor: busy ? "default" : "pointer" }}>
+              {busy ? "Adding…" : "Add project"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* Raised when somebody presses F5 or Ctrl+R with typed values still unsaved.
    The browser's own refresh warning cannot offer to save — this one can, which
    is the whole reason it exists. It names the rows at stake rather than saying
@@ -1611,7 +1969,27 @@ function SaveCell({ id, unsaved, saving, onSave }) {
 
 function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell,
                       onManageTargets, multipleTargetsEnabled, isAdmin, dirtyIds, dirtyCount, savingIds,
-                      onDeleteProject }) {
+                      onDeleteProject, onViewDuplicates, duplicateCount, emptyLabel, onAddProject,
+                      onProjectHistory }) {
+  /* Position of the ID-column context menu, in viewport coordinates, or null. */
+  const [idMenu, setIdMenu] = useState(null);
+
+  useEffect(() => {
+    if (!idMenu) return undefined;
+    const close = () => setIdMenu(null);
+    const esc = (e) => { if (e.key === "Escape") setIdMenu(null); };
+    /* `true` puts these on the capture phase so the menu closes on a scroll
+       inside the table as well as on the window, which a bubbling listener on
+       document would never see. */
+    document.addEventListener("mousedown", close);
+    document.addEventListener("scroll", close, true);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("scroll", close, true);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [idMenu]);
   const [showCollection, setShowCollection] = useState(false);
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
@@ -1652,6 +2030,13 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                          boxShadow: showCollection ? "none" : `0 0 0 2px ${T.collected}22` }}>
           {showCollection ? "▾ Hide" : "▸ Show"} collection detail ({groupCount})
         </button>
+        {onAddProject && (
+          <button onClick={onAddProject} className="rounded-sm px-2.5 py-1 text-xs"
+                  aria-label="Add a project by hand" title="Add a project by hand — imports only add and update, they never invent"
+                  style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft }}>
+            + Add project
+          </button>
+        )}
         <button onClick={onSaveAll} disabled={!dirtyCount || savingIds.size > 0}
                 className="project-save-action rounded-sm px-2.5 py-1 text-xs"
                 aria-label={`Save changes (${SAVE_SHORTCUT_LABEL})`}
@@ -1671,8 +2056,64 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
         </button>
       </div>
     }>
+      {idMenu && (
+        /* Fixed to the viewport because the table scrolls in both directions;
+           anchored to the row it was opened on, it would slide away from the
+           cursor the moment anything moved. */
+        <div role="menu"
+             style={{ position: "fixed", left: Math.min(idMenu.x, window.innerWidth - 260), top: idMenu.y,
+                      zIndex: 50, background: T.panel, border: `1px solid ${T.ink}`, borderRadius: 2,
+                      boxShadow: "0 10px 30px rgba(0,0,0,.22)", padding: 3, minWidth: 240 }}
+             onMouseDown={(e) => e.stopPropagation()}>
+          {/* Always listed, and always with its count, so "no duplicates" is an
+              answer the menu gives rather than something the reader has to
+              infer from an option that is missing. At zero there is nothing to
+              show, so it reports 0 instead of opening an empty table. */}
+          <button type="button" role="menuitem" disabled={!duplicateCount}
+                  onClick={() => { setIdMenu(null); onViewDuplicates(); }}
+                  style={{ display: "block", width: "100%", textAlign: "left", border: "none",
+                           background: "none", padding: "6px 9px", fontSize: 12,
+                           color: duplicateCount ? T.ink : T.inkFaint,
+                           cursor: duplicateCount ? "pointer" : "default", fontFamily: BODY }}>
+            View duplicate Project IDs
+            <span style={{ float: "right", fontFamily: MONO, fontSize: 11, fontWeight: 700,
+                           color: duplicateCount ? T.works : T.inkFaint }}>
+              {duplicateCount}
+            </span>
+          </button>
+          <div style={{ padding: "0 9px 5px", fontSize: 10, color: T.inkFaint, lineHeight: 1.4 }}>
+            {duplicateCount
+              ? "Project IDs appearing on more than one row, across years or otherwise."
+              : "No Project ID appears more than once."}
+          </div>
+          {/* Opened on the row that was right-clicked, so it is only offered
+              from a cell. The header knows the column, not a project. */}
+          {idMenu.row && (
+            <>
+              <div style={{ borderTop: `1px solid ${T.ruleSoft}`, margin: "3px 0" }} />
+              <button type="button" role="menuitem"
+                      onClick={() => { const r = idMenu.row; setIdMenu(null); onProjectHistory(r); }}
+                      style={{ display: "block", width: "100%", textAlign: "left", border: "none",
+                               background: "none", padding: "6px 9px", fontSize: 12, color: T.ink,
+                               cursor: "pointer", fontFamily: BODY }}>
+                Project history
+                <span style={{ float: "right", fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
+                  {idMenu.row.displayId}
+                </span>
+              </button>
+              <div style={{ padding: "0 9px 5px", fontSize: 10, color: T.inkFaint, lineHeight: 1.4 }}>
+                Every recorded change to this project, including its creation.
+              </div>
+            </>
+          )}
+        </div>
+      )}
       {data.length === 0 ? (
-        <div className="py-10 text-center text-xs" style={{ color: T.inkFaint }}>No projects match these filters.</div>
+        /* "No projects match these filters" would be wrong in the duplicate
+           view, where the filters are not what emptied the table. */
+        <div className="py-10 text-center text-xs" style={{ color: T.inkFaint }}>
+          {emptyLabel || "No projects match these filters."}
+        </div>
       ) : (
         <div className="overflow-auto" style={{ maxHeight: 620 }}>
           <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 12 }}>
@@ -1680,6 +2121,14 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
               <tr>
                 {cols.map((c) => (
                   <th key={c.k} onClick={() => onSort(c.k)}
+                      /* The ID header is the natural place to ask a question
+                         about the ID column as a whole, so the duplicate menu
+                         opens from here as well as from any ID cell. */
+                      onContextMenu={c.stick && onViewDuplicates
+                        ? (e) => { e.preventDefault(); setIdMenu({ x: e.clientX, y: e.clientY }); }
+                        : undefined}
+                      title={c.stick && onViewDuplicates
+                        ? "Right-click for duplicate Project IDs" : undefined}
                       style={{ ...th, ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w,
                                                  whiteSpace: c.stick ? "nowrap" : "normal" } : {}),
                                color: c.edit ? "#C28A00" : T.ink,
@@ -1742,6 +2191,17 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                        sentence is admin-only for the same reason the \u24d8 below
                        is \u2014 showing the explanation while hiding the marker
                        would leak the thing the marker signals. */
+                    /* Right-click on the ID column is the administrator's way
+                       into the duplicate view. Only on that column, because
+                       that is the column the question is about, and only for an
+                       administrator — everybody else keeps the browser's own
+                       context menu, which is what they expect. */
+                    if (c.stick && onViewDuplicates) {
+                      auditProps.onContextMenu = (e) => {
+                        e.preventDefault();
+                        setIdMenu({ x: e.clientX, y: e.clientY, row: r });
+                      };
+                    }
                     return <td key={c.k} {...auditProps} title={c.stick
                       ? [v, r.name,
                          isAdmin && r.qmbOverlap ? "Also exists in QMB PROJECTS; QM LICENSES values are used" : ""].filter(Boolean).join(" \u2014 ")
@@ -1756,7 +2216,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                           the only way a wrong Project ID leaves the ledger.
                           Administrators only, and on the ID cell because what
                           it deletes is the whole project, not a field of it. */}
-                      {c.stick && isAdmin && onDeleteProject && (
+                      {c.stick && onDeleteProject && (
                         <button type="button" onClick={(e) => { e.stopPropagation(); onDeleteProject(r); }}
                                 title={`Delete ${r.id} and everything recorded against it`}
                                 aria-label={`Delete project ${r.id} and everything recorded against it`}
@@ -2803,6 +3263,74 @@ function ExcelDataButton({ count, disabled, onClick }) {
   </button>;
 }
 
+/* Which of the administrator features one user may reach. Named permissions
+   rather than a second role, because the useful grants here are individually
+   sized: somebody who should see who is signed in almost never also needs to
+   destroy audit history. */
+function AccessModal({ user, granted, onToggle, onClose, busy }) {
+  const isAdmin = user.role === "admin";
+  return (
+    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}
+         style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(22,33,28,.45)",
+                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="access-title"
+           style={{ width: "min(600px, 100%)", maxHeight: "86vh", overflow: "auto", background: T.panel,
+                    border: `1px solid ${T.ink}`, borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.28)" }}>
+        <div className="flex items-start justify-between gap-3" style={{ padding: "12px 16px", borderBottom: `1px solid ${T.rule}` }}>
+          <div>
+            <h2 id="access-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 800, textTransform: "uppercase" }}>
+              Access · {user.username || user.email}
+            </h2>
+            <div style={{ marginTop: 3, fontSize: 11.5, color: T.inkSoft }}>
+              {isAdmin
+                ? "Administrators hold every permission. Change the role to grant these individually."
+                : "Each permission is granted separately and takes effect the next time this user loads the panel."}
+            </div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close access"
+                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink, padding: "3px 8px", cursor: "pointer" }}>×</button>
+        </div>
+
+        <div style={{ padding: 16 }}>
+          {LEDGER_PERMISSIONS.map((permission) => {
+            const on = isAdmin || granted.has(permission.k);
+            return (
+              <label key={permission.k}
+                     style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "9px 0",
+                              borderBottom: `1px solid ${T.ruleSoft}`,
+                              cursor: isAdmin || busy ? "default" : "pointer", opacity: isAdmin ? 0.6 : 1 }}>
+                <input type="checkbox" checked={on} disabled={isAdmin || busy}
+                       onChange={(e) => onToggle(permission.k, e.target.checked)}
+                       style={{ marginTop: 2, width: 15, height: 15 }} />
+                <span>
+                  <span style={{ fontWeight: 600, fontSize: 12.5 }}>{permission.label}</span>
+                  {/* Said here rather than discovered later: two of these hide a
+                      control without being able to stop a determined request. */}
+                  {!permission.enforced && (
+                    <span title={permission.note}
+                          style={{ marginLeft: 6, fontFamily: MONO, fontSize: 9.5, color: T.works,
+                                   border: `1px solid ${T.works}55`, borderRadius: 2, padding: "0 4px" }}>
+                      UI only
+                    </span>
+                  )}
+                  <span style={{ display: "block", fontSize: 11, color: T.inkSoft, marginTop: 2 }}>
+                    {permission.detail}
+                  </span>
+                  {!permission.enforced && (
+                    <span style={{ display: "block", fontSize: 10, color: T.inkFaint, marginTop: 2 }}>
+                      {permission.note}
+                    </span>
+                  )}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
   const [users, setUsers] = useState([]);
   const [captchaEnabled, setCaptchaEnabled] = useState(true);
@@ -2817,6 +3345,31 @@ function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
   const [fileBusy, setFileBusy] = useState("");
   const [preview, setPreview] = useState(null);
   const [previewSheet, setPreviewSheet] = useState("");
+  const [access, setAccess] = useState(new Map());
+  const [accessUser, setAccessUser] = useState(null);
+  const [accessBusy, setAccessBusy] = useState(false);
+
+  /* Grants live in their own table with their own RPCs, not behind the
+     admin-users edge function, because they are ordinary rows in this database
+     rather than anything needing the service key. Loaded by the mount effect
+     above; changed one at a time below. */
+  const toggleAccess = async (userId, permission, grantIt) => {
+    setAccessBusy(true);
+    const { error } = await supabase.rpc("set_ledger_permission", {
+      p_user_id: userId, p_permission: permission, p_granted: grantIt,
+    });
+    setAccessBusy(false);
+    if (error) { setMessage(`Could not change access: ${error.message}`); return; }
+    /* Updated in place rather than reloaded: the answer is known, and a reload
+       would close over a stale list while the request was in flight. */
+    setAccess((prev) => {
+      const next = new Map(prev);
+      const set = new Set(next.get(userId) || []);
+      if (grantIt) set.add(permission); else set.delete(permission);
+      next.set(userId, set);
+      return next;
+    });
+  };
 
   const call = async (body) => {
     setBusy(true); setMessage("");
@@ -2838,6 +3391,18 @@ function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
       setBusy(false);
       if (error || data?.error) setMessage(error?.message || data.error);
       else { setUsers(data?.users || []); setCaptchaEnabled(data?.captcha_enabled !== false); }
+    });
+    /* Deferred with the users request rather than called straight from the
+       effect body, so nothing sets state during the render that scheduled it. */
+    supabase.rpc("list_ledger_permissions").then(({ data, error }) => {
+      if (!alive) return;
+      if (error) { setMessage(`Could not read access settings: ${error.message}`); return; }
+      const map = new Map();
+      for (const row of data || []) {
+        if (!map.has(row.user_id)) map.set(row.user_id, new Set());
+        map.get(row.user_id).add(row.permission);
+      }
+      setAccess(map);
     });
     return () => { alive = false; };
   }, []);
@@ -2926,7 +3491,7 @@ function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
           </button>
         </div>
         <div className="overflow-auto"><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-          <thead><tr>{["Username", "Email", "Role", "Status", "Temporary password", "Data", "Multiple targets", "Actions"].map((h) => <th key={h} style={{ textAlign: "left", padding: "6px 7px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{h}</th>)}</tr></thead>
+          <thead><tr>{["Username", "Email", "Role", "Status", "Temporary password", "Data", "Multiple targets", "Access", "Actions"].map((h) => <th key={h} style={{ textAlign: "left", padding: "6px 7px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{h}</th>)}</tr></thead>
           <tbody>{users.map((u) => <tr key={u.id}>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO }}>{u.username || "—"}</td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.email || "—"}</td>
@@ -2942,6 +3507,27 @@ function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
                                background: u.multiple_targets_enabled ? "#E4EFEC" : T.paper2,
                                color: u.multiple_targets_enabled ? T.collected : T.inkSoft }}>
                 {u.multiple_targets_enabled ? "Enabled" : "Disabled"}
+              </button>
+            </td>
+            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center" }}>
+              {/* A key, because what this opens is which doors this person can
+                  open — not a settings cog, which would read as preferences. */}
+              <button type="button" disabled={busy} onClick={() => setAccessUser(u)}
+                      aria-label={`Access for ${u.username || u.email}`}
+                      title={u.role === "admin"
+                        ? "Administrator — holds every permission"
+                        : `Access: ${(access.get(u.id)?.size || 0)} of ${LEDGER_PERMISSIONS.length} granted`}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer",
+                               border: `1px solid ${T.rule}`, background: T.paper2, borderRadius: 2,
+                               padding: "3px 7px", color: T.ink }}>
+                <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true" fill="none"
+                     stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="8" cy="12" r="4" /><path d="M12 12h9M17 12v4M20.5 12v3" />
+                </svg>
+                <span style={{ fontFamily: MONO, fontSize: 10.5,
+                               color: u.role === "admin" ? T.collected : T.inkSoft }}>
+                  {u.role === "admin" ? "all" : `${access.get(u.id)?.size || 0}/${LEDGER_PERMISSIONS.length}`}
+                </span>
               </button>
             </td>
             <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}><button type="button" disabled={busy} onClick={() => resetPassword(u.id)} style={{ ...actionButton, marginRight: 6, background: resetSuccess[u.id] ? "#E4EFEC" : T.paper2, color: resetSuccess[u.id] ? T.collected : T.ink }}>{resetSuccess[u.id] ? "Created ✓" : "Reset"}</button><button type="button" disabled={busy} onClick={() => toggleBan(u)} style={{ ...actionButton, border: `1px solid ${u.banned_until ? T.collected : T.bad}`, color: u.banned_until ? T.collected : T.bad }}>{u.banned_until ? "Unblock" : "Block"}</button></td>
@@ -2978,6 +3564,14 @@ function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
         </div>
       </div>
     </div>}
+    {accessUser && (
+      <AccessModal
+        user={accessUser}
+        granted={access.get(accessUser.id) || new Set()}
+        busy={accessBusy}
+        onToggle={(permission, grantIt) => toggleAccess(accessUser.id, permission, grantIt)}
+        onClose={() => setAccessUser(null)} />
+    )}
   </div>;
 }
 
@@ -3009,6 +3603,10 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [auditTarget, setAuditTarget] = useState(null);
   const [deletingProject, setDeletingProject] = useState(null);
   const [reloadPrompt, setReloadPrompt] = useState(false);
+  const [presence, setPresence] = useState({ users: [], error: "" });
+  const [permissions, setPermissions] = useState(null);
+  const [duplicatesOnly, setDuplicatesOnly] = useState(false);
+  const [addingProject, setAddingProject] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -3198,7 +3796,7 @@ export default function ProjectLedger({ user, onSignOut }) {
       const result = await deleteProjectRecords(row.auditIds?.length ? row.auditIds : [row.id], reason);
 
       const { store: nextStore, removedCollections } = removeProjectFromStore(store, row.identity);
-      const label = `${sourceLabel} · ${row.id} deleted`;
+      const label = appendDatasetNote(sourceLabel, `${row.id} deleted`);
       setStore(nextStore);
       setSourceLabel(label);
       /* No audit changes are passed: the rows that would have recorded them
@@ -3241,6 +3839,31 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [groupBy, setGroupBy] = useState("district");
   const [sort, setSort] = useState({ key: "bal", dir: -1 });
 
+  /* The three memos below are reported by the React Compiler's lint rule as
+     memoization it "could not preserve", because `importedRows` and
+     `legacyAssignments` are passed to functions imported from ./lib and the
+     compiler does not analyse across module boundaries. Unable to see the body,
+     it assumes any call might mutate its arguments, and a dependency that might
+     be mutated cannot be relied on.
+
+     Not one of them mutates anything, which is the whole reason they live in a
+     tested library rather than here:
+
+       extendLegacyAssignments  copies into `new Map(existing)` and reads `rows`
+       resolvedEntry            only ever calls .get()
+       importedChanges          reads both arrays, returns a new one
+       assembleProjects         builds new row objects, touches neither input
+
+     The memos must stay. babel-plugin-react-compiler is NOT in vite.config.js,
+     so nothing replaces them at runtime: removing them would re-run
+     assembleProjects over every project on every render. (Deleting them does
+     silence the rule — the compiler then compiles this component cleanly — but
+     that is only safe once the compiler is actually in the build.)
+
+     So the advisory is suppressed rather than obeyed. If the compiler is ever
+     added to the build, delete this block and the memos together and let it do
+     the work. */
+  /* eslint-disable react-hooks/preserve-manual-memoization */
   const importedRows = useMemo(() => assemble(store.coll, store.dim), [store]);
   /* Version-1 datasets had no durable assignment for Project-ID-only manual
      data. Derive it immediately so existing values never disappear while the
@@ -3259,7 +3882,13 @@ export default function ProjectLedger({ user, onSignOut }) {
       const entry = isReady(manual) ? resolvedEntry(manual.value, r, legacyAssignments) : undefined;
       const m = entry?.values;
       const draft = drafts[r.id];
-      const merged = m ? { ...r, ...m } : { ...r };
+      /* Three layers, weakest first: the workbook, then values typed when the
+         project was created by hand, then values typed into a cell. Each later
+         layer only covers the columns it actually holds, so a workbook value is
+         hidden by a typed one and left intact underneath — which is what lets
+         the Excel audit trail still record that the workbook changed. */
+      const handEntered = r.manualValues || null;
+      const merged = { ...r, ...(handEntered || {}), ...(m || {}) };
       const set = (x) => x !== undefined && x !== null && x !== "";
 
       /* Targets hang off the project rather than being flattened into it, so
@@ -3275,7 +3904,10 @@ export default function ProjectLedger({ user, onSignOut }) {
          workbook. The delete confirmation names them: "3 hand-typed values" is
          not something an administrator can weigh, and "Status, Contract,
          Remarks" is. */
-      merged.manualFields = m ? Object.keys(m).filter((field) => set(m[field])) : [];
+      merged.manualFields = [...new Set([
+        ...Object.keys(handEntered || {}),
+        ...(m ? Object.keys(m).filter((field) => set(m[field])) : []),
+      ])];
       /* An unavailable target list renders as empty so nothing downstream has
          to special-case it, but it is flagged as unknown rather than reported
          as "No target" — a project whose targets failed to load would
@@ -3307,12 +3939,16 @@ export default function ProjectLedger({ user, onSignOut }) {
       /* Balance Work is searchable — it is the one target field somebody would
          look a project up by. Remarks stays the project's own field. */
       const scopes = merged.targets.filter((t) => !isArchived(t)).map((t) => t.scope).filter(Boolean);
-      if (m || draft || scopes.length)
-        merged._hay = [r._hay, merged.status, merged.contract, merged.note, merged.engineer, ...scopes]
+      /* handEntered included, or a hand-created project's name and district
+         would be on screen and not findable by the search box above it. */
+      if (m || draft || handEntered || scopes.length)
+        merged._hay = [r._hay, merged.status, merged.contract, merged.note, merged.engineer,
+          merged.name, merged.district, merged.category, merged.location, ...scopes]
           .filter(set).join(" ").toLowerCase();
       return merged;
     });
   }, [importedRows, manual, drafts, targets, legacyAssignments, multipleTargetsEnabled]);
+  /* eslint-enable react-hooks/preserve-manual-memoization */
 
   /* Ctrl+S (Cmd+S on a Mac) saves every pending change — the same work the Save
      changes button does, and nothing the buttons cannot already do. Both of
@@ -3394,6 +4030,122 @@ export default function ProjectLedger({ user, onSignOut }) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [dirtyCount, reloadPrompt]);
 
+  /* Every signed-in browser beats, whether or not the person is an admin —
+     otherwise the list would only ever contain administrators, which is the
+     opposite of what it is for. Beating continues while the tab is in the
+     background, because a backgrounded tab is still the panel being open. */
+  useEffect(() => {
+    if (!user?.id || !isConfigured) return undefined;
+    recordPresence();
+    const beat = setInterval(recordPresence, PRESENCE_BEAT_MS);
+    return () => clearInterval(beat);
+  }, [user?.id]);
+
+  /* Only administrators poll, so nobody else spends a request every 30 seconds
+     on a list they are not allowed to see and would be refused anyway. */
+  useEffect(() => {
+    /* No state is reset on the way out: the strip is only rendered for an
+       admin, so a leftover list is never shown, and clearing it here would be a
+       synchronous setState in an effect for no visible gain. */
+    if (!isConfigured || !Array.isArray(permissions) || !permissions.includes("view_presence")) return undefined;
+    let alive = true;
+    const read = async () => {
+      try {
+        const users = await listPresence();
+        if (alive) setPresence({ users, error: "" });
+      } catch (error) {
+        /* Said out loud rather than shown as an empty list: "nobody is signed
+           in" and "this could not be read" look identical otherwise, and an
+           administrator would act on the first while the truth was the second. */
+        if (alive) setPresence({ users: [], error: error.message });
+      }
+    };
+    read();
+    const poll = setInterval(read, PRESENCE_POLL_MS);
+    return () => { alive = false; clearInterval(poll); };
+  }, [permissions]);
+
+  /* Returns an error sentence for the form to print, or "" when it worked.
+     Saved to the shared dataset immediately rather than held locally: a project
+     only this browser knows about is not in the ledger in any sense that
+     matters, and the next person to import would never see it. */
+  const createProject = async (input) => {
+    const built = buildManualProject(
+      { ...input, swa: input.swa === "" || input.swa === undefined ? "" : fractionFromPercent(input.swa) },
+      { currentYear: new Date().getFullYear() },
+    );
+    if (!built.ok) return built.error;
+
+    const added = addProjectToStore(store, built.record);
+    if (!added.ok) return added.error;
+
+    setBusy(true);
+    try {
+      const label = appendDatasetNote(sourceLabel, `${built.record.rawId} - ${built.record.year} added`);
+      await saveDataset(added.store, label, []);
+      setStore(added.store);
+      setSourceLabel(label);
+
+      /* One event, after the project actually exists. Recorded separately from
+         the dataset save because that RPC writes per-field rows labelled as
+         Excel changes, and this was neither. A failure here is reported without
+         undoing the creation: the project is saved and real, and losing it to
+         tidy up its audit row would be the worse outcome. */
+      const created = displayProjectId(built.record.rawId, built.record.year);
+      let auditNote = "";
+      try {
+        const { error } = await supabase.rpc("record_project_created", {
+          p_project_id: built.record.identity,
+          p_summary: `Created by hand${built.record.name ? ` — ${built.record.name}` : ""}`,
+        });
+        if (error) throw new Error(error.message);
+      } catch (auditError) {
+        auditNote = ` The project was saved, but its "created" audit entry was not recorded (${auditError.message}).`;
+      }
+
+      const held = built.manualFields.length;
+      setSaveMessage(
+        `Added ${created}.`
+        + (held
+          ? ` ${held} hand-entered value${held === 1 ? "" : "s"} will stay on screen through every later import — a workbook that disagrees is recorded in that column's audit trail as an Excel update rather than applied.`
+          : " Every field was left blank, so a later import will fill them.")
+        + auditNote,
+      );
+      return "";
+    } catch (error) {
+      /* The store is left untouched on failure — setStore has not run — so the
+         panel and the shared dataset still agree with each other. */
+      return `Could not save the new project: ${error.message}`;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /* A deliberate sign-out is the one departure the browser can actually report,
+     so it is reported: without this the person stays on the admin's list for
+     the rest of the heartbeat window after they have plainly left. Failure is
+     ignored — the row expires by itself, which is the whole design. */
+  const signOutAndClearPresence = async () => {
+    if (isConfigured && supabase) {
+      try { await supabase.rpc("clear_ledger_presence"); } catch { /* expires anyway */ }
+    }
+    onSignOut();
+  };
+
+  /* null until the answer arrives, and every gate treats null as "no". Drawing
+     a control and taking it away once the real answer lands is worse than a
+     brief absence, and offering an action the database will refuse is worse. */
+  useEffect(() => {
+    if (!isConfigured || !user?.id) return undefined;   // stays null, which reads as no access
+    let alive = true;
+    loadMyPermissions()
+      .then((list) => { if (alive) setPermissions(list); })
+      .catch(() => { if (alive) setPermissions([]); });
+    return () => { alive = false; };
+  }, [user?.id, role]);
+
+  const can = (permission) => Array.isArray(permissions) && permissions.includes(permission);
+
   const reloadNow = () => { allowUnload.current = true; window.location.reload(); };
 
   const saveThenReload = async () => {
@@ -3441,6 +4193,9 @@ export default function ProjectLedger({ user, onSignOut }) {
               const merged = mergeMasterDimensions(dim, r.dim);
               dim = merged.dim; gotMaster = true; accepted = true;
               out.push({ text: `Projects: ${merged.added} new, ${merged.updated} updated, ${merged.retained} kept from earlier uploads` });
+              /* Said out loud. A hand-entered value silently outranking the
+                 workbook looks identical to the workbook agreeing with it. */
+              if (merged.keptManual) out.push({ text: `${merged.keptManual} hand-entered value${merged.keptManual === 1 ? "" : "s"} kept — the workbook differed and was not applied` });
             }
           }
           if (!accepted) out.push({ warn: true, text: `${f.name}: the sheet tab was found but no usable project rows were read from it` });
@@ -3504,7 +4259,22 @@ export default function ProjectLedger({ user, onSignOut }) {
     if (query && !r._hay.includes(query)) return false;
     return true;
   };
-  const rows = records.filter((r) => passes(r, null));
+  /* The duplicate view is a different question from the filters, not another
+     filter. The filters ask "which projects match these attributes"; this asks
+     "which Project IDs are not unique", and answering it through the filter set
+     would mean an admin could hide half of a duplicated pair by leaving a
+     district selected — and then read the remaining half as unique. So it
+     replaces the filters outright while it is on, and the bar above is disabled
+     to say so rather than sitting there looking as though it still applies.
+     Non-admins never reach this mode and their filters behave exactly as
+     before. */
+  const duplicates = useMemo(() => duplicateProjectIds(records), [records]);
+  /* Guarded on the role as well as the flag, so a role that changes while the
+     view is open drops straight back to the ordinary filtered table. */
+  const duplicateView = can("view_duplicates") && duplicatesOnly;
+  const rows = duplicateView
+    ? records.filter((r) => duplicates.identities.has(r.identity))
+    : records.filter((r) => passes(r, null));
 
   const countsFor = (dimKey) => {
     const m = new Map();
@@ -3572,7 +4342,22 @@ export default function ProjectLedger({ user, onSignOut }) {
       backgroundSize: "28px 28px", backgroundPosition: "-1px -1px",
     }}>
       <style dangerouslySetInnerHTML={{ __html:
-        `@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');` }} />
+        `@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+         /* The presence dot. The ring expands and fades once a cycle rather than
+            the dot itself blinking: a blinking dot reads as a warning, a slow
+            ring reads as a pulse — which is what it is. */
+         @keyframes ledgerPulse {
+           0%   { transform: scale(1);   opacity: .55; }
+           70%  { transform: scale(2.6); opacity: 0; }
+           100% { transform: scale(2.6); opacity: 0; }
+         }
+         .ledger-pulse-ring { animation: ledgerPulse 2.4s ease-out infinite; }
+         /* Somebody who has asked for less motion still needs to see who is
+            online; they just do not need it moving. */
+         @media (prefers-reduced-motion: reduce) {
+           .ledger-pulse-ring { animation: none; opacity: .35; }
+         }` }} />
 
       <div className="mx-auto max-w-[1480px] px-4 pb-16">
         <header className="mb-4 flex flex-wrap items-end justify-between gap-4 pt-5 pb-3" style={{ borderBottom: `2px solid ${T.ink}` }}>
@@ -3588,6 +4373,7 @@ export default function ProjectLedger({ user, onSignOut }) {
               {records.length} projects loaded<br />
               master from QMB Projects + QM Licenses
             </div>
+            {can("view_presence") && <PresenceStrip presence={presence} currentUsername={username} />}
             {role === "admin" && <button type="button" onClick={() => setAdminOpen(true)}
               style={{ color: T.ink, background: T.paper2, border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 10, padding: "5px 7px", cursor: "pointer" }}>
               User management
@@ -3595,7 +4381,7 @@ export default function ProjectLedger({ user, onSignOut }) {
             {onSignOut && (
               <button
                 type="button"
-                onClick={onSignOut}
+                onClick={signOutAndClearPresence}
                 className="px-2 py-1 uppercase"
                 style={{
                   color: T.ink,
@@ -3615,13 +4401,36 @@ export default function ProjectLedger({ user, onSignOut }) {
 
         <ImportPanel onLoad={handleFiles} sourceLabel={sourceLabel} uploadedBy={uploadedBy}
                      log={log} busy={busy} onPrevious={() => setDatasetHistoryOpen(true)}
-                     canRestorePrevious={role === "admin"}
+                     canRestorePrevious={can("previous_data")}
                      forceOpen={dataReady && empty} />
 
         {empty ? <EmptyLedger loading={!dataReady} configured={isConfigured} /> : <>
 
         <FilterBar q={q} setQ={setQ} filters={filters} countsFor={countsFor}
-                   onToggle={toggle} onClearOne={clearOne} onClearAll={clearAll} anyActive={anyActive} />
+                   onToggle={toggle} onClearOne={clearOne} onClearAll={clearAll} anyActive={anyActive}
+                   disabled={duplicateView} />
+
+        {duplicateView && (
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3 px-3 py-2"
+               style={{ background: "#FDF3EA", border: `1px solid ${T.works}`, borderLeft: `4px solid ${T.works}`,
+                        fontFamily: MONO, fontSize: 12, color: T.ink }}>
+            <span>
+              <b>Duplicate Project IDs</b> · {duplicates.groups.length} ID
+              {duplicates.groups.length === 1 ? "" : "s"} on {duplicates.rowCount} rows
+              {duplicates.groups.some((g) => g.repeatedYear) && (
+                <span style={{ color: T.bad }}>
+                  {" · "}{duplicates.groups.filter((g) => g.repeatedYear).length} with the same ID twice in one year
+                </span>
+              )}
+              <span style={{ color: T.inkSoft }}> — filters above are disabled in this view</span>
+            </span>
+            <button type="button" onClick={() => setDuplicatesOnly(false)}
+                    style={{ border: `1px solid ${T.ink}`, background: T.panel, color: T.ink,
+                             borderRadius: 2, padding: "3px 10px", fontSize: 11, cursor: "pointer" }}>
+              Back to all projects
+            </button>
+          </div>
+        )}
 
         <div className="mb-4 flex flex-wrap items-baseline gap-2 px-3 py-2"
              style={{ background: T.paper2, border: `1px solid ${T.rule}`, borderLeft: `4px solid ${T.ink}`,
@@ -3697,15 +4506,32 @@ export default function ProjectLedger({ user, onSignOut }) {
                          savingIds={savingIds} onAuditCell={setAuditTarget}
                          onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled}
                          isAdmin={role === "admin"}
-                         onDeleteProject={role === "admin" ? setDeletingProject : undefined} />
+                         onDeleteProject={can("delete_project") ? setDeletingProject : undefined}
+                         onViewDuplicates={can("view_duplicates") ? () => setDuplicatesOnly(true) : undefined}
+                         duplicateCount={duplicates.groups.length}
+                         emptyLabel={duplicateView ? "No Project ID appears more than once." : undefined}
+                         onAddProject={can("add_project") ? () => setAddingProject(true) : undefined}
+                         onProjectHistory={(r) => setAuditTarget({ projectId: r.auditId || r.id, projectIds: r.auditIds,
+                                                                   projectDisplayId: r.displayId, field: null })} />
 
             <TargetAnalysis rows={multipleTargetsEnabled ? rows : rows.map((record) => ({
               ...record,
               targets: record.primaryTarget ? [record.primaryTarget] : [],
             }))} />
             {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
-                                        isAdmin={role === "admin"}
+                                        isAdmin={can("delete_audit")}
                                         onClose={() => setAuditTarget(null)} />}
+            {addingProject && (
+              <AddProjectModal
+                busy={busy}
+                currentYear={new Date().getFullYear()}
+                onCancel={() => setAddingProject(false)}
+                onCreate={async (input) => {
+                  const message = await createProject(input);
+                  if (!message) setAddingProject(false);
+                  return message;
+                }} />
+            )}
             {reloadPrompt && (
               <UnsavedReloadModal
                 cellCount={dirtyCount}
@@ -3736,7 +4562,7 @@ export default function ProjectLedger({ user, onSignOut }) {
                    target list, including one it has just saved */
                 project={records.find((r) => r.id === manageTarget.id) || manageTarget}
                 onSaved={refreshTargets}
-                isAdmin={role === "admin"}
+                isAdmin={can("delete_project")}
                 onClose={() => setManageTarget(null)} />
             )}
         </div>

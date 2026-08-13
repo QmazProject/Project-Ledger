@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import * as XLSX from "xlsx";
 
 import {
-  MASTER_START_YEAR, readMasterWorkbook, readCollectiblesWorkbook, assembleProjects,
+  MASTER_START_YEAR, normalizeText, readMasterWorkbook, readCollectiblesWorkbook, assembleProjects,
   extendLegacyAssignments, resolvedEntry, importedChanges,
   IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
-  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore,
+  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore, duplicateProjectIds,
+  buildManualProject, addProjectToStore, appendDatasetNote,
 } from "./projectImport.js";
 
 const workbook = (sheets) => {
@@ -377,4 +378,287 @@ test("removing a project that is not there changes nothing and does not throw", 
   assert.equal(removedCollections, 0);
   assert.equal(store.dim.size, dim.size);
   assert.equal(removeProjectFromStore(undefined, "X - 2025").store.dim.size, 0, "an absent store is not a crash");
+});
+
+/* The ID column shows the year-free spelling, so the same project in two years
+   renders identical text — indistinguishable by eye from a mistyped ID. This is
+   what the admin duplicate view reads. */
+test("duplicate Project IDs group by normalised base ID and carry their years", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { groups, identities, rowCount } = duplicateProjectIds(assembleProjects([], dim));
+
+  assert.equal(groups.length, 1, "only QMB-001 appears twice");
+  assert.equal(groups[0].displayId, "QMB-001");
+  assert.equal(groups[0].count, 2);
+  assert.deepEqual(groups[0].years, [2022, 2025], "sorted, so the pair reads in order");
+  assert.equal(groups[0].repeatedYear, false, "two different years is legitimate, not an error");
+  assert.equal(rowCount, 2);
+  assert.deepEqual([...identities].sort(), ["QMB-001 - 2022", "QMB-001 - 2025"]);
+  assert.equal(identities.has("QMB-ONLY - 2024"), false, "a unique ID is not in the set");
+});
+
+test("case and apostrophe differences are still the same Project ID", () => {
+  /* The exact failure the normalised key exists for: three spellings that look
+     different in the column but are one ID, which nobody spots by eye. */
+  const rows = [
+    { identity: "QMB-001 - 2025", baseKey: "QMB-001", displayId: "QMB-001", year: 2025 },
+    { identity: "qmb-001 - 2024", baseKey: normalizeText("qmb-001"), displayId: "qmb-001", year: 2024 },
+    { identity: "OTHER - 2025", baseKey: "OTHER", displayId: "OTHER", year: 2025 },
+  ];
+  const { groups } = duplicateProjectIds(rows);
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].count, 2, "QMB-001 and qmb-001 are one ID");
+  assert.equal(groups[0].baseKey, "QMB-001");
+});
+
+test("the same ID twice in one year is flagged separately", () => {
+  const rows = [
+    { identity: "QMB-001 - 2025", baseKey: "QMB-001", displayId: "QMB-001", year: 2025 },
+    { identity: "QMB-001", baseKey: "QMB-001", displayId: "QMB-001", year: 2025 },
+  ];
+  const { groups } = duplicateProjectIds(rows);
+
+  assert.equal(groups[0].repeatedYear, true,
+    "the readers key on ID and year, so one year twice means two spellings collapsed into one");
+});
+
+test("no duplicates, and no rows, are both answered without throwing", () => {
+  const unique = duplicateProjectIds([
+    { identity: "A - 2025", baseKey: "A", displayId: "A", year: 2025 },
+    { identity: "B - 2025", baseKey: "B", displayId: "B", year: 2025 },
+  ]);
+  assert.deepEqual(unique.groups, []);
+  assert.equal(unique.rowCount, 0);
+  assert.equal(duplicateProjectIds([]).groups.length, 0);
+  assert.equal(duplicateProjectIds(undefined).groups.length, 0);
+});
+
+/* Imports add and update but never invent, so a project not yet in any workbook
+   had no way into the ledger. These pin the hand-entry path — above all that a
+   typed project is indistinguishable from an imported one afterwards, because
+   otherwise a later workbook naming it would add a second row beside it. */
+test("a hand-entered project is normalised exactly like an imported one", () => {
+  const built = buildManualProject({
+    projectId: " 26hd0023 ", year: "2026", name: "Barangay road  concreting",
+    district: "qmb north", license: "QM Buiders", engineer: "j. santos",
+    category: "road", location: "cebu", status: "on-going", contract: "12500000", swa: 0.101,
+  }, { currentYear: 2026 });
+
+  assert.equal(built.ok, true);
+  assert.equal(built.identity, "26HD0023 - 2026", "same identity a workbook row would produce");
+  /* The two spellings are kept apart exactly as they are for an imported row:
+     `rawId` is what gets shown, so it keeps the case that was typed, while
+     `baseKey` is what everything matches on and is normalised. That is what
+     makes a typed "26hd0023" and a workbook's "26HD0023" one project. */
+  assert.equal(built.record.rawId, "26hd0023", "displayed as typed, whitespace trimmed");
+  assert.equal(built.record.baseKey, "26HD0023", "matched in the canonical form");
+  /* The typed values live in `manualValues`, beside the workbook's fields and
+     never inside them, so the workbook's own value stays free to change and be
+     audited while the typed one is what the panel shows. */
+  const typed = built.record.manualValues;
+  assert.equal(typed.district, "QMB NORTH");
+  assert.equal(typed.license, "QM BUILDERS", "the same misspelling the readers repair");
+  assert.equal(typed.engineer, "J. SANTOS");
+  assert.equal(typed.status, "ONGOING", "on-going and ongoing are one status");
+  assert.equal(typed.name, "Barangay road concreting", "name keeps its case, loses double spaces");
+  assert.equal(typed.contract, 12_500_000);
+  assert.equal(typed.swa, 0.101, "stored as the fraction, as the workbook supplies it");
+  assert.equal(built.record.district, undefined,
+    "the workbook's own field is untouched, so a workbook supplying it later registers as a change");
+  assert.equal(built.record.inQmb, false);
+  assert.equal(built.record.inLicenses, false);
+  assert.equal(built.record.manualEntry, true);
+});
+
+test("Project ID and Year are required, and the year matches what an import accepts", () => {
+  const at = { currentYear: 2026 };
+  assert.match(buildManualProject({ projectId: "  ", year: "2026" }, at).error, /Project ID is required/);
+  assert.match(buildManualProject({ projectId: "A", year: "" }, at).error, /Year is required/);
+  assert.match(buildManualProject({ projectId: "A", year: "2021" }, at).error, /between 2022 and 2026/);
+  assert.match(buildManualProject({ projectId: "A", year: "2027" }, at).error, /between 2022 and 2026/);
+  assert.match(buildManualProject({ projectId: "A", year: "2026", contract: "-5" }, at).error, /cannot be negative/);
+  assert.equal(buildManualProject({ projectId: "A", year: "2022" }, at).ok, true);
+  assert.equal(buildManualProject({ projectId: "A", year: "2026" }, at).ok, true);
+});
+
+test("adding a project leaves the ledger otherwise untouched, and refuses a clash", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const built = buildManualProject({ projectId: "NEW-1", year: "2026", district: "north" }, { currentYear: 2026 });
+  const added = addProjectToStore({ dim, coll: [], legacy: new Map() }, built.record);
+
+  assert.equal(added.ok, true);
+  assert.equal(added.store.dim.size, dim.size + 1);
+  assert.equal(dim.has("NEW-1 - 2026"), false, "the store passed in is not mutated");
+  const rows = assembleProjects(added.store.coll, added.store.dim);
+  const row = rows.find((r) => r.id === "NEW-1 - 2026");
+  /* assembleProjects deliberately reports the workbook's view — the typed value
+     is carried alongside and applied by the panel at render, which is what keeps
+     the Excel audit diff comparing workbook values to workbook values. */
+  assert.equal(row.district, "UNSPECIFIED", "nothing imported has set this yet");
+  assert.equal(row.manualValues.district, "NORTH", "and the typed value travels with the row");
+  assert.equal(row.collectionAvailable, false, "no collectibles row, so no money is implied");
+  assert.equal(row.qmbOverlap, false);
+
+  const clash = buildManualProject({ projectId: "QMB-001", year: "2025" }, { currentYear: 2026 });
+  const refused = addProjectToStore({ dim, coll: [], legacy: new Map() }, clash.record);
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /already exists/);
+});
+
+test("a later workbook updates a hand-entered project rather than duplicating it", () => {
+  /* The whole reason buildManualProject reuses the readers' normalisers. */
+  const built = buildManualProject({ projectId: "qmb-new", year: "2025", district: "north" }, { currentYear: 2026 });
+  const typed = new Map([[built.identity, built.record]]);
+  const workbook2 = new Map([["QMB-NEW - 2025", {
+    identity: "QMB-NEW - 2025", baseKey: "QMB-NEW", rawId: "QMB-NEW", year: 2025,
+    inQmb: true, inLicenses: false, district: "SOUTH", contract: 9_000_000,
+  }]]);
+  const { dim, added, updated } = mergeMasterDimensions(typed, workbook2);
+
+  assert.equal(added, 0, "the workbook matched the typed project instead of adding a second row");
+  assert.equal(updated, 1);
+  assert.equal(dim.size, 1);
+  /* Matching is the point of this test; who wins each column is the next one's.
+     District was typed on the form, so it is held; contract was left blank, so
+     the workbook supplies it. */
+  assert.equal(dim.get("QMB-NEW - 2025").district, "SOUTH",
+    "the workbook's field moves freely; the typed value hides it at render, it does not freeze it");
+  assert.equal(dim.get("QMB-NEW - 2025").manualValues.district, "NORTH", "and still outranks it on screen");
+  assert.equal(dim.get("QMB-NEW - 2025").contract, 9_000_000);
+  assert.equal(dim.get("QMB-NEW - 2025").inQmb, true);
+});
+
+/* A value somebody typed outranks the workbook permanently, per project and per
+   column. A column they left blank is not protected and the workbook fills it
+   normally — that is what keeps "only two required fields" honest. */
+test("an import cannot overwrite a hand-entered column, but fills the blank ones", () => {
+  const built = buildManualProject({
+    projectId: "HAND-1", year: "2025", district: "TYPED NORTH", engineer: "J. SANTOS",
+  }, { currentYear: 2026 });
+  assert.deepEqual(built.manualFields, ["district", "engineer"],
+    "only the columns actually filled in are held");
+
+  const typed = new Map([[built.identity, built.record]]);
+  const workbook = new Map([["HAND-1 - 2025", {
+    identity: "HAND-1 - 2025", baseKey: "HAND-1", rawId: "HAND-1", year: 2025,
+    inQmb: true, inLicenses: false,
+    district: "WORKBOOK SOUTH", engineer: "SOMEBODY ELSE",
+    category: "ROAD", contract: 4_000_000,
+  }]]);
+  const { dim, keptManual } = mergeMasterDimensions(typed, workbook);
+  const row = dim.get("HAND-1 - 2025");
+
+  assert.equal(row.manualValues.district, "TYPED NORTH", "what the panel shows");
+  assert.equal(row.manualValues.engineer, "J. SANTOS");
+  assert.equal(row.district, "WORKBOOK SOUTH", "what the workbook says, kept so the change can be audited");
+  assert.equal(row.category, "ROAD", "left blank on the form, so nothing hides the workbook here");
+  assert.equal(row.contract, 4_000_000);
+  assert.equal(keptManual, 2, "reported, so the import log can say the workbook disagreed");
+  assert.deepEqual(Object.keys(row.manualValues), ["district", "engineer"], "the overlay survives the import");
+  assert.equal(row.inQmb, true, "sheet membership is still learned from the workbook");
+});
+
+test("protection is permanent across repeated imports", () => {
+  const built = buildManualProject({ projectId: "HAND-2", year: "2025", status: "SUSPENDED" }, { currentYear: 2026 });
+  const workbook = new Map([["HAND-2 - 2025", {
+    identity: "HAND-2 - 2025", baseKey: "HAND-2", rawId: "HAND-2", year: 2025, status: "ONGOING",
+  }]]);
+
+  let dim = new Map([[built.identity, built.record]]);
+  for (let pass = 0; pass < 3; pass++) dim = mergeMasterDimensions(dim, workbook).dim;
+
+  assert.equal(dim.get("HAND-2 - 2025").manualValues.status, "SUSPENDED",
+    "a third import must not wear the hand-entered value down");
+  assert.equal(dim.get("HAND-2 - 2025").status, "ONGOING", "while the workbook's own value is still tracked");
+});
+
+test("a workbook agreeing with a hand-entered value is not counted as a disagreement", () => {
+  const built = buildManualProject({ projectId: "HAND-3", year: "2025", district: "NORTH" }, { currentYear: 2026 });
+  const workbook = new Map([["HAND-3 - 2025", {
+    identity: "HAND-3 - 2025", baseKey: "HAND-3", rawId: "HAND-3", year: 2025, district: "NORTH",
+  }]]);
+  const { keptManual } = mergeMasterDimensions(new Map([[built.identity, built.record]]), workbook);
+
+  assert.equal(keptManual, 0, "nothing was overridden, so the log must not claim it was");
+});
+
+test("an ordinary imported project is unaffected by the protection rule", () => {
+  const { dim: first } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { dim: second } = readMasterWorkbook(laterBook(), { currentYear: 2026 });
+  const { dim, keptManual } = mergeMasterDimensions(first, second);
+
+  assert.equal(keptManual, 0, "no hand-entered columns exist, so nothing is held back");
+  assert.equal(dim.get("QMB-001 - 2025").district, "REVISED SOUTH", "the newer workbook still wins");
+});
+
+/* The requirement in full, in one test: a hand-created project keeps its typed
+   name on screen for ever, AND the workbook's different name is still recorded
+   in that column's audit trail as an Excel update. Both, at the same time —
+   which is only possible because the typed value overlays the workbook's field
+   rather than replacing it. */
+test("a workbook renaming a hand-created project is audited even though the typed name stays", () => {
+  const built = buildManualProject({
+    projectId: "12345", year: "2026", name: "Balao National High School", district: "NORTH",
+  }, { currentYear: 2026 });
+  const before = assembleProjects([], new Map([[built.identity, built.record]]));
+
+  const workbookSays = new Map([["12345 - 2026", {
+    identity: "12345 - 2026", baseKey: "12345", rawId: "12345", year: 2026, inQmb: true,
+    name: "BALAO NAT'L HS - PHASE 2", district: "SOUTH", contract: 8_000_000,
+  }]]);
+  const { dim, keptManual } = mergeMasterDimensions(new Map([[built.identity, built.record]]), workbookSays);
+  const after = assembleProjects([], dim);
+
+  /* What the panel will show: the typed values, unchanged. */
+  const row = after.find((r) => r.id === "12345 - 2026");
+  assert.equal(row.manualValues.name, "Balao National High School");
+  assert.equal(row.manualValues.district, "NORTH");
+  assert.equal(keptManual, 2, "the workbook disagreed on two held columns");
+
+  /* What the audit will record: the workbook's values, traceable. */
+  const changes = importedChanges(before, after);
+  const byField = Object.fromEntries(changes.map((c) => [c.field_key, c]));
+  assert.equal(byField.name.new_value, "BALAO NAT'L HS - PHASE 2",
+    "the name the workbook supplied is recorded even though it is not displayed");
+  assert.equal(byField.name.column_name, "Project name");
+  assert.equal(byField.district.new_value, "SOUTH");
+  assert.equal(byField.contract.new_value, "8000000", "a column nobody typed is simply imported");
+});
+
+test("the same Project ID in a different year is a separate project, not an update", () => {
+  /* 12345 typed for 2026; the workbook brings 12345 for 2027. Identity carries
+     the year, so the 2026 row and its typed values are untouched. */
+  const built = buildManualProject({ projectId: "12345", year: "2026", name: "Balao NHS" }, { currentYear: 2026 });
+  const nextYear = new Map([["12345 - 2027", {
+    identity: "12345 - 2027", baseKey: "12345", rawId: "12345", year: 2027, name: "BALAO NHS", inQmb: true,
+  }]]);
+  const { dim, added, updated, keptManual } = mergeMasterDimensions(new Map([[built.identity, built.record]]), nextYear);
+
+  assert.deepEqual([added, updated, keptManual], [1, 0, 0]);
+  assert.equal(dim.get("12345 - 2026").manualValues.name, "Balao NHS", "the typed year is untouched");
+  assert.equal(dim.get("12345 - 2027").manualValues, undefined, "the new year is purely imported");
+  assert.equal(duplicateProjectIds(assembleProjects([], dim)).groups.length, 1,
+    "and the admin duplicate view shows 12345 twice, which is exactly right");
+});
+
+test("the data-source label records recent changes without growing without limit", () => {
+  let label = "Imported master · 2026 PROJECT LISTINGS.xlsx";
+  label = appendDatasetNote(label, "26HD0023 - 2026 deleted");
+  label = appendDatasetNote(label, "12345 - 2026 added");
+  label = appendDatasetNote(label, "12345 - 2025 added");
+  assert.equal(label,
+    "Imported master · 2026 PROJECT LISTINGS.xlsx • 26HD0023 - 2026 deleted • 12345 - 2026 added • 12345 - 2025 added",
+    "up to three changes are spelled out");
+
+  for (let i = 0; i < 40; i++) label = appendDatasetNote(label, `EXTRA-${i} - 2026 added`);
+  const parts = label.split(" • ");
+  assert.equal(parts.length, 5, "base, one summary, three recent — however many changes have happened");
+  assert.equal(parts[0], "Imported master · 2026 PROJECT LISTINGS.xlsx", "the import it came from is never lost");
+  assert.equal(parts[1], "+40 earlier changes", "and the rest are counted rather than listed");
+  assert.equal(parts[4], "EXTRA-39 - 2026 added", "the most recent change is always shown");
+
+  /* A fresh import replaces the label outright, so the notes start again. */
+  assert.equal(appendDatasetNote("Imported master · NEW.xlsx", "A - 2026 added"),
+    "Imported master · NEW.xlsx • A - 2026 added");
 });

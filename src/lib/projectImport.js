@@ -188,15 +188,34 @@ const mergeMasterRecord = (existing, incoming, preferIncoming) => {
    reaches here it has already been through that step and carries inQmb /
    inLicenses instead of a source, so reusing it would silently clear both. */
 const refreshMasterRecord = (existing, incoming) => {
+  /* `manualValues` are hand-typed and outrank the workbook on screen, but they
+     are NOT written into the fields below and never mask them. This is the same
+     separation Status, Contract and Remarks have always had, and it is what
+     makes both halves of the requirement possible at once: the workbook's own
+     value keeps moving here, so a change to it is still a change and still
+     produces an "Excel updated" audit row, while the panel goes on showing what
+     the person typed. Freezing the typed value into the field would show the
+     right thing and destroy the workbook's history — the audit would have
+     nothing to compare and would fall silent. */
+  const handEntered = existing.manualValues || null;
   const next = { ...incoming,
     inQmb: Boolean(existing.inQmb || incoming.inQmb),
-    inLicenses: Boolean(existing.inLicenses || incoming.inLicenses) };
-  /* A blank cell is not a value. The newer workbook wins every field it
-     actually supplies, and leaves the rest as they were, so a sheet that omits
-     a column cannot wipe that column for every project it happens to list. */
-  for (const field of MASTER_FIELDS)
+    inLicenses: Boolean(existing.inLicenses || incoming.inLicenses),
+    manualEntry: Boolean(existing.manualEntry),
+    ...(handEntered ? { manualValues: handEntered } : {}) };
+
+  let kept = 0;
+  for (const field of MASTER_FIELDS) {
+    /* Counted where the workbook now disagrees with what somebody typed, so the
+       import log can say the value on screen is not the one just imported. */
+    if (handEntered && meaningful(handEntered[field]) && meaningful(incoming[field])
+        && String(incoming[field]) !== String(handEntered[field])) kept++;
+    /* A blank cell is not a value. The newer workbook wins every field it
+       actually supplies, and leaves the rest as they were, so a sheet that omits
+       a column cannot wipe that column for every project it happens to list. */
     if (!meaningful(next[field]) && meaningful(existing[field])) next[field] = existing[field];
-  return next;
+  }
+  return { record: next, kept };
 };
 
 /** Fold a freshly read workbook into the projects the ledger already holds.
@@ -214,13 +233,17 @@ const refreshMasterRecord = (existing, incoming) => {
  */
 export function mergeMasterDimensions(existing, incoming) {
   const dim = new Map(existing instanceof Map ? existing : []);
-  let added = 0, updated = 0;
+  let added = 0, updated = 0, keptManual = 0;
   for (const [identity, record] of incoming instanceof Map ? incoming : []) {
     const current = dim.get(identity);
-    if (current) { dim.set(identity, refreshMasterRecord(current, record)); updated++; }
-    else { dim.set(identity, record); added++; }
+    if (current) {
+      const { record: merged, kept } = refreshMasterRecord(current, record);
+      dim.set(identity, merged);
+      keptManual += kept;
+      updated++;
+    } else { dim.set(identity, record); added++; }
   }
-  return { dim, added, updated, retained: dim.size - added - updated };
+  return { dim, added, updated, keptManual, retained: dim.size - added - updated };
 }
 
 /* Collectibles rows are keyed the same way whether they have just been parsed
@@ -391,6 +414,10 @@ export function assembleProjects(collectionRows = [], masterDimensions = new Map
          `displayId` is the year-free spelling, and is for rendering only. */
       identity, baseKey, rawId, year, id: displayProjectId(rawId, year),
       displayId: cleanText(rawId),
+      /* Carried through, not applied here: assembleProjects must keep producing
+         the workbook's own view, because that is what the Excel audit diff
+         compares. The overlay happens at render. */
+      manualValues: dimension.manualValues || null,
       isLatestYear: latestByBase.get(baseKey) === identity,
       inQmb: Boolean(dimension.inQmb), inLicenses: Boolean(dimension.inLicenses),
       qmbOverlap: Boolean(dimension.inQmb && dimension.inLicenses),
@@ -453,6 +480,158 @@ export function removeProjectFromStore(store, identity) {
   };
 }
 
+/* The data-source label is the one-line answer to "where did what I am looking
+   at come from", shown in the header and stored on every restore point. Each
+   hand-made change appends to it, so without a limit it grows for as long as the
+   ledger is used — a paragraph in the header, and a copy of that paragraph in
+   every version row. Bounded here instead: the import it came from, a count of
+   older changes, and the most recent few spelled out. */
+const NOTE_SEPARATOR = " • ";
+const EARLIER = /^\+(\d+) earlier changes?$/;
+
+export function appendDatasetNote(label, note, keep = 3) {
+  const [base, ...existing] = String(label ?? "").split(NOTE_SEPARATOR);
+  let dropped = 0;
+  const notes = [];
+  for (const entry of existing) {
+    const summary = EARLIER.exec(entry);
+    if (summary) dropped += Number(summary[1]);
+    else notes.push(entry);
+  }
+  notes.push(note);
+  dropped += Math.max(0, notes.length - keep);
+  return [base, ...(dropped ? [`+${dropped} earlier change${dropped === 1 ? "" : "s"}`] : []), ...notes.slice(-keep)]
+    .join(NOTE_SEPARATOR);
+}
+
+/** A project typed in by hand rather than read from a workbook.
+ *
+ *  Built through the same normalisers the readers use — same uppercasing, same
+ *  licence spellings, same identity — so a typed project and an imported one are
+ *  the same kind of thing. If they were not, a later workbook naming this
+ *  project would not match it and would add a second row beside it.
+ *
+ *  `swa` is expected as the stored fraction (0.101 for 10.1%), not as the
+ *  percentage anybody types; converting is the caller's job because the panel
+ *  already owns that conversion.
+ *
+ *  Returns { ok: false, error } rather than throwing: every caller here is a
+ *  form, and a form wants the sentence to print.
+ */
+export function buildManualProject(input, { currentYear = new Date().getFullYear() } = {}) {
+  const rawId = cleanText(input?.projectId);
+  const baseKey = normalizeText(rawId);
+  if (!baseKey) return { ok: false, error: "Project ID is required." };
+
+  const numericYear = numberOrNull(input?.year);
+  const year = numericYear === null ? null : Math.round(numericYear);
+  if (!year) return { ok: false, error: "Year is required." };
+  /* The same window the readers accept. A year outside it would produce a row
+     no workbook could ever have supplied, and which a re-import would never
+     refresh — visible, unmatched and unexplained. */
+  if (year < MASTER_START_YEAR || year > currentYear) {
+    return { ok: false, error: `Year must be between ${MASTER_START_YEAR} and ${currentYear}, the range an import accepts.` };
+  }
+
+  const contract = numberOrNull(input?.contract);
+  if (contract !== null && contract < 0) return { ok: false, error: "Contract amount cannot be negative." };
+  const swa = numberOrNull(input?.swa);
+  if (swa !== null && swa < 0) return { ok: false, error: "SWA % cannot be negative." };
+
+  const typed = {
+    district: normalizeText(input?.district),
+    license: normalizeLicense(input?.license),
+    engineer: normalizeText(input?.engineer),
+    category: normalizeText(input?.category),
+    location: normalizeText(input?.location),
+    name: cleanText(input?.name),
+    status: normalizeStatus(input?.status),
+    contract, swa,
+  };
+  /* Only the columns actually filled in. A blank one is not recorded, so the
+     workbook stays free to supply it — which is what lets the form ask for two
+     required fields and mean it. */
+  const manualValues = {};
+  for (const field of MASTER_FIELDS) if (meaningful(typed[field])) manualValues[field] = typed[field];
+
+  return {
+    ok: true,
+    identity: projectIdentity(baseKey, year),
+    manualFields: Object.keys(manualValues),
+    record: {
+      identity: projectIdentity(baseKey, year), baseKey, rawId, year,
+      /* In neither workbook sheet, because it came from neither. The overlap
+         marker reads these, and claiming otherwise would tell an admin the
+         value had been reconciled against QM Licenses when nothing had. */
+      inQmb: false, inLicenses: false,
+      manualEntry: true,
+      /* Deliberately NOT copied into district/name/... on this record. Those
+         fields belong to the workbook and must stay empty until one supplies
+         them, so that when one does it registers as a change and is audited.
+         What the user typed lives here and is applied over the top at render,
+         exactly as project_manual_updates values are. */
+      ...(Object.keys(manualValues).length ? { manualValues } : {}),
+    },
+  };
+}
+
+/** Puts a hand-entered project into the imported dataset.
+ *
+ *  Refuses an identity that already exists rather than overwriting it: the ID
+ *  and year together are what every target, audit row and manual value is filed
+ *  under, so replacing one silently would re-point all of it at values nobody
+ *  reconciled.
+ */
+export function addProjectToStore(store, record) {
+  const dim = new Map(store?.dim instanceof Map ? store.dim : []);
+  if (dim.has(record.identity)) {
+    return { ok: false, error: `${displayProjectId(record.rawId, record.year)} already exists in the ledger. Edit it instead, or delete it first.` };
+  }
+  dim.set(record.identity, record);
+  return { ok: true, store: { ...store, dim } };
+}
+
+/** Project IDs that appear on more than one row.
+ *
+ *  The ID column shows the year-free spelling, so a project running in 2022 and
+ *  again in 2025 renders the same text twice and looks like a duplicate — and a
+ *  genuinely mistyped ID looks exactly the same. Only the years tell them
+ *  apart, which is why each group carries them.
+ *
+ *  Grouped on `baseKey`, the normalised form, so IDs differing only by case or
+ *  by an apostrophe are still recognised as the same ID. That is the whole
+ *  point: those are the duplicates nobody spots by eye.
+ */
+export function duplicateProjectIds(rows) {
+  const byBase = new Map();
+  for (const row of rows || []) {
+    const key = row?.baseKey || normalizeText(row?.displayId || row?.id);
+    if (!key) continue;
+    if (!byBase.has(key)) byBase.set(key, []);
+    byBase.get(key).push(row);
+  }
+
+  const groups = [];
+  const identities = new Set();
+  for (const [baseKey, list] of byBase) {
+    if (list.length < 2) continue;
+    for (const row of list) identities.add(row.identity);
+    groups.push({
+      baseKey,
+      displayId: list[0].displayId || list[0].id || baseKey,
+      count: list.length,
+      years: list.map((row) => row.year).sort((a, b) => (a || 0) - (b || 0)),
+      /* Same ID, same year, twice over cannot come from the workbook readers —
+         they key on ID and year — so it means two spellings normalised to one.
+         Worth separating: it is the case that is always wrong. */
+      repeatedYear: new Set(list.map((row) => row.year)).size !== list.length,
+      identities: list.map((row) => row.identity),
+    });
+  }
+  groups.sort((a, b) => b.count - a.count || a.displayId.localeCompare(b.displayId));
+  return { groups, identities, rowCount: identities.size };
+}
+
 export function extendLegacyAssignments(existing, rows) {
   const next = new Map(existing instanceof Map ? existing : []);
   for (const row of rows || [])
@@ -470,6 +649,11 @@ export function resolvedEntry(map, row, legacyAssignments) {
 }
 
 export const IMPORT_AUDIT_FIELDS = [
+  /* Project name is audited because a workbook renaming a project is exactly
+     the change somebody needs to find later, and on a hand-created project the
+     typed name stays on screen — so this row is the only trace that the
+     workbook ever said anything different. */
+  ["name", "Project name"],
   ["district", "District"], ["license", "License"], ["engineer", "Senior engineer"],
   ["category", "Category"], ["location", "Location"], ["status", "Status"],
   ["contract", "Contract"], ["swa", "SWA %"], ["office", "Implementing office"],
