@@ -678,18 +678,18 @@ const EXPORT_TARGET_COLS = [
 
 /* the table hides the long project name; the export still carries it */
 const EXPORT_COLS = [
-  /* Deliberately the full `id`, year and all, where the screen shows the short
-     one. The CSV is what the team reconciles against other records, and two
-     rows reading "QMB-014" with no way to tell 2024 from 2025 would be worse
-     than a slightly longer column. */
-  { k: "id", label: "ID" },
+  /* ID and Year as two columns, matching the table. This used to be one column
+     holding "QMB-014 - 2025", because without a Year column that was the only
+     way to tell 2024 from 2025 — the reason no longer holds now that Year is
+     here, and a year glued into an ID is a spreadsheet's problem: it cannot be
+     grouped, filtered or compared against a records system that keeps them
+     apart. The two columns together carry exactly the information the single
+     one did. */
+  { k: "displayId", label: "ID" },
+  { k: "yearStr", label: "Year" },
   { k: "name", label: "Project name" },
-  /* `yearStr` is excluded, not overlooked. This list is built from the screen's
-     columns, so adding one to the table would otherwise shift every column after
-     it in a file the team reconciles against other records — and the year is
-     already in the `id` above, so the CSV loses nothing by leaving it out. Drop
-     the `yearStr` test to add a separate Year column, knowing it moves
-     everything to its right. */
+  /* yearStr again would duplicate the column just placed above; `note` is moved
+     to the end instead of appearing mid-row. */
   ...COLS.slice(1).filter((c) => !c.targets && c.k !== "note" && c.k !== "yearStr"),
   { k: "targetCount", label: "Targets" },
   ...EXPORT_TARGET_COLS,
