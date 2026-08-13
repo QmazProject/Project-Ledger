@@ -6,6 +6,7 @@ import {
   MASTER_START_YEAR, readMasterWorkbook, readCollectiblesWorkbook, assembleProjects,
   extendLegacyAssignments, resolvedEntry, importedChanges,
   IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
+  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore,
 } from "./projectImport.js";
 
 const workbook = (sheets) => {
@@ -218,4 +219,162 @@ test("a recognised tab with no PROJECT ID column says so instead of reporting ze
   assert.ok(log.some((line) => line.warn && line.text.includes("No QM LICENSES sheet tab")), "the absent half is reported too");
   assert.equal(collectibles.rows, null);
   assert.ok(collectibles.log[0].warn && collectibles.log[0].text.includes("no PROJECT ID column"));
+});
+
+/* An upload used to replace the master map outright, so a workbook covering
+   one year deleted every project the previous workbook had supplied - silently,
+   because a row that stops existing produces no audit entry. These pin the
+   fold-in behaviour that replaced it. */
+const laterBook = () => workbook({
+  "QMB PROJECTS": [
+    ["Project ID", "Year", "District", "License", "Senior Engineer", "Category", "Location", "Contract Amount"],
+    ["QMB-001", 2025, "REVISED SOUTH", "QMB", "", "Bridge", "Davao", 21_000_000],
+    ["BRAND-NEW", 2026, "NORTH", "QMB", "New Engineer", "Road", "Cebu", 7_000_000],
+  ],
+});
+
+test("a later upload adds and updates without removing what it does not list", () => {
+  const { dim: first } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { dim: second } = readMasterWorkbook(laterBook(), { currentYear: 2026 });
+  const { dim, added, updated, retained } = mergeMasterDimensions(first, second);
+
+  assert.equal(added, 1, "BRAND-NEW - 2026");
+  assert.equal(updated, 1, "QMB-001 - 2025 appears in both");
+  assert.equal(retained, first.size - 1, "everything else the new workbook never mentioned");
+
+  assert.equal(dim.has("QMB-ONLY - 2024"), true, "absent from the new workbook, still in the ledger");
+  assert.equal(dim.has("LIC-ONLY - 2023"), true);
+  assert.equal(dim.has("QMB-001 - 2022"), true, "an earlier year of an updated project survives too");
+  assert.equal(dim.get("QMB-ONLY - 2024").district, "WEST", "and keeps its values untouched");
+  assert.equal(dim.has("BRAND-NEW - 2026"), true);
+});
+
+test("the newer workbook wins every field it supplies, and blanks overwrite nothing", () => {
+  const { dim: first } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { dim: second } = readMasterWorkbook(laterBook(), { currentYear: 2026 });
+  const { dim } = mergeMasterDimensions(first, second);
+  const updatedRow = dim.get("QMB-001 - 2025");
+
+  assert.equal(updatedRow.district, "REVISED SOUTH", "the new value replaces the old one");
+  assert.equal(updatedRow.contract, 21_000_000);
+  assert.equal(updatedRow.engineer, "LICENSE ENGINEER",
+    "the new sheet left Senior Engineer blank, so the known value stands rather than being erased");
+  assert.equal(updatedRow.inLicenses, true,
+    "sheet membership learned from the first upload is not forgotten by the second");
+});
+
+test("merging is repeatable and order-independent for disjoint uploads", () => {
+  const { dim: first } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { dim: second } = readMasterWorkbook(laterBook(), { currentYear: 2026 });
+
+  const once = mergeMasterDimensions(first, second);
+  const twice = mergeMasterDimensions(once.dim, second);
+  assert.equal(twice.added, 0, "re-uploading the same workbook adds nothing");
+  assert.equal(twice.dim.size, once.dim.size, "and removes nothing");
+
+  assert.equal(mergeMasterDimensions(new Map(), second).dim.size, 2,
+    "an empty ledger takes the whole workbook");
+});
+
+test("collectibles rows fold in the same way, replacing a matched row whole", () => {
+  const before = [
+    { sourceKey: "QMB-001 - 2025", baseKey: "QMB-001", id: "QMB-001", year: 2025, net: 5_000_000, gross: 9_000_000 },
+    { sourceKey: "OLD-ONE - 2024", baseKey: "OLD-ONE", id: "OLD-ONE", year: 2024, net: 1_000_000 },
+  ];
+  const incoming = [
+    { sourceKey: "QMB-001 - 2025", baseKey: "QMB-001", id: "QMB-001", year: 2025, net: 6_500_000 },
+    { sourceKey: "NEW-ONE - 2026", baseKey: "NEW-ONE", id: "NEW-ONE", year: 2026, net: 2_000_000 },
+  ];
+  const { rows, added, updated, retained } = mergeCollectionRows(before, incoming);
+
+  assert.deepEqual([added, updated, retained], [1, 1, 1]);
+  const matched = rows.find((row) => row.sourceKey === "QMB-001 - 2025");
+  assert.equal(matched.net, 6_500_000);
+  assert.equal(matched.gross, undefined,
+    "replaced whole: a new net beside a retained old gross was never true on any date");
+  assert.equal(rows.find((row) => row.sourceKey === "OLD-ONE - 2024").net, 1_000_000, "kept");
+  assert.equal(rows.length, 3);
+});
+
+test("a retained project produces no audit entry, and an updated one does", () => {
+  const { dim: first } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { dim: second } = readMasterWorkbook(laterBook(), { currentYear: 2026 });
+  const before = assembleProjects([], first);
+  const after = assembleProjects([], mergeMasterDimensions(first, second).dim);
+  const changes = importedChanges(before, after);
+
+  assert.equal(changes.some((c) => c.project_id === "QMB-ONLY - 2024"), false,
+    "a project nobody touched records nothing");
+  /* Every field the later workbook supplied, and no others. Note what this
+     says about precedence: QM LICENSES outranks QMB PROJECTS *within one
+     upload*, but a later upload outranks an earlier one, so these values came
+     from a QMB PROJECTS sheet and still replaced ones read from QM LICENSES.
+     Engineer and status are absent because the later sheet left them blank. */
+  assert.deepEqual(
+    changes.filter((c) => c.project_id === "QMB-001 - 2025").map((c) => c.field_key).sort(),
+    ["category", "contract", "district", "license", "location"],
+    "only the fields the new workbook actually supplied a value for",
+  );
+  assert.equal(changes.some((c) => c.project_id === "QMB-001 - 2025" && c.field_key === "engineer"), false,
+    "a blank cell changed nothing, so it is not recorded as a change");
+});
+
+/* Imports no longer remove anything, so a Project ID that was wrong in the
+   workbook can only leave through removeProjectFromStore. These pin what it
+   takes with it and, more importantly, what it leaves alone. */
+test("removing a project drops its master entry and nothing else", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { store, removedMaster } = removeProjectFromStore({ dim, coll: [], legacy: new Map() }, "QMB-ONLY - 2024");
+
+  assert.equal(removedMaster, true);
+  assert.equal(store.dim.has("QMB-ONLY - 2024"), false);
+  assert.equal(store.dim.size, dim.size - 1);
+  assert.equal(dim.has("QMB-ONLY - 2024"), true, "the store passed in is not mutated");
+  assert.deepEqual(
+    assembleProjects([], store.dim).map((row) => row.id),
+    ["LIC-ONLY - 2023", "QMB-001 - 2022", "QMB-001 - 2025"],
+  );
+});
+
+test("a yearless Collectibles row goes with the project it attached to", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  /* No year, so assembleProjects attaches it to QMB-001's newest year, 2025.
+     Matching on the row's own key would leave it behind, and the project would
+     come straight back as a collection-only row. */
+  const coll = [
+    { key: "QMB-001", baseKey: "QMB-001", id: "QMB-001", year: null, net: 12_000_000 },
+    { sourceKey: "LIC-ONLY - 2023", baseKey: "LIC-ONLY", id: "LIC-ONLY", year: 2023, net: 3_000_000 },
+  ];
+  assert.equal(assembleProjects(coll, dim).find((r) => r.id === "QMB-001 - 2025").net, 12_000_000,
+    "it really did attach to 2025");
+
+  const { store, removedCollections } = removeProjectFromStore({ dim, coll, legacy: new Map() }, "QMB-001 - 2025");
+
+  assert.equal(removedCollections, 1);
+  assert.equal(store.coll.length, 1);
+  assert.equal(store.coll[0].baseKey, "LIC-ONLY", "the other project's money is untouched");
+  const rows = assembleProjects(store.coll, store.dim);
+  assert.equal(rows.some((row) => row.id === "QMB-001 - 2025"), false, "and it does not return as a collection-only row");
+  assert.equal(rows.some((row) => row.id === "QMB-001 - 2022"), true, "the project's other year survives");
+});
+
+test("removing a project clears a legacy assignment pointing at it", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const legacy = new Map([["QMB-001", "QMB-001 - 2025"], ["LIC-ONLY", "LIC-ONLY - 2023"]]);
+  const { store } = removeProjectFromStore({ dim, coll: [], legacy }, "QMB-001 - 2025");
+
+  assert.equal(store.legacy.has("QMB-001"), false,
+    "a stale assignment would re-adopt the old history if the ID were imported again");
+  assert.equal(store.legacy.get("LIC-ONLY"), "LIC-ONLY - 2023", "other assignments stand");
+});
+
+test("removing a project that is not there changes nothing and does not throw", () => {
+  const { dim } = readMasterWorkbook(masterBook(), { currentYear: 2026 });
+  const { store, removedMaster, removedCollections } = removeProjectFromStore(
+    { dim, coll: [], legacy: new Map() }, "NOT-A-PROJECT - 2099");
+
+  assert.equal(removedMaster, false);
+  assert.equal(removedCollections, 0);
+  assert.equal(store.dim.size, dim.size);
+  assert.equal(removeProjectFromStore(undefined, "X - 2025").store.dim.size, 0, "an absent store is not a crash");
 });

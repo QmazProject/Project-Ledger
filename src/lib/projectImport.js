@@ -170,15 +170,82 @@ function readMasterSheet(workbook, sheetName, source, currentYear) {
   return { records, missingId: false, skippedYear };
 }
 
+const MASTER_FIELDS = ["district", "license", "engineer", "category", "location", "name", "status", "contract", "swa"];
+
 const mergeMasterRecord = (existing, incoming, preferIncoming) => {
   const next = { ...(existing || {}), identity: incoming.identity, baseKey: incoming.baseKey,
     year: incoming.year, rawId: preferIncoming || !existing?.rawId ? incoming.rawId : existing.rawId,
     inQmb: Boolean(existing?.inQmb || incoming.source === "qmb_projects"),
     inLicenses: Boolean(existing?.inLicenses || incoming.source === "qm_licenses") };
-  for (const field of ["district", "license", "engineer", "category", "location", "name", "status", "contract", "swa"])
+  for (const field of MASTER_FIELDS)
     if (meaningful(incoming[field]) && (preferIncoming || !meaningful(next[field]))) next[field] = incoming[field];
   return next;
 };
+
+/* One project-year already in the ledger, refreshed from a newer workbook.
+   Distinct from mergeMasterRecord above, which combines the two sheets of a
+   single workbook and reads `source` off a raw row: by the time a record
+   reaches here it has already been through that step and carries inQmb /
+   inLicenses instead of a source, so reusing it would silently clear both. */
+const refreshMasterRecord = (existing, incoming) => {
+  const next = { ...incoming,
+    inQmb: Boolean(existing.inQmb || incoming.inQmb),
+    inLicenses: Boolean(existing.inLicenses || incoming.inLicenses) };
+  /* A blank cell is not a value. The newer workbook wins every field it
+     actually supplies, and leaves the rest as they were, so a sheet that omits
+     a column cannot wipe that column for every project it happens to list. */
+  for (const field of MASTER_FIELDS)
+    if (!meaningful(next[field]) && meaningful(existing[field])) next[field] = existing[field];
+  return next;
+};
+
+/** Fold a freshly read workbook into the projects the ledger already holds.
+ *
+ *  An import used to replace the master map outright. That made every upload a
+ *  reset: a workbook listing only the current year removed every project the
+ *  previous workbook had supplied, and removed them silently, because a row
+ *  that ceases to exist has not "changed" and so produces no audit entry. An
+ *  upload is an update, not a replacement. What the new workbook names is
+ *  refreshed; what it does not name is left exactly as it was.
+ *
+ *  Consequence, stated because it is the price of the above: a project can no
+ *  longer be removed by uploading a workbook without it. Restoring an earlier
+ *  dataset from "Previous data" still replaces wholesale and is the way back.
+ */
+export function mergeMasterDimensions(existing, incoming) {
+  const dim = new Map(existing instanceof Map ? existing : []);
+  let added = 0, updated = 0;
+  for (const [identity, record] of incoming instanceof Map ? incoming : []) {
+    const current = dim.get(identity);
+    if (current) { dim.set(identity, refreshMasterRecord(current, record)); updated++; }
+    else { dim.set(identity, record); added++; }
+  }
+  return { dim, added, updated, retained: dim.size - added - updated };
+}
+
+/* Collectibles rows are keyed the same way whether they have just been parsed
+   or have come back out of the saved dataset, which stores them verbatim. */
+const collectionKey = (row) => row?.sourceKey
+  || projectIdentity(row?.baseKey || row?.key || row?.id, row?.year);
+
+/** The same fold for the money side.
+ *
+ *  Replaces a matched row whole rather than field by field, deliberately: a
+ *  Collectibles row is one coherent statement of a project's position, and a
+ *  new gross beside a retained old net would be a figure that was never true on
+ *  any date. Projects the new sheet does not mention keep their last statement.
+ */
+export function mergeCollectionRows(existing, incoming) {
+  const rows = new Map();
+  for (const row of existing || []) rows.set(collectionKey(row), row);
+  let added = 0, updated = 0;
+  for (const row of incoming || []) {
+    const key = collectionKey(row);
+    if (rows.has(key)) updated++; else added++;
+    rows.set(key, row);
+  }
+  return { rows: [...rows.values()], added, updated, retained: rows.size - added - updated };
+}
 
 export function readMasterWorkbook(workbook, { currentYear = new Date().getFullYear() } = {}) {
   const dim = new Map();
@@ -269,21 +336,39 @@ const normalizedMaster = (dim) => {
   return normalized;
 };
 
-export function assembleProjects(collectionRows = [], masterDimensions = new Map()) {
-  const master = normalizedMaster(masterDimensions);
+/* Master records grouped by base ID, newest year first. Extracted so that the
+   rule deciding which project a yearless Collectibles row belongs to is written
+   once: removing a project has to drop exactly the rows assembling it would
+   have attached, and a second copy of this arithmetic would eventually disagree
+   with the first. */
+const indexMasterByBase = (master) => {
   const byBase = new Map();
   for (const value of master.values()) {
     if (!byBase.has(value.baseKey)) byBase.set(value.baseKey, []);
     byBase.get(value.baseKey).push(value);
   }
   for (const list of byBase.values()) list.sort((a, b) => (b.year || 0) - (a.year || 0));
+  return byBase;
+};
+
+/* A Collectibles row carrying a year names its project outright. One without a
+   year attaches to that base ID's newest master year, which is why this needs
+   the master index and not just the row. */
+const assignedCollectionIdentity = (row, byBase) => {
+  const baseKey = row.baseKey || row.key || normalizeText(row.id);
+  const candidates = byBase.get(baseKey) || [];
+  return row.year ? projectIdentity(baseKey, row.year)
+    : candidates[0]?.identity || projectIdentity(baseKey, null);
+};
+
+export function assembleProjects(collectionRows = [], masterDimensions = new Map()) {
+  const master = normalizedMaster(masterDimensions);
+  const byBase = indexMasterByBase(master);
 
   const collections = new Map();
   for (const row of collectionRows || []) {
+    const identity = assignedCollectionIdentity(row, byBase);
     const baseKey = row.baseKey || row.key || normalizeText(row.id);
-    const candidates = byBase.get(baseKey) || [];
-    const identity = row.year ? projectIdentity(baseKey, row.year)
-      : candidates[0]?.identity || projectIdentity(baseKey, null);
     if (!collections.has(identity)) collections.set(identity, { ...row, baseKey, assignedIdentity: identity });
   }
 
@@ -330,6 +415,42 @@ export function assembleProjects(collectionRows = [], masterDimensions = new Map
       row.location, row.status, row.office, row.remarks].join(" ").toLowerCase();
     return row;
   }).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/** Remove one project from the imported dataset.
+ *
+ *  The counterpart to an additive import. Because imports no longer remove
+ *  anything, a Project ID that was wrong in the workbook can only leave the
+ *  ledger through here — the workbook can be corrected, but correcting it can
+ *  no longer take the bad row with it.
+ *
+ *  Drops the master entry, every Collectibles row that assembles onto it, and
+ *  any legacy assignment pointing at it. The Collectibles rows are matched by
+ *  the identity `assembleProjects` would give them rather than by their own
+ *  key, so a yearless row attached to this project goes with it instead of
+ *  being left behind to resurrect the project as a collection-only row.
+ *
+ *  Pure: returns a new store and does not touch the one passed in.
+ */
+export function removeProjectFromStore(store, identity) {
+  const master = normalizedMaster(store?.dim instanceof Map ? store.dim : new Map());
+  const byBase = indexMasterByBase(master);
+
+  const dim = new Map(store?.dim instanceof Map ? store.dim : []);
+  const removedMaster = dim.delete(identity);
+
+  const before = Array.isArray(store?.coll) ? store.coll : [];
+  const coll = before.filter((row) => assignedCollectionIdentity(row, byBase) !== identity);
+
+  const legacy = new Map();
+  for (const [baseKey, assigned] of store?.legacy instanceof Map ? store.legacy : [])
+    if (assigned !== identity) legacy.set(baseKey, assigned);
+
+  return {
+    store: { ...store, dim, coll, legacy },
+    removedMaster,
+    removedCollections: before.length - coll.length,
+  };
 }
 
 export function extendLegacyAssignments(existing, rows) {

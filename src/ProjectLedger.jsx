@@ -15,6 +15,7 @@ import {
   cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook,
   assembleProjects, extendLegacyAssignments, resolvedEntry, importedChanges,
   IMPORT_AUDIT_FIELDS, IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
+  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore,
 } from "./lib/projectImport";
 
 /* ==================================================================
@@ -360,6 +361,19 @@ async function deleteAuditEntries(auditIds, reason) {
   return callTargetRpc("admin_delete_audit_entries", {
     p_audit_ids: auditIds, p_reason: reason,
   });
+}
+
+/* Every ID spelling the project's rows were filed under, resolved here rather
+   than in SQL: a project imported before the year joined the ID has its manual
+   values, audit and targets under the bare "QMB-001" while everything since is
+   under "QMB-001 - 2025". Only the panel knows which of those belong to this
+   row, and guessing in the database would delete another year's history. */
+async function deleteProjectRecords(projectIds, reason) {
+  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
+  const rows = await callTargetRpc("admin_delete_project", {
+    p_project_ids: projectIds, p_reason: reason,
+  });
+  return (Array.isArray(rows) ? rows[0] : rows) || {};
 }
 
 /* Shared by both deletion paths so the wording of the warning cannot drift
@@ -708,8 +722,9 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
               updated collectibles workbook (read from <b>Collectibles</b>). Drop either one on its own or both
               together — the filename does not matter because each file is identified by its sheet names. Master
               projects from 2022 onward are consolidated by Project ID and Year, with QM Licenses preferred and
-              master-only projects kept visible. Hand-typed status, contract, remarks and targets are retained;
-              only Excel fields that really changed receive an <b>Excel updated</b> audit entry.
+              master-only projects kept visible. An upload <b>adds and updates</b>: projects already in the ledger
+              that the new workbook does not list are kept, not removed. Hand-typed status, contract, remarks and
+              targets are retained; only Excel fields that really changed receive an <b>Excel updated</b> audit entry.
             </p>
             {/* stated before the upload, not only after one is rejected */}
             <p className="mx-auto mt-1.5 max-w-xl text-[11px]" style={{ color: T.inkFaint }}>
@@ -1260,6 +1275,177 @@ function AuditModal({ target, onClose, isAdmin }) {
 }
 
 
+/* The words assembleProjects substitutes for an absent value. Listing them as
+   data that will be destroyed would promise the administrator something real
+   was there. */
+const DELETE_PLACEHOLDERS = new Set(["UNSPECIFIED", "UNASSIGNED", "NONE"]);
+
+/* The confirmation for the only action in the panel that destroys a project.
+   A window.confirm cannot do this job: the thing an administrator needs to
+   weigh is what *this* project is carrying — how much history, whose typed
+   values, how many targets — and a fixed sentence cannot say. So the counts are
+   read from the database before the button is live, and the fields are listed
+   by name. Nothing here is an estimate; the audit query matches the same rows
+   the delete will match. */
+function DeleteProjectModal({ project, onCancel, onConfirm, busy }) {
+  const [reason, setReason] = useState("");
+  const [audit, setAudit] = useState({ loading: true, error: "", rows: 0, columns: [] });
+
+  /* Keyed on the ids themselves rather than on `project`, which is a fresh
+     object on every render of the page behind this dialog: depending on the
+     object would re-run the count continuously while it sits open. */
+  const auditIdKey = (project.auditIds || [project.id]).join("|");
+  const targetIdKey = (project.targets || []).map((t) => t.id).join("|");
+
+  useEffect(() => {
+    let alive = true;
+    const targetIds = (project.targets || []).map((t) => t.id).filter(Boolean);
+    /* Two queries rather than one .or(): the project IDs contain spaces and
+       hyphens, which PostgREST's in.() list cannot carry unquoted inside or().
+       Merged on row id so a row matched by both is counted once — the same
+       thing the delete's `project_id = any(...) or target_id = any(...)` does. */
+    const byProject = supabase.from("project_manual_update_audit")
+      .select("id, column_name").in("project_id", project.auditIds?.length ? project.auditIds : [project.id]);
+    const byTarget = targetIds.length
+      ? supabase.from("project_manual_update_audit").select("id, column_name").in("target_id", targetIds)
+      : Promise.resolve({ data: [], error: null });
+
+    Promise.all([byProject, byTarget]).then(([a, b]) => {
+      if (!alive) return;
+      const failure = a.error || b.error;
+      if (failure) { setAudit({ loading: false, error: failure.message, rows: 0, columns: [] }); return; }
+      const merged = new Map();
+      for (const row of [...(a.data || []), ...(b.data || [])]) merged.set(row.id, row.column_name);
+      setAudit({ loading: false, error: "", rows: merged.size,
+                 columns: [...new Set(merged.values())].sort() });
+    });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auditIdKey, targetIdKey]);
+
+  const imported = IMPORT_AUDIT_FIELDS
+    .filter(([key]) => project[key] !== null && project[key] !== undefined && project[key] !== ""
+      && !DELETE_PLACEHOLDERS.has(project[key]));
+  const liveTargets = (project.targets || []).filter((t) => !isArchived(t)).length;
+  const archivedTargets = (project.targets || []).length - liveTargets;
+  /* Counts still loading, or a failed count, must not be confirmable: an
+     administrator agreeing to destroy "an unknown amount of history" has not
+     been told anything. */
+  const ready = !audit.loading && !audit.error && reason.trim().length > 0 && !busy;
+
+  const section = { marginTop: 12 };
+  const heading = { fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+                    letterSpacing: ".06em", color: T.inkSoft, marginBottom: 4 };
+
+  return (
+    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}
+         style={{ position: "fixed", inset: 0, zIndex: 30, background: "rgba(22,33,28,.45)",
+                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="delete-project-title"
+           style={{ width: "min(620px, 100%)", maxHeight: "85vh", overflow: "auto", background: T.panel,
+                    border: `2px solid ${T.bad}`, borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.3)" }}>
+        <div style={{ padding: "12px 16px", background: "#FBEEEC", borderBottom: `1px solid ${T.bad}55` }}>
+          <h2 id="delete-project-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 800,
+                                                 textTransform: "uppercase", color: T.bad }}>
+            Permanently delete {project.id}
+          </h2>
+          <div style={{ marginTop: 4, fontSize: 12, color: T.ink, lineHeight: 1.45 }}>
+            This cannot be undone from the panel. Everything listed below is destroyed, not archived and not
+            hidden. Restoring it afterwards takes a database administrator and both halves of the recovery:
+            <b> Previous data</b> for the imported values, and the purge log for the rest.
+          </div>
+        </div>
+
+        <div style={{ padding: 16, fontSize: 12 }}>
+          {project.name && <div style={{ color: T.inkSoft, marginBottom: 8 }}>{project.name}</div>}
+
+          <div style={section}>
+            <div style={heading}>Imported values that will be deleted ({imported.length})</div>
+            {imported.length === 0
+              ? <div style={{ color: T.inkFaint }}>None recorded.</div>
+              : (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <tbody>{imported.map(([key, label]) => (
+                    <tr key={key}>
+                      <td style={{ padding: "3px 7px 3px 0", color: T.inkSoft, width: "45%" }}>{label}</td>
+                      <td style={{ padding: "3px 0", fontFamily: MONO, fontSize: 11 }}>{auditValue(key, project[key])}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              )}
+          </div>
+
+          <div style={section}>
+            <div style={heading}>Targets</div>
+            {project.targetsUnavailable
+              ? <div style={{ color: T.bad }}>Could not be loaded, so it is not known how many would be deleted.</div>
+              : (project.targets || []).length === 0
+                ? <div style={{ color: T.inkFaint }}>None.</div>
+                : (
+                  <div>
+                    {liveTargets} live{archivedTargets ? `, ${archivedTargets} archived` : ""} — every one is deleted,
+                    with its own history
+                    <ul style={{ margin: "4px 0 0 16px", color: T.inkSoft }}>
+                      {(project.targets || []).map((t) => (
+                        <li key={t.id}>{t.scope || "(no Balance Work)"}{isArchived(t) ? " · archived" : ""}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+          </div>
+
+          <div style={section}>
+            <div style={heading}>Audit history</div>
+            {audit.loading && <div style={{ color: T.inkFaint }}>Counting entries…</div>}
+            {audit.error && <div style={{ color: T.bad }}>Could not count the audit history ({audit.error}). Nothing can be deleted until this is known.</div>}
+            {!audit.loading && !audit.error && (
+              audit.rows === 0
+                ? <div style={{ color: T.inkFaint }}>No recorded changes.</div>
+                : <div>
+                    <b>{audit.rows}</b> entr{audit.rows === 1 ? "y" : "ies"} across: {audit.columns.join(", ")}
+                    <div style={{ color: T.inkFaint, marginTop: 2 }}>
+                      Both Excel-updated and Manual-edit records, for the project and for its targets.
+                    </div>
+                  </div>
+            )}
+          </div>
+
+          <div style={section}>
+            <div style={heading}>Hand-typed values</div>
+            {project.manualFields?.length
+              ? <div>{project.manualFields.map((f) => AUDIT_DISPLAY_LABELS[f] || f).join(", ")} — typed in the panel and not recoverable from any workbook.</div>
+              : <div style={{ color: T.inkFaint }}>None.</div>}
+          </div>
+
+          <div style={{ ...section, paddingTop: 12, borderTop: `1px solid ${T.ruleSoft}` }}>
+            <label htmlFor="delete-reason" style={heading}>Reason (required, stored in the purge log)</label>
+            <input id="delete-reason" value={reason} autoFocus disabled={busy}
+                   onChange={(e) => setReason(e.target.value)}
+                   placeholder="e.g. wrong Project ID typed into the 2026 workbook"
+                   style={{ width: "100%", border: `1px solid ${T.rule}`, borderRadius: 2, padding: "5px 7px",
+                            fontFamily: BODY, fontSize: 12, background: busy ? T.paper2 : T.panel }} />
+          </div>
+
+          <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button type="button" onClick={onCancel} disabled={busy}
+                    style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
+                             borderRadius: 2, padding: "5px 12px", fontSize: 12, cursor: busy ? "default" : "pointer" }}>
+              Cancel
+            </button>
+            <button type="button" disabled={!ready} onClick={() => onConfirm(reason.trim())}
+                    title={audit.loading ? "Waiting for the audit count" : !reason.trim() ? "A reason is required" : ""}
+                    style={{ border: `1px solid ${T.bad}`, background: ready ? T.bad : T.paper2,
+                             color: ready ? T.panel : T.inkFaint, borderRadius: 2, padding: "5px 12px",
+                             fontSize: 12, fontWeight: 600, cursor: ready ? "pointer" : "default" }}>
+              {busy ? "Deleting…" : "Delete permanently"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* The one cell that stands in for the six target columns. It has to read at a
    glance, so it leads with the count and names only the worst standing — that
    is the part that decides whether somebody needs to open it. */
@@ -1355,7 +1541,8 @@ function SaveCell({ id, unsaved, saving, onSave }) {
 }
 
 function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell,
-                      onManageTargets, multipleTargetsEnabled, isAdmin, dirtyIds, dirtyCount, savingIds }) {
+                      onManageTargets, multipleTargetsEnabled, isAdmin, dirtyIds, dirtyCount, savingIds,
+                      onDeleteProject }) {
   const [showCollection, setShowCollection] = useState(false);
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
@@ -1495,6 +1682,21 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                       cursor: auditProps.onContextMenu ? "help" : undefined }}>{v}
                       {c.stick && isAdmin && r.qmbOverlap && <span aria-label="Also exists in QMB Projects" title="Also exists in QMB PROJECTS; QM LICENSES values are used"
                         style={{ marginLeft: 5, color: T.works, fontWeight: 800 }}>ⓘ</span>}
+                      {/* An import can no longer remove a project, so this is
+                          the only way a wrong Project ID leaves the ledger.
+                          Administrators only, and on the ID cell because what
+                          it deletes is the whole project, not a field of it. */}
+                      {c.stick && isAdmin && onDeleteProject && (
+                        <button type="button" onClick={(e) => { e.stopPropagation(); onDeleteProject(r); }}
+                                title={`Delete ${r.id} and everything recorded against it`}
+                                aria-label={`Delete project ${r.id} and everything recorded against it`}
+                                style={{ float: "right", border: "none", background: "none", color: T.inkFaint,
+                                         padding: "0 1px", fontSize: 11, lineHeight: 1, cursor: "pointer" }}
+                                onMouseEnter={(e) => { e.currentTarget.style.color = T.bad; }}
+                                onMouseLeave={(e) => { e.currentTarget.style.color = T.inkFaint; }}>
+                          ×
+                        </button>
+                      )}
                     </td>;
                   })}
                   <SaveCell id={r.id} unsaved={dirtyIds.has(r.id)} saving={savingIds.has(r.id)} onSave={onSaveRow} />
@@ -2730,6 +2932,7 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [forcePasswordChange, setForcePasswordChange] = useState(false);
   const [adminOpen, setAdminOpen] = useState(false);
   const [auditTarget, setAuditTarget] = useState(null);
+  const [deletingProject, setDeletingProject] = useState(null);
 
   useEffect(() => {
     let alive = true;
@@ -2896,6 +3099,52 @@ export default function ProjectLedger({ user, onSignOut }) {
     }
   };
 
+  /* The one action that removes a project. Imports are additive now, so a
+     Project ID that was wrong in the workbook cannot be got rid of by fixing
+     the workbook; this is the way out, and it is administrator-only.
+
+     Two halves, in this order. The database rows go first, through one RPC that
+     is one transaction and logs everything it destroys. Only if that succeeds is
+     the imported row removed from the dataset payload and saved — the reverse
+     order would risk a saved dataset with no project beside targets and history
+     that still point at it, which reads as corruption rather than as a failed
+     delete. Failing between the two leaves the DB rows gone and the imported row
+     present, which the message says plainly so it can be retried. */
+  const deleteProject = async (row, reason) => {
+    setBusy(true);
+    setSaveMessage("");
+    try {
+      const result = await deleteProjectRecords(row.auditIds?.length ? row.auditIds : [row.id], reason);
+
+      const { store: nextStore, removedCollections } = removeProjectFromStore(store, row.identity);
+      const label = `${sourceLabel} · ${row.id} deleted`;
+      setStore(nextStore);
+      setSourceLabel(label);
+      /* No audit changes are passed: the rows that would have recorded them
+         have just been deleted, and re-creating history for a project that no
+         longer exists is not a record, it is noise. */
+      await saveDataset(nextStore, label, []);
+
+      setDrafts((prev) => { const next = { ...prev }; delete next[row.id]; return next; });
+      try {
+        setManual(settleLoad({ status: "fulfilled", value: await loadManual() }));
+      } catch (manualError) {
+        setManual(settleLoad({ status: "rejected", reason: manualError }));
+      }
+      await refreshTargets();
+      setSaveMessage(
+        `Deleted ${row.id}: ${result.targets_deleted ?? 0} target(s), `
+        + `${result.audit_rows_deleted ?? 0} audit entr${result.audit_rows_deleted === 1 ? "y" : "ies"}, `
+        + `${result.manual_rows_deleted ?? 0} manual row(s) and ${removedCollections} collection row(s). `
+        + "Recorded in the purge log; the imported values remain in Previous data.",
+      );
+    } catch (error) {
+      setSaveMessage(`Could not delete ${row.id}: ${error.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const saveAll = async () => {
     const ids = [...dirtyIds];
     for (const id of ids) await saveRow(id);
@@ -2936,6 +3185,11 @@ export default function ProjectLedger({ user, onSignOut }) {
         ? r.baseKey : null;
       merged.auditId = entry?.storedId || r.id;
       merged.auditIds = [...new Set([r.id, entry?.storedId, legacyId].filter(Boolean))];
+      /* Which fields somebody typed by hand, as opposed to inherited from the
+         workbook. The delete confirmation names them: "3 hand-typed values" is
+         not something an administrator can weigh, and "Status, Contract,
+         Remarks" is. */
+      merged.manualFields = m ? Object.keys(m).filter((field) => set(m[field])) : [];
       /* An unavailable target list renders as empty so nothing downstream has
          to special-case it, but it is flagged as unknown rather than reported
          as "No target" — a project whose targets failed to load would
@@ -2989,15 +3243,27 @@ export default function ProjectLedger({ user, onSignOut }) {
         if (!sheets.recognized) {
           out.push(...unrecognizedWorkbookLog(f.name, wb.SheetNames));
         } else {
+          /* Folded into what is already held, never substituted for it. A
+             workbook covering one year used to remove every project the last
+             workbook supplied, and remove them with no audit entry, because a
+             row that stops existing has not changed. */
           if (sheets.hasCollectibles) {
             const r = readCollectibles(wb);
             out.push(...r.log);
-            if (r.rows && r.rows.length) { coll = r.rows; gotColl = true; accepted = true; }
+            if (r.rows && r.rows.length) {
+              const merged = mergeCollectionRows(coll, r.rows);
+              coll = merged.rows; gotColl = true; accepted = true;
+              out.push({ text: `Collectibles: ${merged.added} new, ${merged.updated} updated, ${merged.retained} kept from earlier uploads` });
+            }
           }
           if (sheets.hasMaster) {
             const r = readMaster(wb);
             out.push(...r.log);
-            if (r.dim.size) { dim = r.dim; gotMaster = true; accepted = true; }
+            if (r.dim.size) {
+              const merged = mergeMasterDimensions(dim, r.dim);
+              dim = merged.dim; gotMaster = true; accepted = true;
+              out.push({ text: `Projects: ${merged.added} new, ${merged.updated} updated, ${merged.retained} kept from earlier uploads` });
+            }
           }
           if (!accepted) out.push({ warn: true, text: `${f.name}: the sheet tab was found but no usable project rows were read from it` });
         }
@@ -3252,7 +3518,8 @@ export default function ProjectLedger({ user, onSignOut }) {
                          onSaveRow={saveRow} onSaveAll={saveAll} dirtyIds={dirtyIds} dirtyCount={dirtyCount}
                          savingIds={savingIds} onAuditCell={setAuditTarget}
                          onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled}
-                         isAdmin={role === "admin"} />
+                         isAdmin={role === "admin"}
+                         onDeleteProject={role === "admin" ? setDeletingProject : undefined} />
 
             <TargetAnalysis rows={multipleTargetsEnabled ? rows : rows.map((record) => ({
               ...record,
@@ -3261,6 +3528,20 @@ export default function ProjectLedger({ user, onSignOut }) {
             {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
                                         isAdmin={role === "admin"}
                                         onClose={() => setAuditTarget(null)} />}
+            {deletingProject && (
+              <DeleteProjectModal
+                key={deletingProject.identity}
+                /* re-read from `records`, so a target saved or a value typed
+                   while the dialog was open is counted by it */
+                project={records.find((r) => r.identity === deletingProject.identity) || deletingProject}
+                busy={busy}
+                onCancel={() => setDeletingProject(null)}
+                onConfirm={async (reason) => {
+                  const row = records.find((r) => r.identity === deletingProject.identity) || deletingProject;
+                  await deleteProject(row, reason);
+                  setDeletingProject(null);
+                }} />
+            )}
             {multipleTargetsEnabled && manageTarget && (
               <TargetsModal
                 key={manageTarget.id}

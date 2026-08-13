@@ -272,3 +272,58 @@ limit 50;
 --     null::public.project_manual_update_audit,
 --     (select payload from public.project_audit_purge_log where id = <log id>)
 --   );
+
+
+-- ===========================================================================
+-- 8. WHOLE-PROJECT DELETION  --  migration 20260825000000
+--
+-- admin_delete_project() removes every target, audit entry and manual-override
+-- row filed under a project. The imported values (district, licence, category,
+-- contract) are NOT in a table - the panel removes them from the
+-- project_ledger_dataset JSONB in the same action - so recovering a deleted
+-- project takes both halves:
+--   imported values      -> Previous data > Restore, in the panel
+--   targets/audit/manual -> project_purge_log, below
+-- ===========================================================================
+
+-- What has been deleted, and by whom.
+select id, purged_at, purged_by_username, project_ids,
+       targets_deleted, audit_rows_deleted, manual_rows_deleted, reason
+from public.project_purge_log
+order by purged_at desc
+limit 50;
+
+-- Confirm a project really is gone from all three tables. Pass the same
+-- spellings the panel passed (they are recorded in project_ids above).
+select 'targets' as source, count(*) from public.project_targets
+ where project_key = any (select project_keys from public.project_purge_log where id = 1)
+union all
+select 'audit', count(*) from public.project_manual_update_audit
+ where project_id = any (select project_ids from public.project_purge_log where id = 1)
+union all
+select 'manual', count(*) from public.project_manual_updates
+ where project_id = any (select project_ids from public.project_purge_log where id = 1);
+-- All three counts must be 0.
+
+-- Restore a project's database rows from the log. Targets first: the audit
+-- rows reference them.
+--
+-- begin;
+--
+-- insert into public.project_targets
+-- select * from jsonb_populate_recordset(null::public.project_targets,
+--   (select payload -> 'targets' from public.project_purge_log where id = <log id>));
+--
+-- insert into public.project_manual_updates
+-- select * from jsonb_populate_recordset(null::public.project_manual_updates,
+--   (select payload -> 'manual' from public.project_purge_log where id = <log id>));
+--
+-- insert into public.project_manual_update_audit
+-- select * from jsonb_populate_recordset(null::public.project_manual_update_audit,
+--   (select payload -> 'audit' from public.project_purge_log where id = <log id>));
+--
+-- commit;
+--
+-- Then restore the imported values from Previous data in the panel. Doing only
+-- one half leaves targets and history attached to a project the ledger does not
+-- list, or a listed project with none of its history.
