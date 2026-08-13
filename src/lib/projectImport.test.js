@@ -5,6 +5,7 @@ import * as XLSX from "xlsx";
 import {
   MASTER_START_YEAR, readMasterWorkbook, readCollectiblesWorkbook, assembleProjects,
   extendLegacyAssignments, resolvedEntry, importedChanges,
+  IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
 } from "./projectImport.js";
 
 const workbook = (sheets) => {
@@ -166,4 +167,55 @@ test("displayId drops the year for display while id keeps it for joining", () =>
   assert.notEqual(y2022.id, y2025.id, "two years remain distinct rows to the database");
   assert.equal(y2022.year, 2022, "and the year is still available to print in a tooltip");
   assert.equal(y2025.year, 2025);
+});
+
+/* A workbook is accepted on its sheet tab names alone. The file name is never
+   read, and a file with no recognised tab must be rejected with instructions
+   rather than silently doing nothing. */
+test("sheet tabs are matched by name fragment, and the file name is irrelevant", () => {
+  const named = classifyWorkbookSheets(workbook({
+    "QMB PROJECTS 2026": [["Project ID"]],
+    "qm licenses (final)": [["Project ID"]],
+    "Sheet1": [[]],
+  }));
+
+  assert.equal(named.recognized, true);
+  assert.equal(named.hasMaster, true);
+  assert.equal(named.hasCollectibles, false, "no COLLECTIBLES tab in this file");
+  assert.equal(named.matched.qmb_projects, "QMB PROJECTS 2026", "trailing year still matches");
+  assert.equal(named.matched.qm_licenses, "qm licenses (final)", "case and suffix are ignored");
+  assert.deepEqual(named.unmatched, ["Sheet1"]);
+});
+
+test("a workbook with none of the three tabs is not recognised", () => {
+  const stranger = classifyWorkbookSheets(workbook({ "Sheet1": [["Project ID", "Year"]], "Summary": [[]] }));
+
+  assert.equal(stranger.recognized, false);
+  assert.equal(stranger.hasMaster, false);
+  assert.equal(stranger.hasCollectibles, false);
+  assert.deepEqual(stranger.matched, {}, "a PROJECT ID column cannot rescue a tab with the wrong name");
+  assert.deepEqual(classifyWorkbookSheets(undefined).sheetNames, [], "a missing workbook is not a crash");
+});
+
+test("the rejection message names every accepted tab and what the user should rename", () => {
+  const lines = unrecognizedWorkbookLog("BUDGET 2026.xlsx", ["Sheet1", "Summary"]);
+  const all = lines.map((line) => line.text).join("\n");
+
+  assert.equal(lines[0].warn, true, "the first line reads as a failure, not a note");
+  for (const rule of IMPORT_SHEET_RULES) assert.ok(all.includes(rule.label), `names ${rule.label}`);
+  assert.ok(all.includes("BUDGET 2026.xlsx"), "says which file was rejected");
+  assert.ok(all.includes("Sheet1, Summary"), "says which tabs it actually found");
+  assert.ok(all.includes("ledger is unchanged"), "says nothing was overwritten");
+  assert.ok(all.includes("file name itself is never checked"), "corrects the file-name assumption");
+  assert.ok(all.includes("PROJECT ID"), "states the column still required after renaming");
+});
+
+test("a recognised tab with no PROJECT ID column says so instead of reporting zero projects", () => {
+  const { log } = readMasterWorkbook(workbook({ "QMB PROJECTS": [["Name", "Year"], ["Road", 2025]] }), { currentYear: 2026 });
+  const collectibles = readCollectiblesWorkbook(workbook({ "COLLECTIBLES": [["Office", "Status"]] }));
+
+  assert.ok(log.some((line) => line.warn && line.text.includes("no PROJECT ID column")));
+  assert.ok(log.some((line) => line.warn && line.text.includes("No QM LICENSES sheet tab")), "the absent half is reported too");
+  assert.equal(collectibles.rows, null);
+  assert.ok(collectibles.log[0].warn && collectibles.log[0].text.includes("no PROJECT ID column"));
 });

@@ -73,6 +73,12 @@ export const isArchived = (target) => Boolean(target && target.archived_at);
 export function selectPrimaryTarget(targets) {
   const active = (Array.isArray(targets) ? targets : []).filter((target) => !isArchived(target));
   active.sort((a, b) => {
+    /* A draft has no quantity and no deadline, so picking one ahead of a target
+       that has either leaves the single-target table showing a row of blanks
+       while a real target sits behind it. Both are undated, so the date rule
+       below cannot separate them — trackable targets are preferred here first.
+       Among equals the ordering is exactly as it was. */
+    if (isTrackable(a) !== isTrackable(b)) return isTrackable(a) ? -1 : 1;
     const dueA = a.target_completion || "9999-12-31";
     const dueB = b.target_completion || "9999-12-31";
     return String(dueA).localeCompare(String(dueB))

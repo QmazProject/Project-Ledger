@@ -67,6 +67,58 @@ const findColumn = (headers, exact = [], partial = []) => {
 
 const meaningful = (value) => value !== "" && value !== null && value !== undefined && value !== "-";
 
+/* A workbook is identified by its sheet tab names and nothing else — never by
+   the file name. One list answers both "can this file be read at all?" for the
+   uploader and "which tab do I read?" here, so the guidance shown to the user
+   can never drift from what the parser actually accepts. */
+export const IMPORT_SHEET_RULES = [
+  { key: "qmb_projects", label: "QMB PROJECTS", match: "QMB PROJECT" },
+  { key: "qm_licenses", label: "QM LICENSES", match: "QM LICENSE" },
+  { key: "collectibles", label: "COLLECTIBLES", match: "COLLECTIBLE" },
+];
+
+const ruleFor = (key) => IMPORT_SHEET_RULES.find((rule) => rule.key === key);
+const matchesRule = (rule, sheetName) => normalizeText(sheetName).includes(rule.match);
+
+export const findSheetName = (workbook, key) =>
+  (workbook?.SheetNames || []).find((name) => matchesRule(ruleFor(key), name));
+
+export function classifyWorkbookSheets(workbook) {
+  const sheetNames = workbook?.SheetNames || [];
+  const matched = {};
+  for (const rule of IMPORT_SHEET_RULES) {
+    const name = sheetNames.find((sheet) => matchesRule(rule, sheet));
+    if (name) matched[rule.key] = name;
+  }
+  return {
+    sheetNames, matched,
+    unmatched: sheetNames.filter((sheet) => !IMPORT_SHEET_RULES.some((rule) => matchesRule(rule, sheet))),
+    hasCollectibles: Boolean(matched.collectibles),
+    hasMaster: Boolean(matched.qmb_projects || matched.qm_licenses),
+    recognized: Object.keys(matched).length > 0,
+  };
+}
+
+const sheetList = (names, limit = 8) => !names.length ? "(no sheets)"
+  : names.length > limit ? `${names.slice(0, limit).join(", ")} … +${names.length - limit} more`
+  : names.join(", ");
+
+/* Rejecting a file silently is the worst outcome here: the upload appears to
+   work, the ledger does not change, and nothing says why. Say what was found,
+   what is accepted, and what to rename. */
+export function unrecognizedWorkbookLog(fileName, sheetNames = []) {
+  const labels = IMPORT_SHEET_RULES.map((rule) => rule.label).join(", ");
+  const matches = IMPORT_SHEET_RULES.map((rule) => `"${rule.match}"`).join(", ");
+  return [
+    { warn: true, text: `${fileName}: no readable sheet — nothing from this file was imported and the ledger is unchanged` },
+    { warn: true, text: `${fileName} has ${sheetNames.length} sheet tab${sheetNames.length === 1 ? "" : "s"}: ${sheetList(sheetNames)}` },
+    { text: `Accepted sheet tab names: ${labels}. The file name itself is never checked — only the tab names inside it.` },
+    { text: `A tab is accepted when its name contains ${matches}, so "QMB PROJECTS 2026" or "COLLECTIBLES AS OF JUNE" also work.` },
+    { text: `Rename the sheet tab at the bottom of Excel (right-click › Rename), save the file, then upload it again.` },
+    { text: `Each accepted tab still needs a PROJECT ID column, and ${ruleFor("qmb_projects").label} / ${ruleFor("qm_licenses").label} also need YEAR, within its first 12 rows.` },
+  ];
+}
+
 function readMasterSheet(workbook, sheetName, source, currentYear) {
   const rows = sheetGrid(workbook, sheetName);
   const headerIndex = headerRow(rows);
@@ -131,24 +183,21 @@ const mergeMasterRecord = (existing, incoming, preferIncoming) => {
 export function readMasterWorkbook(workbook, { currentYear = new Date().getFullYear() } = {}) {
   const dim = new Map();
   const log = [];
-  const definitions = [
-    { source: "qmb_projects", label: "QMB Projects", test: (name) => name.includes("QMB PROJECT") },
-    { source: "qm_licenses", label: "QM Licenses", test: (name) => name.includes("QM LICENSE") },
-  ];
-  for (const definition of definitions) {
-    const sheetName = workbook.SheetNames.find((name) => definition.test(normalizeText(name)));
+  for (const key of ["qmb_projects", "qm_licenses"]) {
+    const rule = ruleFor(key);
+    const sheetName = findSheetName(workbook, key);
     if (!sheetName) {
-      log.push({ warn: true, text: `Sheet for ${definition.label} not found` });
+      log.push({ warn: true, text: `No ${rule.label} sheet tab in this file — that half was not read` });
       continue;
     }
-    const result = readMasterSheet(workbook, sheetName, definition.source, currentYear);
+    const result = readMasterSheet(workbook, sheetName, key, currentYear);
     if (result.missingId) {
-      log.push({ warn: true, text: `${sheetName}: no Project ID column` });
+      log.push({ warn: true, text: `${sheetName}: no PROJECT ID column found in its first 12 rows — nothing read from this tab` });
       continue;
     }
     for (const record of result.records) {
       const current = dim.get(record.identity);
-      dim.set(record.identity, mergeMasterRecord(current, record, definition.source === "qm_licenses"));
+      dim.set(record.identity, mergeMasterRecord(current, record, key === "qm_licenses"));
     }
     log.push({ text: `${sheetName}: ${result.records.length} projects from ${MASTER_START_YEAR}-${currentYear} read` });
     if (result.skippedYear) log.push({ text: `${sheetName}: ${result.skippedYear} rows outside ${MASTER_START_YEAR}-${currentYear} skipped` });
@@ -158,8 +207,8 @@ export function readMasterWorkbook(workbook, { currentYear = new Date().getFullY
 
 export function readCollectiblesWorkbook(workbook) {
   const log = [];
-  const sheetName = workbook.SheetNames.find((name) => normalizeText(name).includes("COLLECTIBLE"));
-  if (!sheetName) return { rows: null, log: [{ warn: true, text: "No sheet named COLLECTIBLES found" }] };
+  const sheetName = findSheetName(workbook, "collectibles");
+  if (!sheetName) return { rows: null, log: [{ warn: true, text: "No COLLECTIBLES sheet tab in this file — collections were not read" }] };
   const rows = sheetGrid(workbook, sheetName);
   const headerIndex = headerRow(rows);
   const headers = (rows[headerIndex] || []).map(normalizeText);
@@ -179,7 +228,7 @@ export function readCollectiblesWorkbook(workbook) {
     status: findColumn(headers, ["STATUS"], ["STATUS"]),
     remarks: findColumn(headers, ["REMARKS"], ["REMARKS"]),
   };
-  if (columns.id < 0) return { rows: null, log: [{ warn: true, text: `${sheetName}: no Project ID column` }] };
+  if (columns.id < 0) return { rows: null, log: [{ warn: true, text: `${sheetName}: no PROJECT ID column found in its first 12 rows — nothing read from this tab` }] };
 
   const output = [];
   const seen = new Set();

@@ -12,9 +12,9 @@ import {
   buildManualSave, normalizeManualValue, fractionFromPercent, percentFromFraction,
 } from "./lib/panelData";
 import {
-  normalizeText, cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook,
+  cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook,
   assembleProjects, extendLegacyAssignments, resolvedEntry, importedChanges,
-  IMPORT_AUDIT_FIELDS,
+  IMPORT_AUDIT_FIELDS, IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
 } from "./lib/projectImport";
 
 /* ==================================================================
@@ -32,7 +32,6 @@ const NO_DATA_LABEL = "No data yet \u00b7 upload the workbooks to begin";
 
 /* ---------------- parsing helpers ---------------- */
 
-const NORM = normalizeText;
 const CLEAN = cleanText;
 const toNum = numberOrNull;
 const readMaster = readMasterWorkbook;
@@ -655,6 +654,11 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
               projects from 2022 onward are consolidated by Project ID and Year, with QM Licenses preferred and
               master-only projects kept visible. Hand-typed status, contract, remarks and targets are retained;
               only Excel fields that really changed receive an <b>Excel updated</b> audit entry.
+            </p>
+            {/* stated before the upload, not only after one is rejected */}
+            <p className="mx-auto mt-1.5 max-w-xl text-[11px]" style={{ color: T.inkFaint }}>
+              Sheet tabs read: {IMPORT_SHEET_RULES.map((rule) => <b key={rule.key} style={{ color: T.inkSoft }}>{rule.label}{rule.key === "collectibles" ? "" : " · "}</b>)}
+              — a file with none of these tabs is rejected and the ledger is left unchanged.
             </p>
             <input ref={inputRef} type="file" accept=".xlsx,.xls,.xlsm" multiple hidden
                    onChange={(e) => take(e.target.files)} />
@@ -1406,12 +1410,17 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                   if (c.k === "billpct") { const ct = sum(data, "contract");
                     return <td key={c.k} style={{ ...base, textAlign: "right" }}>{pct(ct ? sum(data, "gross") / ct : null)}</td>; }
                   /* the count is of targets, not of projects that have one —
-                     those are different numbers now and the label says which */
-                  if (c.k === "targetSummary") return <td key={c.k} style={{ ...base, textAlign: "right",
-                    ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w } : {}) }}>
-                    {data.some((r) => r.targetsUnavailable)
-                      ? <span style={{ color: T.inkFaint }}>unavailable</span>
-                      : `${data.reduce((n, r) => n + r.targetCount, 0)} targets`}</td>;
+                     those are different numbers now and the label says which.
+                     Drafts are excluded from the total and named separately, so
+                     this never disagrees with the Targets filter beside it. */
+                  if (c.k === "targetSummary") {
+                    const draftTotal = data.reduce((n, r) => n + (r.targetSummary?.drafts.length || 0), 0);
+                    return <td key={c.k} style={{ ...base, textAlign: "right",
+                      ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w } : {}) }}>
+                      {data.some((r) => r.targetsUnavailable)
+                        ? <span style={{ color: T.inkFaint }}>unavailable</span>
+                        : `${data.reduce((n, r) => n + r.targetCount, 0)} targets${draftTotal ? ` · ${draftTotal} draft${draftTotal === 1 ? "" : "s"}` : ""}`}</td>;
+                  }
                   return <td key={c.k} style={base} />;
                 })}
                 <td style={{ position: "sticky", bottom: 0, background: T.paper2, borderTop: `2px solid ${T.ink}`,
@@ -2790,10 +2799,18 @@ export default function ProjectLedger({ user, onSignOut }) {
       merged.targetsUnavailable = targetsOf.unavailable;
       merged.targetSummary = assessProjectTargets(merged, { today });
       merged.primaryTarget = selectPrimaryTarget(merged.targets);
-      merged.targetCount = multipleTargetsEnabled
-        ? merged.targetSummary.active
-        : (merged.primaryTarget ? 1 : 0);
-      merged.hasTarget = targetsLabel(targetsOf.unavailable, merged.targetCount);
+      /* A draft is a target saved with a Balance Work name but no quantity and
+         no completion date. It is stored, listed and editable, but there is
+         nothing in it to measure, so every target column on its row renders
+         blank. Counting drafts here filed those projects under "With target"
+         while their row showed none, and wrote a target count beside it. Both
+         numbers now count only targets that can actually be tracked. Drafts are
+         not lost: Manage Targets still lists them and its button still counts
+         them, which is where they can be completed. */
+      const trackedCount = merged.targetSummary.tracked.length;
+      /* the legacy single-target table reports the one target it can show */
+      merged.targetCount = multipleTargetsEnabled ? trackedCount : Math.min(trackedCount, 1);
+      merged.hasTarget = targetsLabel(targetsOf.unavailable, trackedCount);
       /* scope is one of these now, so it no longer needs lifting separately */
       for (const column of INLINE_TARGET_COLS)
         merged[column.k] = merged.primaryTarget?.[column.k] ?? "";
@@ -2817,22 +2834,24 @@ export default function ProjectLedger({ user, onSignOut }) {
       try {
         let accepted = false;
         const wb = XLSX.read(await f.arrayBuffer(), { type: "array" });
-        const names = wb.SheetNames.map(NORM);
-        const isColl = names.some((n) => n.includes("COLLECTIBLE"));
-        const isMaster = names.some((n) => n.includes("QMB PROJECT") || n.includes("QM LICENSE"));
+        const sheets = classifyWorkbookSheets(wb);
         out.push({ text: `${f.name} — ${wb.SheetNames.length} sheets` });
-        if (isColl) {
-          const r = readCollectibles(wb);
-          out.push(...r.log);
-          if (r.rows && r.rows.length) { coll = r.rows; gotColl = true; accepted = true; }
-        }
-        if (isMaster) {
-          const r = readMaster(wb);
-          out.push(...r.log);
-          if (r.dim.size) { dim = r.dim; gotMaster = true; accepted = true; }
-        }
-        if (!isColl && !isMaster) {
-          out.push({ warn: true, text: `${f.name}: no Collectibles / QMB Projects / QM Licenses sheet — skipped` });
+        /* a file whose tabs are not recognised is rejected with instructions,
+           not with a one-line "skipped" the uploader cannot act on */
+        if (!sheets.recognized) {
+          out.push(...unrecognizedWorkbookLog(f.name, wb.SheetNames));
+        } else {
+          if (sheets.hasCollectibles) {
+            const r = readCollectibles(wb);
+            out.push(...r.log);
+            if (r.rows && r.rows.length) { coll = r.rows; gotColl = true; accepted = true; }
+          }
+          if (sheets.hasMaster) {
+            const r = readMaster(wb);
+            out.push(...r.log);
+            if (r.dim.size) { dim = r.dim; gotMaster = true; accepted = true; }
+          }
+          if (!accepted) out.push({ warn: true, text: `${f.name}: the sheet tab was found but no usable project rows were read from it` });
         }
         if (accepted) acceptedFiles.push(f);
       } catch (err) {
@@ -2876,6 +2895,8 @@ export default function ProjectLedger({ user, onSignOut }) {
         setUploadedBy("not saved — visible in this browser only");
         out.push({ warn: true, text: `Shown here but NOT saved for other users: ${error.message}` });
       }
+    } else {
+      out.push({ warn: true, text: `Nothing was imported — the shared ledger is unchanged. Fix the sheet tab names above and upload again.` });
     }
     setLog(out);
     setBusy(false);
@@ -2925,7 +2946,10 @@ export default function ProjectLedger({ user, onSignOut }) {
         if (c.k === "targetCount") return "unavailable";
         if (targetKeys.has(c.k)) return "";
       }
-      if (!multipleTargetsEnabled && c.k === "targetCount") return r.primaryTarget ? 1 : 0;
+      /* already draft-free, and it has to stay that way here: a "1" in this
+         column beside six blank target cells is the same false reading the
+         Targets filter used to give, only in a file read away from the app */
+      if (c.k === "targetCount") return r.targetCount;
       if (!targetKeys.has(c.k)) return r[c.k];
       if (!multipleTargetsEnabled) return r.primaryTarget ? r[c.k] : "";
       const live = (r.targets || []).filter((t) => !isArchived(t));

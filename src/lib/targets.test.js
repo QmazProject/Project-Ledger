@@ -443,3 +443,54 @@ test("12. targets are read from their own collection, never from project fields"
   assert.equal(drafts.length, 0);
   assert.equal(assessProjectTargets(reimported, at).all.length, 0);
 });
+
+/* The Targets filter counted every stored target, so a project whose only
+   target was a draft — a Balance Work name with no quantity and no completion
+   date — was filed under "With target" while every target column on its row
+   rendered blank. These pin the two halves of that fix. */
+test("a draft is not counted as a trackable target", () => {
+  const at = { today: Date.parse("2026-08-13T00:00:00Z") };
+  const draftOnly = { id: "QMB-001", bal: 1_000_000, targets: [
+    { id: "d1", scope: "Roadworks", target_qty: null, unit: "", start_date: "", target_completion: "", actual_output: null },
+  ] };
+  const summary = assessProjectTargets(draftOnly, at);
+
+  assert.equal(summary.tracked.length, 0, "this is what the Targets filter reads");
+  assert.equal(summary.drafts.length, 1, "and the draft is still reported, not dropped");
+  assert.equal(summary.active, 1, "Manage Targets still counts it, so it stays reachable");
+  assert.equal(isDraft(draftOnly.targets[0]), true);
+  assert.equal(isTrackable(draftOnly.targets[0]), false);
+
+  const bare = assessProjectTargets({ id: "X", targets: [{ id: "d2" }] }, at);
+  assert.equal(bare.tracked.length, 0, "a target with no fields at all is a draft too");
+});
+
+test("a quantity alone or a completion date alone makes a target trackable", () => {
+  const at = { today: Date.parse("2026-08-13T00:00:00Z") };
+  const rows = { id: "QMB-001", bal: 0, targets: [
+    { id: "q", scope: "Qty only", target_qty: 100 },
+    { id: "d", scope: "Date only", target_completion: "2026-12-31" },
+    { id: "z", scope: "Zero qty", target_qty: 0 },
+  ] };
+  const summary = assessProjectTargets(rows, at);
+
+  assert.equal(summary.tracked.length, 3, "a zero quantity is a real target, not a blank one");
+  assert.equal(summary.drafts.length, 0);
+});
+
+test("a draft never wins the primary target slot from a real target", () => {
+  const draft = { id: "draft", scope: "Named only", created_at: "2026-01-01" };
+  const undated = { id: "real", scope: "Has a quantity", target_qty: 50, created_at: "2026-06-01" };
+
+  assert.equal(selectPrimaryTarget([draft, undated]).id, "real",
+    "both are undated, so only the draft rule can separate them");
+  assert.equal(selectPrimaryTarget([undated, draft]).id, "real", "and the input order does not decide it");
+
+  const dated = { id: "dated", scope: "Due soon", target_completion: "2026-09-01", created_at: "2026-07-01" };
+  assert.equal(selectPrimaryTarget([draft, dated, undated]).id, "dated",
+    "among trackable targets the nearest completion date still wins");
+  assert.equal(selectPrimaryTarget([draft]).id, "draft",
+    "a project with only a draft still opens on that draft");
+  assert.equal(selectPrimaryTarget([{ id: "gone", target_qty: 5, archived_at: "2026-02-02" }, draft]).id, "draft",
+    "an archived target is still never selected, trackable or not");
+});
