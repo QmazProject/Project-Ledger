@@ -610,7 +610,9 @@ const COLS = [
      is a summary that opens it — which makes the table one column narrower than
      it was, not wider. */
   { k: "targetSummary", label: "Targets", targets: true, w: 178 },
-  { k: "note", label: "Remarks", edit: "text", w: 190 },
+  /* wraps for the same reason Balance Work does: a note somebody typed is a
+     sentence, and 190px of it is not the note */
+  { k: "note", label: "Remarks", edit: "text", w: 190, wrap: true },
 ];
 
 /* Columns that sort on a different field from the one they display. The summary
