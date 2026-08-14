@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useEffect, useLayoutEffect } from "react";
 import * as XLSX from "xlsx";
 import { supabase, isConfigured } from "./lib/supabase";
 import {
@@ -623,7 +623,10 @@ const SORT_KEYS = { targetSummary: "targetCount", yearStr: "year" };
 const INLINE_TARGET_COLS = [
   /* The work itself, ahead of the numbers that measure it. Same field the
      Manage Targets modal edits, so the two are one value and not two. */
-  { k: "scope", label: SCOPE_LABEL, edit: "text", targetField: true, w: 190 },
+  /* `wrap`: the value is a list of works — "Emulsified Asphalt, Wearing Course
+     Hot Laid…" — not a word, so the cell has to show all of it rather than as
+     much as 190px holds. */
+  { k: "scope", label: SCOPE_LABEL, edit: "text", targetField: true, w: 190, wrap: true },
   { k: "target_qty", label: "Target qty", edit: "qty", targetField: true, w: 92 },
   { k: "unit", label: "Unit", edit: "text", targetField: true, w: 80 },
   { k: "start_date", label: "Start date", edit: "date", targetField: true, w: 132 },
@@ -1143,7 +1146,13 @@ const PROJECT_STATUS_TONE = {
    back, 0.101 stored (see fractionFromPercent). The typed text is held
    separately while the cell has focus: deriving it from the stored fraction on
    every keystroke would eat the dot the moment somebody typed "10.". */
-function EditCell({ value, type, onChange }) {
+/* `wrap` is for the columns that hold a sentence rather than a word. A single
+   line input showed only as much of a saved Balance Work as the column was
+   wide — "Emulsified Asphalt, Wearing Course Hot Lai…" — and the rest could be
+   reached only by clicking into the cell and scrolling it. A textarea grown to
+   its own content shows every line of it while staying one field: same value,
+   same onChange, same Escape. */
+function EditCell({ value, type, onChange, wrap = false }) {
   const [focus, setFocus] = useState(false);
   /* null means "not being typed into"; "" is a real value the user cleared */
   const [typed, setTyped] = useState(null);
@@ -1162,6 +1171,40 @@ function EditCell({ value, type, onChange }) {
     const asPercent = percentFromFraction(v);
     displayValue = focus ? (typed ?? asPercent) : (asPercent === "" ? "" : asPercent + "%");
   }
+
+  /* Only text wraps. The number, percent and date cells reformat themselves on
+     blur and are a single token by construction, so growing them would add
+     height no value can ever fill. */
+  const multiline = wrap && type === "text";
+  const grow = useRef(null);
+  /* Measured before paint, or a cell that is two lines tall would render one
+     line tall for a frame every time the row re-renders. */
+  useLayoutEffect(() => {
+    const el = grow.current;
+    if (!el) return;
+    const fit = () => {
+      /* auto first: scrollHeight never reports less than the height already
+         set, so without this a cell that lost a line would keep the old one. */
+      el.style.height = "auto";
+      /* scrollHeight is content plus padding and stops short of the border, so
+         a border-box height set from it alone clips the last line by a pixel. */
+      el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`;
+    };
+    fit();
+    if (typeof ResizeObserver === "undefined") return undefined;
+    /* How many lines the same text takes depends on how wide the column ended
+       up, and that is settled by the browser after this runs — and again
+       whenever the window is resized. Width only: fit() changes the height, so
+       reacting to height here is how this would loop forever. */
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      fit();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [multiline, displayValue]);
 
   if (type === "status") {
     const current = CLEAN(v).toUpperCase();
@@ -1200,6 +1243,40 @@ function EditCell({ value, type, onChange }) {
     );
   }
 
+  const field = {
+    width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
+    background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
+    fontFamily: type === "text" ? BODY : MONO, fontSize: 11.5, color: T.ink,
+    textAlign: type === "qty" || type === "amount" || type === "pct" ? "right" : "left", outline: "none",
+  };
+  const handlers = {
+    onFocus: () => setFocus(true),
+    onBlur: () => { setFocus(false); setTyped(null); },
+  };
+
+  if (multiline) return (
+    <textarea
+      ref={grow}
+      rows={1}
+      value={displayValue}
+      onChange={(e) => onChange(e.target.value)}
+      {...handlers}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") { e.currentTarget.blur(); return; }
+        /* The column stores one run of text, so Enter leaves the cell the way
+           it does in every other cell instead of writing a newline into the
+           value. Shift+Enter is left alone for anybody who wants one. */
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); }
+      }}
+      style={{
+        ...field, display: "block", boxSizing: "border-box", resize: "none",
+        /* the element is sized to its own content, so it never has anything to
+           scroll — a scrollbar here would only steal width from the text */
+        overflow: "hidden", whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.35,
+      }}
+    />
+  );
+
   return (
     <input
       value={displayValue}
@@ -1217,15 +1294,9 @@ function EditCell({ value, type, onChange }) {
           ? e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
           : e.target.value);
       }}
-      onFocus={() => setFocus(true)}
-      onBlur={() => { setFocus(false); setTyped(null); }}
+      {...handlers}
       onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
-      style={{
-        width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
-        background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
-        fontFamily: type === "text" ? BODY : MONO, fontSize: 11.5, color: T.ink,
-        textAlign: type === "qty" || type === "amount" || type === "pct" ? "right" : "left", outline: "none",
-      }}
+      style={field}
     />
   );
 }
@@ -2174,7 +2245,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                       }}
                           style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA",
                                    cursor: c.edit === "status" ? "pointer" : "text" }}>
-                        <EditCell value={v} type={c.edit} onChange={(nv) => onEdit(r.id, c.k, nv)}
+                        <EditCell value={v} type={c.edit} wrap={c.wrap} onChange={(nv) => onEdit(r.id, c.k, nv)}
                         />
                       </td>
                     );
@@ -2485,9 +2556,14 @@ function TargetAnalysis({ rows }) {
                     nothing to do with the deliverable being ranked. Remarks
                     stays a project note in the Projects table and is not part of
                     target tracking. */}
+                {/* Wrapped, not clipped. This cell used to end in an ellipsis —
+                    "Emulsified Asphalt, Wearing Course Hot Lai…" — which hid the
+                    part of the list that says what the row is ranking. The width
+                    stays a maximum so the column cannot stretch the table; the
+                    row grows downwards instead. */}
                 <td title={p.scope || `No ${SCOPE_LABEL} specified for this target`}
                     style={{ padding: "5px 8px", borderBottom: `1px solid ${T.ruleSoft}`,
-                             maxWidth: 210, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                             maxWidth: 210, whiteSpace: "normal", overflowWrap: "anywhere", lineHeight: 1.35,
                              color: p.scope ? T.ink : T.inkFaint }}>
                   {p.scope || "—"}</td>
                 {/* The balance to collect belongs to the project, so it repeats
@@ -2532,7 +2608,10 @@ function TargetAnalysis({ rows }) {
 ------------------------------------------------- */
 
 const TARGET_COLUMNS = [
-  { k: "scope", label: SCOPE_LABEL, type: "text", w: 200 },
+  /* wraps for the same reason the ledger row's Balance Work does — this is the
+     field being typed into, so it is the first place the full text has to be
+     readable back */
+  { k: "scope", label: SCOPE_LABEL, type: "text", w: 200, wrap: true },
   { k: "target_qty", label: "Target qty", type: "qty", w: 92 },
   { k: "unit", label: "Unit", type: "text", w: 80 },
   { k: "start_date", label: "Start date", type: "date", w: 132 },
@@ -2964,7 +3043,7 @@ function TargetsModal({ project, onClose, onSaved, isAdmin }) {
                               {row[c.k] === "" || row[c.k] === null ? "—" : String(row[c.k])}
                             </span>
                           ) : (
-                            <EditCell value={row[c.k]} type={c.type} onChange={(v) => edit(row.id, c.k, v)} />
+                            <EditCell value={row[c.k]} type={c.type} wrap={c.wrap} onChange={(v) => edit(row.id, c.k, v)} />
                           )}
                           {rowErrors[c.k] && (
                             <div style={{ color: T.bad, fontSize: 10, padding: "1px 4px" }}>{rowErrors[c.k]}</div>
