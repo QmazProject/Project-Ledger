@@ -67,6 +67,66 @@ const deserialiseStore = (payload) => ({
   legacy: new Map(Array.isArray(payload?.legacy) ? payload.legacy : []),
 });
 
+/* ---------------- one request per mount ----------------
+   React StrictMode (see main.jsx) mounts, unmounts and remounts every component
+   in development, so each of the mount effects below runs twice. Each one used
+   to call its loader twice and disarm the first call's `alive` flag in between,
+   which meant the response that actually arrived was the one the effect had
+   already agreed to ignore — and the panel's readiness depended entirely on a
+   *second* request. When that second request did not complete, the panel sat on
+   "Loading the ledger…" for as long as it was left open, with a successful 200
+   for the first one visible in the network log the whole time.
+
+   Sharing one promise removes the second request altogether: both invocations
+   await the same response, and whichever instance is still mounted applies it.
+   The `alive` guards stay exactly where they are — they still do their real job
+   of not calling setState on an unmounted component. They simply no longer
+   throw away the only answer the page is going to get.
+
+   The entry is cleared once it settles, so a later mount — signing out and back
+   in — fetches again rather than replaying a stale snapshot. The identity check
+   in the cleanup matters: without it a settling promise would delete a newer
+   request that had already claimed the same key.
+------------------------------------------------- */
+
+const inFlight = new Map();
+
+function once(key, start) {
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+  let promise;
+  /* Promise.resolve, not the value itself: a supabase query builder is a
+     *thenable* and not a promise — it implements `then` so it can be awaited,
+     and nothing else. Calling `.finally` straight on one throws. */
+  promise = Promise.resolve(start()).finally(() => {
+    if (inFlight.get(key) === promise) inFlight.delete(key);
+  });
+  inFlight.set(key, promise);
+  return promise;
+}
+
+/** Rejects rather than waiting forever.
+ *
+ *  Applied to the one request that gates the entire screen. A load that cannot
+ *  finish is a bad outcome; a load that cannot finish and says nothing is a
+ *  worse one, because the only thing distinguishing it from a slow network is
+ *  how long somebody is willing to sit and watch. The rejection lands in the
+ *  caller's existing catch, which already reports it and releases the screen. */
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} did not respond within ${Math.round(ms / 1000)}s`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/* Short enough that somebody watching the screen sees the answer rather than
+   giving up and reloading first. A load that has not returned in eight seconds
+   is not going to be saved by twelve more. */
+const DATASET_TIMEOUT_MS = 8_000;
+
 /** null when nothing has been uploaded yet, or when Supabase is not configured */
 async function loadDataset() {
   if (!isConfigured || !supabase) return null;
@@ -840,6 +900,20 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
 }
 
 function EmptyLedger({ loading, configured }) {
+  /* Counts while the load is outstanding.
+     The load is bounded (see DATASET_TIMEOUT_MS), so this can only reach that
+     many seconds before the screen resolves one way or the other. If it ever
+     runs past it, the number is the diagnosis: the effect holding the timeout
+     is not running. And if the number stops advancing, nothing is running at
+     all — the page is blocked rather than waiting. */
+  const [waited, setWaited] = useState(0);
+  useEffect(() => {
+    if (!loading) return undefined;
+    const started = Date.now();
+    const tick = setInterval(() => setWaited(Math.round((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(tick);
+  }, [loading]);
+
   return (
     <div className="rounded-sm px-6 py-12 text-center"
          style={{ background: T.panel, border: `1px solid ${T.rule}` }}>
@@ -847,6 +921,11 @@ function EmptyLedger({ loading, configured }) {
            style={{ fontFamily: DISPLAY, fontWeight: 800, letterSpacing: ".05em" }}>
         {loading ? "Loading the ledger…" : "No project data yet"}
       </div>
+      {loading && (
+        <div className="mt-2 text-[11px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
+          {waited}s · this resolves within {Math.round(DATASET_TIMEOUT_MS / 1000)}s either way
+        </div>
+      )}
       {!loading && (
         <p className="mx-auto mt-2 max-w-lg text-xs" style={{ color: T.inkSoft }}>
           {configured
@@ -2385,8 +2464,24 @@ const pillStyle = (b) => {
     : { ...PILL_BASE, background: "transparent", color: BUCKET_COLOR[b], border: `1px solid ${BUCKET_COLOR[b]}`, fontWeight: 500 };
 };
 
+/* How many rows the worklist opens with. The rest are one click away rather
+   than gone: this used to be three separate caps (10 action items, 8 on track,
+   8 delivered) applied silently, so a ledger holding 76 tracked targets showed
+   26 of them and said 76 in the caption above. Nothing on screen reconciled the
+   two numbers. */
+const TARGET_ROWS_COLLAPSED = 10;
+/* Expanded, the panel keeps its height and the rows scroll inside it. Growing
+   the page instead would push every panel below this one off the screen the
+   moment somebody wanted to read past row ten. */
+const TARGET_ROWS_MAX_HEIGHT = 560;
+
 function TargetAnalysis({ rows }) {
   const { tracked, drafts } = useMemo(() => assessTargets(rows), [rows]);
+  /* Not gated on role or on the multiple-targets flag. Every user sees the same
+     worklist, so every user gets the same control over how much of it is on
+     screen — an administrator has no more reason to read past row ten than the
+     engineer whose targets these are. */
+  const [showAll, setShowAll] = useState(false);
   /* Every row shares one target load, so if any is unknown they all are. */
   const unavailable = rows.some((r) => r.targetsUnavailable);
 
@@ -2434,22 +2529,32 @@ function TargetAnalysis({ rows }) {
 
   /* action items first; targets already met on time are listed underneath as a
      record of what has landed, and never carry a priority weight */
-  const actionItems = tracked.filter((t) => t.rank <= 1).slice(0, 10);
-  const onTrack = tracked.filter((t) => t.bucket === "On track").slice(0, 8);
+  const actionItems = tracked.filter((t) => t.rank <= 1);
+  const onTrack = tracked.filter((t) => t.bucket === "On track");
   /* both delivered standings belong in the record of what has landed — a late
      delivery is if anything the more useful one to see */
   const achieved = tracked.filter((t) => t.done)
-    .sort((a, b) => (b.project.bal || 0) - (a.project.bal || 0)).slice(0, 8);
-  const priority = [...actionItems, ...onTrack, ...achieved];
+    .sort((a, b) => (b.project.bal || 0) - (a.project.bal || 0));
+  /* Every tracked target, in the order the worklist presents them. Nothing is
+     dropped here; `priority` below decides only how many are on screen. */
+  const ranked = [...actionItems, ...onTrack, ...achieved];
+  const hasMore = ranked.length > TARGET_ROWS_COLLAPSED;
+  const priority = showAll || !hasMore ? ranked : ranked.slice(0, TARGET_ROWS_COLLAPSED);
   /* normalise the bar inside each bucket — otherwise one huge overdue project
-     flattens every critical bar to a sliver */
+     flattens every critical bar to a sliver.
+     Measured across `ranked` and not across what is rendered: normalising the
+     visible slice would rescale the first ten bars the moment the list was
+     expanded, so the same target would appear more urgent collapsed than it did
+     open. The bar means the same thing either way. */
   const bucketMax = {};
-  priority.forEach((p) => { bucketMax[p.bucket] = Math.max(bucketMax[p.bucket] || 1, p.score); });
+  ranked.forEach((p) => { bucketMax[p.bucket] = Math.max(bucketMax[p.bucket] || 1, p.score); });
 
   return (
     <Panel title="Target tracking and priority" right={
       <span className="text-[11px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-        {tracked.length} target{tracked.length === 1 ? "" : "s"} across {projectsTracked} of {rows.length} projects
+        {/* States what is on screen, not only what exists. The two used to be
+            different numbers with nothing between them to explain the gap. */}
+        showing {priority.length} of {tracked.length} target{tracked.length === 1 ? "" : "s"} across {projectsTracked} of {rows.length} projects
         {drafts.length > 0 && <> · {drafts.length} draft{drafts.length === 1 ? "" : "s"} not tracked</>}
       </span>
     }>
@@ -2493,18 +2598,44 @@ function TargetAnalysis({ rows }) {
       </div>
 
       {/* the ranked worklist */}
-      <div className="mb-1.5 text-[10px] uppercase tracking-widest"
-           style={{ fontFamily: DISPLAY, fontWeight: 600, color: T.inkSoft }}>
-        Work these first — on-track and completed targets are listed underneath
+      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-widest"
+             style={{ fontFamily: DISPLAY, fontWeight: 600, color: T.inkSoft }}>
+          Work these first — on-track and completed targets are listed underneath
+        </div>
+        {/* Rendered only when there is something hidden, so a short ledger is not
+            offered a control that would do nothing. */}
+        {hasMore && (
+          <button type="button" onClick={() => setShowAll(!showAll)}
+                  className="project-target-showall rounded-sm px-2.5 py-1"
+                  aria-expanded={showAll}
+                  title={showAll
+                    ? `Show only the first ${TARGET_ROWS_COLLAPSED} targets`
+                    : `Show all ${ranked.length} tracked targets — the list scrolls inside this panel`}
+                  style={{ border: `1px solid ${T.ink}`, background: showAll ? T.ink : "transparent",
+                           color: showAll ? T.paper2 : T.ink, fontFamily: DISPLAY, fontWeight: 700,
+                           letterSpacing: ".04em", textTransform: "uppercase", fontSize: 10,
+                           whiteSpace: "nowrap" }}>
+            {showAll ? `▴ Show top ${TARGET_ROWS_COLLAPSED}` : `▾ Show all ${ranked.length}`}
+          </button>
+        )}
       </div>
-      <div className="overflow-x-auto">
+      {/* Expanded, the rows scroll inside a fixed height and the header stays
+          put; collapsed, only the horizontal overflow of the original. */}
+      <div className={showAll ? "overflow-auto" : "overflow-x-auto"}
+           style={showAll ? { maxHeight: TARGET_ROWS_MAX_HEIGHT } : undefined}>
         <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 11.5 }}>
           <thead>
             <tr>
               {[["#"], ["Project"], ["District / engineer"], ["Standing"], ["Target qty", "right"],
                 ["Actual", "right"], ["Done", "right"], ["Pace", "right"], ["Due"], [SCOPE_LABEL],
                 ["Balance to collect", "right"], ["Priority"]].map(([hd, al]) => (
+                /* Sticky needs an opaque background of its own — the panel's
+                   white would otherwise let the scrolled rows show through the
+                   heading. Harmless while the list is collapsed and nothing
+                   scrolls under it. */
                 <th key={hd} style={{ textAlign: al || "left", padding: "5px 8px",
+                                      position: "sticky", top: 0, zIndex: 2, background: T.paper2,
                                       borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 9.5,
                                       textTransform: "uppercase", letterSpacing: ".06em", whiteSpace: "nowrap" }}>{hd}</th>
               ))}
@@ -2588,7 +2719,9 @@ function TargetAnalysis({ rows }) {
         </table>
       </div>
       <div className="mt-2 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint, lineHeight: 1.6 }}>
-        One row per target, so a project with several targets appears several times. On track means the target
+        One row per target, so a project with several targets appears several times. The list opens at the{" "}
+        {TARGET_ROWS_COLLAPSED} highest-priority targets; <b>Show all</b> adds the rest and scrolls them inside this
+        panel rather than lengthening the page. On track means the target
         completion date is more than three days away and the target has not yet been reached. Critical means the
         deadline is within three days; overdue means the deadline has passed. A target counts as delivered when
         Actual output reaches Target qty. The system permanently records the date of the first qualifying Actual output
@@ -3689,12 +3822,14 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [duplicatesOnly, setDuplicatesOnly] = useState(false);
   const [addingProject, setAddingProject] = useState(false);
 
+  const userId = user?.id;
+
   useEffect(() => {
     let alive = true;
     /* Settled independently and deliberately. Awaiting them together meant one
        rejection discarded the other's result, so a missing targets table took
        every hand-typed status, contract and remark off the screen with it. */
-    Promise.allSettled([loadManual(), loadTargets()]).then(([m, t]) => {
+    once("manual+targets", () => Promise.allSettled([loadManual(), loadTargets()])).then(([m, t]) => {
       if (!alive) return;
       const manualState = settleLoad(m);
       const targetState = settleLoad(t);
@@ -3706,8 +3841,13 @@ export default function ProjectLedger({ user, onSignOut }) {
       ].filter(Boolean);
       if (problems.length) setSaveMessage(`Could not load ${problems.join(" and ")}.`);
     });
-    if (isConfigured && supabase && user?.id) {
-      supabase.from("profiles").select("username, role, force_password_change, multiple_targets_enabled").eq("id", user.id).maybeSingle()
+    if (isConfigured && supabase && userId) {
+      /* Shared for the same reason as the loads above, and it matters more here
+         than it looks: a discarded profile row leaves `role` at its "user"
+         default, so an administrator silently loses the admin UI. */
+      once(`profile:${userId}`, () => supabase.from("profiles")
+        .select("username, role, force_password_change, multiple_targets_enabled")
+        .eq("id", userId).maybeSingle())
         .then(({ data }) => {
           if (!alive || !data) return;
           if (data.username) setUsername(data.username);
@@ -3717,7 +3857,11 @@ export default function ProjectLedger({ user, onSignOut }) {
         });
     }
     return () => { alive = false; };
-  }, [user]);
+    /* Keyed on the user's ID and not on the user object. AuthGate hands down
+       `session.user`, and a token refresh produces a new object with the same
+       contents — so depending on the object re-ran this whole load on every
+       refresh, throwing away whatever was still in flight each time. */
+  }, [userId]);
 
   /* Apply the shared dataset on initial load and after an import or restore. */
   const applyDataset = (row) => {
@@ -3734,16 +3878,17 @@ export default function ProjectLedger({ user, onSignOut }) {
 
   useEffect(() => {
     let alive = true;
-    loadDataset().then((row) => {
-      if (!alive) return;
-      applyDataset(row);
-      setDataReady(true);
-    }).catch((error) => {
-      if (!alive) return;
-      setSourceLabel("Could not load the saved ledger");
-      setLog([{ warn: true, text: `Could not load the saved ledger: ${error.message}` }]);
-      setDataReady(true);
-    });
+    once("dataset", () => withTimeout(loadDataset(), DATASET_TIMEOUT_MS, "The saved ledger"))
+      .then((row) => {
+        if (!alive) return;
+        applyDataset(row);
+        setDataReady(true);
+      }).catch((error) => {
+        if (!alive) return;
+        setSourceLabel("Could not load the saved ledger");
+        setLog([{ warn: true, text: `Could not load the saved ledger: ${error.message}. Reload the page to try again.` }]);
+        setDataReady(true);
+      });
     return () => { alive = false; };
   }, []);
 
@@ -4206,9 +4351,17 @@ export default function ProjectLedger({ user, onSignOut }) {
      so it is reported: without this the person stays on the admin's list for
      the rest of the heartbeat window after they have plainly left. Failure is
      ignored — the row expires by itself, which is the whole design. */
-  const signOutAndClearPresence = async () => {
+  /* Signing out is not allowed to wait for anything.
+
+     Clearing presence used to be awaited here, so while any request was slow to
+     come back the button did nothing at all — no spinner, no error, no sign-out
+     — and the only way out of the page was to close the tab. The presence row
+     expires on its own, which is what the empty catch below already conceded:
+     this call is best-effort, and best-effort work must never stand between
+     somebody and the door. Fired and left to finish on its own. */
+  const signOutAndClearPresence = () => {
     if (isConfigured && supabase) {
-      try { await supabase.rpc("clear_ledger_presence"); } catch { /* expires anyway */ }
+      Promise.resolve(supabase.rpc("clear_ledger_presence")).catch(() => { /* expires anyway */ });
     }
     onSignOut();
   };
