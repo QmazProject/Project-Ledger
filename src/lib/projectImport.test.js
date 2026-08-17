@@ -7,8 +7,13 @@ import {
   extendLegacyAssignments, resolvedEntry, importedChanges,
   IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
   mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore, duplicateProjectIds,
-  buildManualProject, addProjectToStore, appendDatasetNote,
+  buildManualProject, addProjectToStore, appendDatasetNote, setWorkbookSheetReader,
 } from "./projectImport.js";
+
+/* projectImport does not import xlsx itself — that static import used to drag
+   the whole parser into the browser startup chunk. In the app loadXlsx()
+   registers this; here the test file plays that part, once, up front. */
+setWorkbookSheetReader(XLSX.utils.sheet_to_json);
 
 const workbook = (sheets) => {
   const book = XLSX.utils.book_new();
@@ -661,4 +666,27 @@ test("the data-source label records recent changes without growing without limit
   /* A fresh import replaces the label outright, so the notes start again. */
   assert.equal(appendDatasetNote("Imported master · NEW.xlsx", "A - 2026 added"),
     "Imported master · NEW.xlsx • A - 2026 added");
+});
+
+/* The sheet reader is injected rather than statically imported, so there is a
+   window in which it could be missing. Reading a workbook then has to fail
+   loudly: an empty grid would read as "the workbook holds no projects", which
+   merges as a dataset-wide deletion of everybody's data. */
+test("reading a workbook without the Excel library loaded throws instead of reporting an empty workbook", () => {
+  const book = masterBook();
+  const money = workbook({ COLLECTIBLES: [
+    ["Project ID", "Net Amount (Check Amount)"],
+    ["QMB-001", 12_000_000],
+  ] });
+  setWorkbookSheetReader(null);
+  try {
+    assert.throws(() => readMasterWorkbook(book, { currentYear: 2026 }), /not loaded/i,
+      "a missing parser is an error, never an empty sheet");
+    assert.throws(() => readCollectiblesWorkbook(money), /not loaded/i);
+  } finally {
+    setWorkbookSheetReader(XLSX.utils.sheet_to_json);
+  }
+
+  const { dim } = readMasterWorkbook(book, { currentYear: 2026 });
+  assert.ok(dim.size > 0, "and the same workbook reads normally once the reader is registered again");
 });

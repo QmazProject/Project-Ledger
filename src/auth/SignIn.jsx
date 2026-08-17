@@ -74,14 +74,22 @@ export default function SignIn() {
     const { data, error: functionError } = await supabase.functions.invoke("auth-login", {
       body: { username: normalizedUsername, password, ...(captchaEnabled ? { captcha_token: captchaToken } : {}) },
     });
-    if (!functionError && data?.session) await supabase.auth.setSession(data.session);
+    let sessionError = null;
+    if (!functionError && data?.session) {
+      try {
+        ({ error: sessionError } = await supabase.auth.setSession(data.session));
+      } catch (setSessionError) {
+        sessionError = setSessionError;
+      }
+    }
     if (captchaEnabled) captchaRef.current?.resetCaptcha();
     setCaptchaToken("");
-    setBusy(false);
 
-    // on success the auth listener in AuthGate swaps this screen out
-    if (functionError || data?.error) {
-      setError(readable({ message: await functionErrorMessage(functionError, data) }));
+    // On success the auth listener replaces this form with the application
+    // shell immediately. Only a failed attempt needs to release the button.
+    if (functionError || data?.error || sessionError || !data?.session) {
+      setBusy(false);
+      setError(readable({ message: await functionErrorMessage(sessionError || functionError, data) }));
       setPassword("");
     }
   };

@@ -1,5 +1,3 @@
-import * as XLSX from "xlsx";
-
 export const MASTER_START_YEAR = 2022;
 
 export const normalizeText = (value) => String(value ?? "")
@@ -42,9 +40,33 @@ export const displayProjectId = (projectId, year) => {
   return year ? `${id} - ${year}` : id;
 };
 
-const sheetGrid = (workbook, name) => XLSX.utils.sheet_to_json(workbook.Sheets[name], {
-  header: 1, raw: true, defval: "",
-});
+/* ---------------- the one thing here that needs SheetJS ----------------
+   Everything else in this module is plain data work, so importing xlsx at the
+   top of the file dragged ~441 kB (125 kB gzipped) of parser into the startup
+   chunk for every sign-in — including the majority of sign-ins that never touch
+   a workbook. Worse, the static import silently defeated the dynamic import()
+   in ProjectLedger: rolldown reported INEFFECTIVE_DYNAMIC_IMPORT and kept the
+   library in the main chunk anyway.
+
+   So the sheet reader is handed in instead. loadXlsx() registers it the moment
+   the library finishes downloading, which is necessarily before any workbook
+   object can exist to be read.
+---------------------------------------------------------------------- */
+
+let sheetToRows = null;
+
+/* Called with XLSX.utils.sheet_to_json once the library is loaded. */
+export function setWorkbookSheetReader(reader) {
+  sheetToRows = typeof reader === "function" ? reader : null;
+}
+
+const sheetGrid = (workbook, name) => {
+  /* Deliberately a throw and not an empty grid. An empty grid reads as "this
+     workbook contained no projects", which merges as a dataset-wide deletion —
+     exactly the silent-wipe failure the readiness rules exist to prevent. */
+  if (!sheetToRows) throw new Error("Excel tools are not loaded yet — setWorkbookSheetReader was never called.");
+  return sheetToRows(workbook.Sheets[name], { header: 1, raw: true, defval: "" });
+};
 
 const headerRow = (rows) => {
   for (let index = 0; index < Math.min(12, rows.length); index++)

@@ -1,23 +1,38 @@
-import { useState, useMemo, useRef, useEffect, useLayoutEffect } from "react";
-import * as XLSX from "xlsx";
+import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { supabase, isConfigured } from "./lib/supabase";
-import {
-  projectKey, todayMs, assessTargets, assessProjectTargets, assessTarget,
-  atRiskExposure, distinctProjectCount, isTrackable, isArchived,
-  validateTarget, targetWarnings, selectPrimaryTarget, TARGET_FIELDS, SCOPE_LABEL,
-} from "./lib/targets";
-import { groupTargetHistory, actionLabel, isEventOnly, isBlankValue } from "./lib/targetHistory";
+import { projectKey, todayMs, assessTargets, assessProjectTargets, atRiskExposure, distinctProjectCount, isArchived, validateTarget, selectPrimaryTarget, SCOPE_LABEL } from "./lib/targets";
 import {
   settleLoad, loadingState, isReady, hasFailed, projectTargets, targetsLabel,
-  buildManualSave, normalizeManualValue, fractionFromPercent, percentFromFraction,
+  buildManualSave, normalizeManualValue, fractionFromPercent,
 } from "./lib/panelData";
+import { cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook, assembleProjects, extendLegacyAssignments, resolvedEntry, importedChanges, IMPORT_AUDIT_FIELDS, IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog, mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore, duplicateProjectIds, buildManualProject, addProjectToStore, displayProjectId, appendDatasetNote } from "./lib/projectImport";
 import {
-  cleanText, numberOrNull, readMasterWorkbook, readCollectiblesWorkbook,
-  assembleProjects, extendLegacyAssignments, resolvedEntry, importedChanges,
-  IMPORT_AUDIT_FIELDS, IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
-  mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore, duplicateProjectIds,
-  buildManualProject, addProjectToStore, displayProjectId, appendDatasetNote,
-} from "./lib/projectImport";
+  ledgerReadiness, markLedgerStartupPoint, measureApproximateJsonBytes,
+  measureLedgerWork, recordLedgerStartupSince, startLedgerTiming,
+} from "./lib/ledgerStartup";
+/* Module scope the on-demand dialogs also need — see ./ledger/shared.jsx for
+   why it no longer lives in this file. */
+import { once, fmtDate, T, DISPLAY, BODY, MONO, money, compact, qty, pct, PROJECT_STATUS_OPTIONS, AUDIT_FIELD_LABELS, AUDIT_DISPLAY_LABELS, auditValue, BUCKET_COLOR, pillStyle, emptyTarget } from "./ledger/shared";
+import EditCell from "./ledger/EditCell";
+import LazyDialog from "./ledger/LazyDialog";
+import { loadDialog } from "./ledger/loadDialog";
+import { useVirtualRows } from "./ledger/useVirtualRows";
+import {
+  AUDIT_TABLE, numOrNull, newBatchId, callTargetRpc, saveTargets, loadXlsx,
+} from "./ledger/data";
+
+/* ---------------- dialogs downloaded on demand ----------------
+   None of these is needed to render the project rows, and two of them are only
+   ever reachable by an administrator. Keeping them out of the startup chunk is
+   the point; the loaders are declared here, at module scope, because a loader
+   created during render would restart the download on every render.
+
+   A failure to download any of them is contained by LazyDialog and leaves the
+   ledger itself untouched. */
+const loadAuditModal = loadDialog("audit_modal", () => import("./ledger/AuditModal"));
+const loadTargetsModal = loadDialog("targets_modal", () => import("./ledger/TargetsModal"));
+const loadAdminPanel = loadDialog("admin_panel", () => import("./ledger/AdminPanel"));
+const loadDatasetHistory = loadDialog("previous_data", () => import("./ledger/DatasetHistoryModal"));
 
 /* ==================================================================
    Project Ledger — QM Builders
@@ -49,11 +64,12 @@ const assemble = assembleProjects;
 ------------------------------------------------- */
 
 const DATASET_TABLE = "project_ledger_dataset";
-const DATASET_VERSION_TABLE = "project_ledger_dataset_versions";
 const DATASET_ID = "current";
 const DATASET_VERSION = 2;
 const LEDGER_UPLOAD_TABLE = "project_ledger_uploads";
 const LEDGER_UPLOAD_BUCKET = "project-ledger-uploads";
+const SECONDARY_LOAD_TIMEOUT_MS = 12_000;
+
 
 const serialiseStore = (store) => ({
   version: DATASET_VERSION,
@@ -67,43 +83,6 @@ const deserialiseStore = (payload) => ({
   legacy: new Map(Array.isArray(payload?.legacy) ? payload.legacy : []),
 });
 
-/* ---------------- one request per mount ----------------
-   React StrictMode (see main.jsx) mounts, unmounts and remounts every component
-   in development, so each of the mount effects below runs twice. Each one used
-   to call its loader twice and disarm the first call's `alive` flag in between,
-   which meant the response that actually arrived was the one the effect had
-   already agreed to ignore — and the panel's readiness depended entirely on a
-   *second* request. When that second request did not complete, the panel sat on
-   "Loading the ledger…" for as long as it was left open, with a successful 200
-   for the first one visible in the network log the whole time.
-
-   Sharing one promise removes the second request altogether: both invocations
-   await the same response, and whichever instance is still mounted applies it.
-   The `alive` guards stay exactly where they are — they still do their real job
-   of not calling setState on an unmounted component. They simply no longer
-   throw away the only answer the page is going to get.
-
-   The entry is cleared once it settles, so a later mount — signing out and back
-   in — fetches again rather than replaying a stale snapshot. The identity check
-   in the cleanup matters: without it a settling promise would delete a newer
-   request that had already claimed the same key.
-------------------------------------------------- */
-
-const inFlight = new Map();
-
-function once(key, start) {
-  const existing = inFlight.get(key);
-  if (existing) return existing;
-  let promise;
-  /* Promise.resolve, not the value itself: a supabase query builder is a
-     *thenable* and not a promise — it implements `then` so it can be awaited,
-     and nothing else. Calling `.finally` straight on one throws. */
-  promise = Promise.resolve(start()).finally(() => {
-    if (inFlight.get(key) === promise) inFlight.delete(key);
-  });
-  inFlight.set(key, promise);
-  return promise;
-}
 
 /** Rejects rather than waiting forever.
  *
@@ -130,17 +109,33 @@ const DATASET_TIMEOUT_MS = 8_000;
 /** null when nothing has been uploaded yet, or when Supabase is not configured */
 async function loadDataset() {
   if (!isConfigured || !supabase) return null;
-  const { data, error } = await supabase.from(DATASET_TABLE)
-    .select("payload, source_label, uploaded_by_username, uploaded_at")
-    .eq("id", DATASET_ID).maybeSingle();
-  if (error) throw error;
-  if (!data?.payload) return null;
-  return {
-    store: deserialiseStore(data.payload),
-    label: data.source_label || "",
-    username: data.uploaded_by_username || "",
-    at: data.uploaded_at || "",
-  };
+  const finishRequest = startLedgerTiming("dataset.request_and_json");
+  try {
+    const { data, error } = await supabase.from(DATASET_TABLE)
+      .select("payload, source_label, uploaded_by_username, uploaded_at")
+      .eq("id", DATASET_ID).maybeSingle();
+    finishRequest({ outcome: error ? "error" : "ok", projectCount: data?.payload?.dim?.length || 0 });
+    if (error) throw error;
+    if (!data?.payload) return null;
+    measureApproximateJsonBytes(data.payload);
+    const store = measureLedgerWork("dataset.deserialise", () => deserialiseStore(data.payload), {
+      projectCount: data.payload.dim?.length || 0,
+    });
+    return {
+      store,
+      label: data.source_label || "",
+      username: data.uploaded_by_username || "",
+      at: data.uploaded_at || "",
+    };
+  } catch (error) {
+    finishRequest({ outcome: "error" });
+    throw error;
+  }
+}
+
+/** Share the StrictMode request without making authentication wait for it. */
+async function loadCurrentDataset() {
+  return once("dataset", () => withTimeout(loadDataset(), DATASET_TIMEOUT_MS, "The saved ledger"));
 }
 
 async function saveDataset(store, label, changes = []) {
@@ -155,15 +150,6 @@ async function saveDataset(store, label, changes = []) {
   return data || new Date().toISOString();
 }
 
-async function loadDatasetVersions() {
-  if (!isConfigured || !supabase) return [];
-  const { data, error } = await supabase.from(DATASET_VERSION_TABLE)
-    .select("id, source_label, project_count, uploaded_by_username, uploaded_at, saved_reason, saved_by_username, saved_at")
-    .order("saved_at", { ascending: false })
-    .limit(25);
-  if (error) throw error;
-  return data || [];
-}
 
 async function restoreDatasetVersion(versionId) {
   if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
@@ -230,12 +216,8 @@ async function archiveLedgerUpload(file, userId) {
    spelling the row was actually written under so an update still finds it.
 ------------------------------------------------- */
 
-const AUDIT_TABLE = "project_manual_update_audit";
 const TARGET_TABLE = "project_targets";
 
-const blankToNull = (v) => (v === "" || v === null || v === undefined ? null : v);
-const numOrNull = (v) => (v === "" || v === null || v === undefined ? null : toNum(v));
-const newBatchId = () => (globalThis.crypto?.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
 
 /** One audit row. Field-level granularity is deliberate: the panel's
  *  right-click history reads (project_id, column_name) against a matching
@@ -270,40 +252,58 @@ async function insertAudit(rows) {
 /** Map of canonical project key → { storedId, values }. */
 async function loadManual() {
   if (!isConfigured || !supabase) return new Map();
-  const { data, error } = await supabase.from("project_manual_updates")
-    .select("project_id, status, contract_amount, remarks, engineer, swa");
-  if (error) throw error;
-  const byKey = new Map();
-  for (const row of data || []) {
-    const values = { note: row.remarks };
-    if (row.status !== null && row.status !== undefined) values.status = row.status;
-    if (row.contract_amount !== null && row.contract_amount !== undefined) values.contract = row.contract_amount;
-    /* An absent override must not become a value. These are merged over the
-       imported row, so carrying a null here would blank out the Senior engineer
-       the workbook supplied for every project nobody has typed one against. */
-    if (row.engineer !== null && row.engineer !== undefined && row.engineer !== "") values.engineer = row.engineer;
-    if (row.swa !== null && row.swa !== undefined) values.swa = row.swa;
-    byKey.set(projectKey(row.project_id), { storedId: row.project_id, values });
+  const finishRequest = startLedgerTiming("manual.request_and_json");
+  try {
+    const { data, error } = await supabase.from("project_manual_updates")
+      .select("project_id, status, contract_amount, remarks, engineer, swa");
+    finishRequest({ outcome: error ? "error" : "ok", manualCount: data?.length || 0 });
+    if (error) throw error;
+    return measureLedgerWork("manual.map", () => {
+      const byKey = new Map();
+      for (const row of data || []) {
+        const values = { note: row.remarks };
+        if (row.status !== null && row.status !== undefined) values.status = row.status;
+        if (row.contract_amount !== null && row.contract_amount !== undefined) values.contract = row.contract_amount;
+        /* An absent override must not become a value. These are merged over the
+           imported row, so carrying a null here would blank out the Senior engineer
+           the workbook supplied for every project nobody has typed one against. */
+        if (row.engineer !== null && row.engineer !== undefined && row.engineer !== "") values.engineer = row.engineer;
+        if (row.swa !== null && row.swa !== undefined) values.swa = row.swa;
+        byKey.set(projectKey(row.project_id), { storedId: row.project_id, values });
+      }
+      return byKey;
+    }, { manualCount: data?.length || 0 });
+  } catch (error) {
+    finishRequest({ outcome: "error" });
+    throw error;
   }
-  return byKey;
 }
 
 /** Map of canonical project key → target rows, soonest deadline first. */
 async function loadTargets() {
   if (!isConfigured || !supabase) return new Map();
-  const { data, error } = await supabase.from(TARGET_TABLE)
-    .select("id, project_id, project_key, scope, target_qty, unit, start_date, target_completion, actual_completion, actual_output, archived_at, created_at, updated_at");
-  if (error) throw error;
-  const byKey = new Map();
-  for (const row of data || []) {
-    const key = row.project_key || projectKey(row.project_id);
-    if (!byKey.has(key)) byKey.set(key, []);
-    byKey.get(key).push(row);
+  const finishRequest = startLedgerTiming("targets.request_and_json");
+  try {
+    const { data, error } = await supabase.from(TARGET_TABLE)
+      .select("id, project_id, project_key, scope, target_qty, unit, start_date, target_completion, actual_completion, actual_output, archived_at, created_at, updated_at");
+    finishRequest({ outcome: error ? "error" : "ok", targetCount: data?.length || 0 });
+    if (error) throw error;
+    return measureLedgerWork("targets.map_and_sort", () => {
+      const byKey = new Map();
+      for (const row of data || []) {
+        const key = row.project_key || projectKey(row.project_id);
+        if (!byKey.has(key)) byKey.set(key, []);
+        byKey.get(key).push(row);
+      }
+      for (const list of byKey.values())
+        list.sort((a, b) => String(a.target_completion || "9999").localeCompare(String(b.target_completion || "9999"))
+                            || String(a.created_at || "").localeCompare(String(b.created_at || "")));
+      return byKey;
+    }, { targetCount: data?.length || 0 });
+  } catch (error) {
+    finishRequest({ outcome: "error" });
+    throw error;
   }
-  for (const list of byKey.values())
-    list.sort((a, b) => String(a.target_completion || "9999").localeCompare(String(b.target_completion || "9999"))
-                        || String(a.created_at || "").localeCompare(String(b.created_at || "")));
-  return byKey;
 }
 
 /** Every audit row belonging to a set of targets, newest first.
@@ -313,17 +313,6 @@ async function loadTargets() {
  *  the workbook spelled it that day — which is the same weakness project_key()
  *  exists to work around. A target's UUID has no such problem, so a target's
  *  history stays attached to it whatever happens to the project's display ID. */
-async function loadTargetHistory(targetIds) {
-  if (!isConfigured || !supabase) return [];
-  const ids = (targetIds || []).filter(Boolean);
-  if (!ids.length) return [];
-  const { data, error } = await supabase.from(AUDIT_TABLE)
-    .select("id, target_id, target_scope, column_name, field_key, old_value, new_value, action, source, batch_id, changed_by, changed_by_username, changed_at")
-    .in("target_id", ids)
-    .order("changed_at", { ascending: false });
-  if (error) throw error;
-  return data || [];
-}
 
 /** Project-level save. Targets are never written here — a target edit must not
  *  rewrite status and contract as a side effect, which is what the single
@@ -381,48 +370,8 @@ async function saveManualRow(id, values, oldValues, userId, username, changedFie
    screen is what is stored either way.
 ------------------------------------------------- */
 
-const targetColumns = (v) => ({
-  scope: blankToNull(v.scope),
-  target_qty: numOrNull(v.target_qty),
-  unit: blankToNull(v.unit),
-  start_date: blankToNull(v.start_date),
-  target_completion: blankToNull(v.target_completion),
-  actual_completion: blankToNull(v.actual_completion),
-  actual_output: numOrNull(v.actual_output),
-});
 
-/* PostgREST surfaces a RAISE EXCEPTION as an error with the raised message,
-   which is what the modal shows. Anything without one falls back to the code so
-   a failure is never reported as a blank string. */
-async function callTargetRpc(fn, args) {
-  const { data, error } = await supabase.rpc(fn, args);
-  if (error) throw new Error(error.message || error.details || error.code || `${fn} failed`);
-  return data;
-}
 
-/* Administrator deletions.
-
-   Permanent, and the only writes in this file that destroy rather than add.
-   `isAdmin` in this browser decides whether the controls are drawn and nothing
-   more: the role is re-read from profiles inside each function, so a non-admin
-   who calls them directly is refused by the database rather than by the UI.
-
-   The reason is required by the database, not merely collected here. Once the
-   rows are gone it is the only remaining explanation of why. */
-async function deleteTargetPermanently(targetId, reason) {
-  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
-  const rows = await callTargetRpc("admin_delete_project_target", {
-    p_target_id: targetId, p_reason: reason,
-  });
-  return Array.isArray(rows) ? rows[0] : rows;
-}
-
-async function deleteAuditEntries(auditIds, reason) {
-  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
-  return callTargetRpc("admin_delete_audit_entries", {
-    p_audit_ids: auditIds, p_reason: reason,
-  });
-}
 
 /* Every ID spelling the project's rows were filed under, resolved here rather
    than in SQL: a project imported before the year joined the ID has its manual
@@ -437,54 +386,37 @@ async function deleteProjectRecords(projectIds, reason) {
   return (Array.isArray(rows) ? rows[0] : rows) || {};
 }
 
-/* Shared by both deletion paths so the wording of the warning cannot drift
-   between them. Returns the typed reason, or null if the user backed out at
-   either step. */
-function confirmPermanentDelete(what, detail) {
-  if (!window.confirm(`Permanently delete ${what}?\n\n${detail}\n\nThis cannot be undone from the panel.`)) return null;
-  const reason = window.prompt(`Reason for deleting ${what}. This is stored in the purge log and is required.`, "");
-  if (reason === null) return null;
-  if (!reason.trim()) {
-    window.alert("A reason is required. Nothing was deleted.");
-    return null;
-  }
-  return reason.trim();
-}
 
-/* ---------------- access ----------------
-   The named permissions an administrator can grant one at a time. An admin holds
-   all of them implicitly, so this list is only consulted for everybody else.
-   Kept in step with the check constraint in
-   20260831000000_ledger_access_permissions.sql — a key here the database rejects
-   would look like a permission nobody can hold. */
-const LEDGER_PERMISSIONS = [
-  { k: "add_project", label: "Add project",
-    detail: "Create a project by hand in the Projects panel.",
-    enforced: false,
-    note: "Hides the form only. Writing to the shared dataset is something every signed-in user can already do in order to import a workbook, so this is not a security boundary." },
-  { k: "delete_project", label: "Delete project",
-    detail: "Permanently delete a project, its targets, audit history and hand-typed values. Also covers deleting a single target.",
-    enforced: true },
-  { k: "delete_audit", label: "Delete audit trail",
-    detail: "Delete individual audit entries, or a whole cell's history.",
-    enforced: true },
-  { k: "view_presence", label: "See who is signed in",
-    detail: "Show the list of users with the panel open, in the header.",
-    enforced: true },
-  { k: "view_duplicates", label: "View duplicate Project IDs",
-    detail: "Right-click the ID column or header to list Project IDs appearing more than once.",
-    enforced: false,
-    note: "Arithmetic over rows the user can already see, done in the browser. There is nothing to enforce server-side." },
-  { k: "previous_data", label: "Previous data",
-    detail: "Restore the shared ledger to an earlier saved state.",
-    enforced: true },
-];
 
 async function loadMyPermissions() {
   if (!isConfigured || !supabase) return [];
-  const { data, error } = await supabase.rpc("my_ledger_permissions");
-  if (error) throw new Error(error.message || "Could not read your access.");
-  return data || [];
+  const finish = startLedgerTiming("permissions.request_and_json");
+  try {
+    const { data, error } = await supabase.rpc("my_ledger_permissions");
+    finish({ outcome: error ? "error" : "ok", count: data?.length || 0 });
+    if (error) throw new Error(error.message || "Could not read your access.");
+    return data || [];
+  } catch (error) {
+    finish({ outcome: "error" });
+    throw error;
+  }
+}
+
+async function loadProfile(userId) {
+  if (!isConfigured || !supabase || !userId) throw new Error("The signed-in profile could not be identified.");
+  const finish = startLedgerTiming("profile.request_and_json");
+  try {
+    const { data, error } = await supabase.from("profiles")
+      .select("username, role, force_password_change, multiple_targets_enabled")
+      .eq("id", userId).maybeSingle();
+    finish({ outcome: error || !data ? "error" : "ok", count: data ? 1 : 0 });
+    if (error) throw error;
+    if (!data) throw new Error("Your account settings were not found.");
+    return data;
+  } catch (error) {
+    finish({ outcome: "error" });
+    throw error;
+  }
 }
 
 /* ---------------- presence ----------------
@@ -510,12 +442,14 @@ async function recordPresence() {
      supabase.rpc RETURNS its error rather than throwing, so the error field has
      to be read; a bare try/catch around this call would catch nothing. */
   let failure = "";
+  const finish = startLedgerTiming("presence.heartbeat");
   try {
     const { error } = await supabase.rpc("record_ledger_presence");
     if (error) failure = error.message || "unknown error";
   } catch (thrown) {
     failure = thrown.message || "request failed";   // network, not PostgREST
   }
+  finish({ outcome: failure ? "error" : "ok" });
   if (failure && !presenceBeatWarned) {
     presenceBeatWarned = true;
     console.warn(`Project Ledger: presence heartbeat failed — the admin header will show nobody signed in. ${failure}`);
@@ -524,77 +458,19 @@ async function recordPresence() {
 
 async function listPresence() {
   if (!isConfigured || !supabase) return [];
-  const { data, error } = await supabase.rpc("list_ledger_presence", { p_within_seconds: PRESENCE_WINDOW_S });
-  if (error) throw new Error(error.message || "Could not read who is signed in.");
-  return data || [];
+  const finish = startLedgerTiming("presence.list");
+  try {
+    const { data, error } = await supabase.rpc("list_ledger_presence", { p_within_seconds: PRESENCE_WINDOW_S });
+    finish({ outcome: error ? "error" : "ok", count: data?.length || 0 });
+    if (error) throw new Error(error.message || "Could not read who is signed in.");
+    return data || [];
+  } catch (error) {
+    finish({ outcome: "error" });
+    throw error;
+  }
 }
 
-async function saveTargets({ projectId, creates = [], updates = [], archives = [], restores = [] }) {
-  if (!isConfigured || !supabase) throw new Error("Supabase is not configured.");
-  /* One batch id for the whole save, passed into every call, so the field rows
-     written across several targets still read back as a single event. */
-  const batchId = newBatchId();
-  const created = [];
 
-  for (const target of creates) {
-    const c = targetColumns(target);
-    created.push(await callTargetRpc("create_project_target", {
-      p_project_id: projectId,
-      p_scope: c.scope,
-      p_target_qty: c.target_qty,
-      p_unit: c.unit,
-      p_start_date: c.start_date,
-      p_target_completion: c.target_completion,
-      p_actual_completion: c.actual_completion,
-      p_actual_output: c.actual_output,
-      p_batch_id: batchId,
-    }));
-  }
-
-  /* Only which targets to send is decided here. Which *fields* changed is
-     decided in the database against the current row, so a stale copy in this
-     browser cannot cause a change to go unaudited. */
-  for (const { id, after } of updates) {
-    const c = targetColumns(after);
-    await callTargetRpc("update_project_target", {
-      p_target_id: id,
-      /* A target migrated from the old Project-ID-only model keeps that stored
-         identity. New targets use Project ID - Year. Sending each existing
-         target's own identity lets both live together on the latest-year row. */
-      p_project_id: after.project_id || projectId,
-      p_scope: c.scope,
-      p_target_qty: c.target_qty,
-      p_unit: c.unit,
-      p_start_date: c.start_date,
-      p_target_completion: c.target_completion,
-      p_actual_completion: c.actual_completion,
-      p_actual_output: c.actual_output,
-      p_batch_id: batchId,
-    });
-  }
-
-  for (const target of archives)
-    await callTargetRpc("set_project_target_archived", {
-      p_target_id: target.id, p_project_id: target.project_id || projectId, p_archived: true, p_batch_id: batchId,
-    });
-
-  for (const target of restores)
-    await callTargetRpc("set_project_target_archived", {
-      p_target_id: target.id, p_project_id: target.project_id || projectId, p_archived: false, p_batch_id: batchId,
-    });
-
-  return { batchId, created };
-}
-
-/* The date arithmetic behind a target's standing now lives in ./lib/targets so
-   it can be exercised with an injected "today". Only formatting is left here. */
-const fmtDate = (s) => {
-  if (!s) return "";
-  const t = Date.parse(s + "T00:00:00");
-  if (isNaN(t)) return s;
-  const d = new Date(t);
-  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-};
 
 /* ---------------- presentation ---------------- */
 
@@ -610,30 +486,6 @@ const DIMS = [
   { k: "hasTarget", label: "Targets", w: 150 },
 ];
 
-const T = {
-  paper: "#E9EDE7", paper2: "#F4F7F2", panel: "#FFFFFF",
-  ink: "#16211C", inkSoft: "#4C5B53", inkFaint: "#7F8D84",
-  rule: "#C6CEC4", ruleSoft: "#DEE4DA",
-  collected: "#0E5B57", works: "#9A4B12", retention: "#6E6014", cash: "#3C6E9E", bad: "#8C2F26",
-};
-const DISPLAY = '"Archivo","Helvetica Neue",system-ui,sans-serif';
-const BODY = '"IBM Plex Sans",system-ui,-apple-system,sans-serif';
-const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
-
-const P = "\u20B1";
-const money = (n) => n === null || n === undefined || !isFinite(n) ? "—"
-  : (n < 0 ? "-" : "") + P + Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
-const compact = (n) => {
-  if (n === null || n === undefined || !isFinite(n)) return "—";
-  const a = Math.abs(n), s = n < 0 ? "-" : "";
-  if (a >= 1e9) return s + P + (a / 1e9).toFixed(2) + "B";
-  if (a >= 1e6) return s + P + (a / 1e6).toFixed(1) + "M";
-  if (a >= 1e3) return s + P + (a / 1e3).toFixed(0) + "K";
-  return money(n);
-};
-const qty = (n) => (n === null || n === undefined || n === "" || isNaN(Number(n)))
-  ? "—" : Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
-const pct = (n) => (n === null || n === undefined || !isFinite(n) ? "—" : (n * 100).toFixed(1) + "%");
 const sum = (rows, k) => rows.reduce((t, r) => t + (r[k] || 0), 0);
 
 const COLS = [
@@ -697,29 +549,6 @@ const INLINE_TARGET_COLS = [
 ];
 const INLINE_TARGET_FIELD_KEYS = new Set(INLINE_TARGET_COLS.map((column) => column.k));
 
-/* The name each field is stored under in the audit trail. This is what the
-   history query matches on, so it follows the database and not the column
-   heading — see SCOPE_LABEL. */
-const AUDIT_FIELD_LABELS = Object.fromEntries([
-  ...IMPORT_AUDIT_FIELDS,
-  ...TARGET_FIELDS,
-  ["note", "Remarks"],
-]);
-
-/* ...and the name to show above that history, which is the one on the column. */
-const AUDIT_DISPLAY_LABELS = { ...AUDIT_FIELD_LABELS, scope: SCOPE_LABEL };
-
-/* The trail stores what was stored. SWA is a fraction there — from Excel and
-   from the panel alike — so it has to be rendered the way the column renders
-   it, or every row reads as a hundredfold error. Formatting on the way out
-   rather than on the way in also covers the history written before the column
-   was editable. */
-const AUDIT_VALUE_FORMATTERS = {
-  swa: (raw) => { const n = toNum(raw); return n === null ? raw : pct(n); },
-};
-const auditValue = (field, raw) => raw === null || raw === undefined || raw === ""
-  ? "—"
-  : (AUDIT_VALUE_FORMATTERS[field] ? AUDIT_VALUE_FORMATTERS[field](raw) : raw);
 
 /* ---------------- export ----------------
    The export keeps one row per project, because everything downstream of it
@@ -814,13 +643,14 @@ function Meter({ label, segments, legend }) {
 
 /* ---------------- import panel ---------------- */
 
-function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, canRestorePrevious, forceOpen }) {
+function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, disabled, disabledReason,
+                       onPrevious, canRestorePrevious, forceOpen }) {
   const [open, setOpen] = useState(false);
   const [over, setOver] = useState(false);
   const inputRef = useRef(null);
   const shown = open || forceOpen;
 
-  const take = (files) => { if (files && files.length) onLoad([...files]); };
+  const take = (files) => { if (!disabled && files && files.length) onLoad([...files]); };
 
   return (
     <div className="mb-4 rounded-sm" style={{ background: T.panel, border: `1px solid ${T.rule}` }}>
@@ -830,19 +660,20 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
           {uploadedBy && <span style={{ color: T.inkFaint }}> · {uploadedBy}</span>}
         </div>
         <div className="flex items-center gap-2">
-          {canRestorePrevious && <button type="button" onClick={onPrevious} disabled={busy || !isConfigured}
+          {canRestorePrevious && <button type="button" onClick={onPrevious} disabled={busy || disabled || !isConfigured}
                   className="rounded-sm px-2.5 py-1 text-xs"
                   title="Restore the shared ledger as it was before an earlier Excel update"
                   style={{ border: `1px solid ${T.rule}`, color: T.inkSoft,
-                           opacity: busy || !isConfigured ? 0.6 : 1 }}>
+                           opacity: busy || disabled || !isConfigured ? 0.6 : 1 }}>
             Previous data
           </button>}
           {/* with no ledger loaded there is nothing to close back to, so the drop
               zone stays open and the toggle is left out */}
           {!forceOpen && (
-            <button type="button" onClick={() => setOpen(!open)} className="rounded-sm px-2.5 py-1 text-xs"
+            <button type="button" onClick={() => setOpen(!open)} disabled={disabled}
+                    className="rounded-sm px-2.5 py-1 text-xs"
                     style={{ border: `1px solid ${T.ink}`, background: open ? T.ink : T.panel,
-                             color: open ? T.paper2 : T.ink }}>
+                             color: open ? T.paper2 : T.ink, opacity: disabled ? 0.55 : 1 }}>
               {open ? "Close" : "Update from Excel"}
             </button>
           )}
@@ -852,7 +683,7 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
       {shown && (
         <div className="px-3 pb-3" style={{ borderTop: `1px solid ${T.ruleSoft}` }}>
           <div
-            onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+            onDragOver={(e) => { e.preventDefault(); if (!disabled) setOver(true); }}
             onDragLeave={() => setOver(false)}
             onDrop={(e) => { e.preventDefault(); setOver(false); take(e.dataTransfer.files); }}
             className="mt-3 rounded-sm px-4 py-7 text-center"
@@ -875,13 +706,18 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
               Sheet tabs read: {IMPORT_SHEET_RULES.map((rule) => <b key={rule.key} style={{ color: T.inkSoft }}>{rule.label}{rule.key === "collectibles" ? "" : " · "}</b>)}
               — a file with none of these tabs is rejected and the ledger is left unchanged.
             </p>
-            <input ref={inputRef} type="file" accept=".xlsx,.xls,.xlsm" multiple hidden
+            <input ref={inputRef} type="file" accept=".xlsx,.xls,.xlsm" multiple hidden disabled={disabled}
                    onChange={(e) => take(e.target.files)} />
-            <button type="button" onClick={() => inputRef.current && inputRef.current.click()} disabled={busy}
+            <button type="button" onClick={() => inputRef.current && inputRef.current.click()} disabled={busy || disabled}
                     className="mt-3 rounded-sm px-3 py-1.5 text-xs"
-                    style={{ border: `1px solid ${T.ink}`, background: T.ink, color: T.paper2, opacity: busy ? 0.6 : 1 }}>
-              {busy ? "Reading…" : "Choose files"}
+                    title={disabled ? disabledReason : undefined}
+                    style={{ border: `1px solid ${T.ink}`, background: T.ink, color: T.paper2,
+                             opacity: busy || disabled ? 0.6 : 1 }}>
+              {busy ? "Reading…" : disabled ? "Waiting for server…" : "Choose files"}
             </button>
+            {disabled && disabledReason && (
+              <div className="mt-2 text-[11px]" style={{ color: T.inkFaint }}>{disabledReason}</div>
+            )}
           </div>
 
           {log.length > 0 && (
@@ -899,41 +735,116 @@ function ImportPanel({ onLoad, sourceLabel, uploadedBy, log, busy, onPrevious, c
   );
 }
 
-function EmptyLedger({ loading, configured }) {
-  /* Counts while the load is outstanding.
-     The load is bounded (see DATASET_TIMEOUT_MS), so this can only reach that
-     many seconds before the screen resolves one way or the other. If it ever
-     runs past it, the number is the diagnosis: the effect holding the timeout
-     is not running. And if the number stops advancing, nothing is running at
-     all — the page is blocked rather than waiting. */
-  const [waited, setWaited] = useState(0);
-  useEffect(() => {
-    if (!loading) return undefined;
-    const started = Date.now();
-    const tick = setInterval(() => setWaited(Math.round((Date.now() - started) / 1000)), 1000);
-    return () => clearInterval(tick);
-  }, [loading]);
-
+function EmptyLedger({ loading, configured, unavailable }) {
   return (
     <div className="rounded-sm px-6 py-12 text-center"
          style={{ background: T.panel, border: `1px solid ${T.rule}` }}>
       <div className="text-base uppercase"
            style={{ fontFamily: DISPLAY, fontWeight: 800, letterSpacing: ".05em" }}>
-        {loading ? "Loading the ledger…" : "No project data yet"}
+        {loading ? "Preparing the latest projects…" : unavailable ? "Latest ledger unavailable" : "No project data yet"}
       </div>
       {loading && (
-        <div className="mt-2 text-[11px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-          {waited}s · this resolves within {Math.round(DATASET_TIMEOUT_MS / 1000)}s either way
+        <div className="mx-auto mt-5 grid max-w-2xl gap-2" aria-hidden="true">
+          {[88, 72, 94].map((width) => (
+            <div key={width} style={{ height: 12, width: `${width}%`, margin: "0 auto",
+                                      background: T.ruleSoft, borderRadius: 2, opacity: 0.8 }} />
+          ))}
         </div>
       )}
-      {!loading && (
+      {!loading && !unavailable && (
         <p className="mx-auto mt-2 max-w-lg text-xs" style={{ color: T.inkSoft }}>
           {configured
             ? "Use the drop zone above to import the project master and collectibles workbooks. The figures are saved once and everybody signed in sees them."
             : "Supabase is not configured for this build, so nothing can be loaded or saved. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY, then import the workbooks."}
         </p>
       )}
+      {unavailable && (
+        <p className="mx-auto mt-2 max-w-lg text-xs" style={{ color: T.inkSoft }}>
+          The application remains available, but project data and all shared-data actions stay locked until Retry succeeds.
+        </p>
+      )}
     </div>
+  );
+}
+
+const loadLabel = (state) => state?.status === "ready" ? "Ready"
+  : state?.status === "failed" ? "Unavailable" : "Loading";
+
+function LedgerStartupStatus({ dataset, manual, targets, profile, permissions, onRetry }) {
+  const states = [
+    ["Latest ledger", dataset],
+    ["Saved updates", manual],
+    ["Targets", targets],
+    ["Account settings", profile],
+    ["Access controls", permissions],
+  ];
+  const failed = states.filter(([, state]) => state?.status === "failed");
+  const loading = states.filter(([, state]) => state?.status === "loading");
+  if (!failed.length && !loading.length) return null;
+
+  const datasetLoading = dataset.status === "loading";
+  const datasetFailed = dataset.status === "failed";
+  const criticalFailed = datasetFailed || manual.status === "failed" || profile.status === "failed";
+  const criticalLoading = datasetLoading || manual.status === "loading" || profile.status === "loading";
+  const secondaryFailed = targets.status === "failed" || permissions.status === "failed";
+  const title = datasetLoading ? "Loading the latest ledger from the server…"
+    : datasetFailed ? "Could not load the latest ledger from the server."
+    : criticalFailed ? "Project Ledger is read-only until required data is available."
+    : criticalLoading ? "Applying saved updates and checking account settings…"
+    : secondaryFailed ? "The ledger is ready — some secondary features are unavailable."
+    : "The ledger is ready — finishing secondary features…";
+
+  return (
+    <section className="mb-4 rounded-sm px-4 py-3" role={failed.length ? "alert" : "status"}
+             style={{ background: criticalFailed ? "#FBEEEC" : T.paper2,
+                      border: `1px solid ${criticalFailed ? T.bad + "66" : T.rule}`,
+                      borderLeft: `4px solid ${criticalFailed ? T.bad : T.cash}` }}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontFamily: DISPLAY, fontSize: 12, fontWeight: 800,
+                        textTransform: "uppercase", letterSpacing: ".045em", color: T.ink }}>
+            {title}
+          </div>
+          <div className="mt-1 text-xs" style={{ color: T.inkSoft, lineHeight: 1.5 }}>
+            {datasetLoading
+              ? "Project Ledger is checking the shared database for the latest project data. You can stay on this page while it loads."
+              : criticalFailed
+                ? "No server data was replaced or treated as empty. Retry the unavailable item; editing and imports remain locked meanwhile."
+                : criticalLoading
+                  ? "Imported rows may appear while saved overrides finish loading, but the ledger remains read-only until those values and account policy are confirmed."
+                  : "Core project data is usable. Target or administrator features will appear when their own checks finish."}
+          </div>
+        </div>
+        {loading.length > 0 && (
+          <span aria-hidden="true" className="ledger-startup-spinner"
+                style={{ width: 16, height: 16, borderRadius: "50%",
+                                            border: `2px solid ${T.rule}`, borderTopColor: T.cash,
+                                            animation: "ledgerSpin .8s linear infinite", flex: "0 0 auto" }} />
+        )}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {states.map(([label, state]) => {
+          const isFailed = state.status === "failed";
+          return (
+            <span key={label} title={isFailed ? state.error : undefined}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 7px",
+                           border: `1px solid ${isFailed ? T.bad + "66" : T.ruleSoft}`,
+                           background: T.panel, color: isFailed ? T.bad : T.inkSoft,
+                           fontFamily: MONO, fontSize: 10.5 }}>
+              {label}: <b>{loadLabel(state)}</b>
+              {isFailed && <button type="button" onClick={() => onRetry[label]()}
+                  style={{ border: 0, background: "none", color: T.bad, textDecoration: "underline",
+                           padding: 0, cursor: "pointer", font: "inherit" }}>Retry</button>}
+            </span>
+          );
+        })}
+      </div>
+      {failed.map(([label, state]) => (
+        <div key={label} className="mt-1 text-[10.5px]" style={{ color: T.bad }}>
+          {label}: {state.error}
+        </div>
+      ))}
+    </section>
   );
 }
 
@@ -1206,325 +1117,6 @@ function StatusChart({ rows }) {
 
 /* ---------------- table ---------------- */
 
-/* Lifecycle order, not alphabetical: a project is unspecified before it is
-   bid, awarded before it runs, and suspended only after it has started. The
-   dropdown reads top to bottom the way the work actually moves. */
-const PROJECT_STATUS_OPTIONS = ["UNSPECIFIED", "NOT YET AWARDED", "ONGOING", "COMPLETED", "SUSPENDED"];
-const PROJECT_STATUS_TONE = {
-  /* Grey, and deliberately the flattest of the five: UNSPECIFIED is the
-     absence of an answer, so it must not compete with the statuses that carry
-     one. It is also what a blank status renders as — see below. */
-  UNSPECIFIED: { background: T.paper2, border: T.rule, color: T.inkFaint },
-  /* Blue, borrowed from the cash tone. Prospective work, distinct from
-     ONGOING's amber so the two are not read as the same stage at a glance. */
-  "NOT YET AWARDED": { background: "#E8F0F7", border: T.cash, color: T.cash },
-  ONGOING: { background: "#FFF4C2", border: "#D2A21C", color: "#765900" },
-  COMPLETED: { background: "#E4EFEC", border: T.collected, color: T.collected },
-  SUSPENDED: { background: "#FBEEEC", border: T.bad, color: T.bad },
-};
-
-/* The SWA cell is percent on both sides of the keyboard — 10.1 in, "10.1%"
-   back, 0.101 stored (see fractionFromPercent). The typed text is held
-   separately while the cell has focus: deriving it from the stored fraction on
-   every keystroke would eat the dot the moment somebody typed "10.". */
-/* `wrap` is for the columns that hold a sentence rather than a word. A single
-   line input showed only as much of a saved Balance Work as the column was
-   wide — "Emulsified Asphalt, Wearing Course Hot Lai…" — and the rest could be
-   reached only by clicking into the cell and scrolling it. A textarea grown to
-   its own content shows every line of it while staying one field: same value,
-   same onChange, same Escape. */
-function EditCell({ value, type, onChange, wrap = false }) {
-  const [focus, setFocus] = useState(false);
-  /* null means "not being typed into"; "" is a real value the user cleared */
-  const [typed, setTyped] = useState(null);
-  const v = value ?? "";
-  const numericValue = type === "amount" ? toNum(v) : null;
-  let displayValue = v;
-  if (type === "amount" && !focus && v !== "")
-    displayValue = numericValue === null ? v : money(numericValue);
-  else if (type === "pct") {
-    /* Focused and blurred must show the same number. pct() rounds to one
-       decimal, so a typed 58.45 read back as "58.5%" and the cell disagreed
-       with what the user had just entered. percentFromFraction is the exact
-       inverse of what the keystroke handler stored, so what comes back is
-       precisely what was typed — 58.4 stays 58.4%, 58.45 stays 58.45% — with
-       the % sign added on blur. */
-    const asPercent = percentFromFraction(v);
-    displayValue = focus ? (typed ?? asPercent) : (asPercent === "" ? "" : asPercent + "%");
-  }
-
-  /* Only text wraps. The number, percent and date cells reformat themselves on
-     blur and are a single token by construction, so growing them would add
-     height no value can ever fill. */
-  const multiline = wrap && type === "text";
-  const grow = useRef(null);
-  /* Measured before paint, or a cell that is two lines tall would render one
-     line tall for a frame every time the row re-renders. */
-  useLayoutEffect(() => {
-    const el = grow.current;
-    if (!el) return;
-    const fit = () => {
-      /* auto first: scrollHeight never reports less than the height already
-         set, so without this a cell that lost a line would keep the old one. */
-      el.style.height = "auto";
-      /* scrollHeight is content plus padding and stops short of the border, so
-         a border-box height set from it alone clips the last line by a pixel. */
-      el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`;
-    };
-    fit();
-    if (typeof ResizeObserver === "undefined") return undefined;
-    /* How many lines the same text takes depends on how wide the column ended
-       up, and that is settled by the browser after this runs — and again
-       whenever the window is resized. Width only: fit() changes the height, so
-       reacting to height here is how this would loop forever. */
-    let width = el.clientWidth;
-    const observer = new ResizeObserver(() => {
-      if (el.clientWidth === width) return;
-      width = el.clientWidth;
-      fit();
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [multiline, displayValue]);
-
-  if (type === "status") {
-    const current = CLEAN(v).toUpperCase();
-    /* A blank status *is* UNSPECIFIED, so it now selects the real option and
-       takes its colour rather than showing a disabled placeholder. Display
-       only — nothing is written until somebody picks a value, so a project
-       nobody has touched keeps its empty status in the data and in the chart
-       instead of being silently reclassified by a render. */
-    const effective = current || "UNSPECIFIED";
-    const recognized = PROJECT_STATUS_OPTIONS.includes(effective);
-    const tone = PROJECT_STATUS_TONE[effective] || { background: T.paper2, border: T.rule, color: T.inkSoft };
-    return (
-      <select
-        aria-label="Project status"
-        value={recognized ? effective : "__current__"}
-        onChange={(e) => onChange(e.target.value)}
-        onFocus={() => setFocus(true)}
-        onBlur={() => setFocus(false)}
-        onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
-        style={{
-          width: "100%", border: `1px solid ${focus ? T.ink : tone.border}`,
-          background: tone.background, color: tone.color, borderRadius: 2, padding: "2px 4px",
-          fontFamily: MONO, fontSize: 11.5, fontWeight: 700, outline: "none", cursor: "pointer",
-        }}
-      >
-        {/* Only an unrecognised *non-blank* status still needs this — a value
-            some older import wrote that is not one of the five. Blank is now
-            handled by UNSPECIFIED above. */}
-        {!recognized && <option value="__current__" disabled>{current}</option>}
-        {PROJECT_STATUS_OPTIONS.map((status) => (
-          <option key={status} value={status} style={{ color: PROJECT_STATUS_TONE[status].color }}>
-            {status}
-          </option>
-        ))}
-      </select>
-    );
-  }
-
-  const field = {
-    width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
-    background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
-    fontFamily: type === "text" ? BODY : MONO, fontSize: 11.5, color: T.ink,
-    textAlign: type === "qty" || type === "amount" || type === "pct" ? "right" : "left", outline: "none",
-  };
-  const handlers = {
-    onFocus: () => setFocus(true),
-    onBlur: () => { setFocus(false); setTyped(null); },
-  };
-
-  if (multiline) return (
-    <textarea
-      ref={grow}
-      rows={1}
-      value={displayValue}
-      onChange={(e) => onChange(e.target.value)}
-      {...handlers}
-      onKeyDown={(e) => {
-        if (e.key === "Escape") { e.currentTarget.blur(); return; }
-        /* The column stores one run of text, so Enter leaves the cell the way
-           it does in every other cell instead of writing a newline into the
-           value. Shift+Enter is left alone for anybody who wants one. */
-        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); }
-      }}
-      style={{
-        ...field, display: "block", boxSizing: "border-box", resize: "none",
-        /* the element is sized to its own content, so it never has anything to
-           scroll — a scrollbar here would only steal width from the text */
-        overflow: "hidden", whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.35,
-      }}
-    />
-  );
-
-  return (
-    <input
-      value={displayValue}
-      type={type === "date" ? "date" : "text"}
-      inputMode={type === "qty" || type === "amount" || type === "pct" ? "decimal" : undefined}
-      title={type === "pct" ? "Type the percentage itself — 10.1 is 10.1%" : undefined}
-      onChange={(e) => {
-        if (type === "pct") {
-          const text = e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1");
-          setTyped(text);
-          onChange(fractionFromPercent(text));
-          return;
-        }
-        onChange(type === "amount"
-          ? e.target.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
-          : e.target.value);
-      }}
-      {...handlers}
-      onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
-      style={field}
-    />
-  );
-}
-
-function AuditModal({ target, onClose, isAdmin }) {
-  const [logs, setLogs] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
-
-  /* Removed from the list as well as from the database, rather than reloading:
-     the query that filled this modal is keyed on the cell, and re-running it
-     after a delete would flicker the whole table for one removed row. */
-  const purge = async (ids, what) => {
-    const reason = confirmPermanentDelete(what, `${ids.length} audit entr${ids.length === 1 ? "y" : "ies"} for ${target.projectDisplayId || target.projectId}.`);
-    if (!reason) return;
-    setBusy(true);
-    setNotice("");
-    try {
-      const deleted = await deleteAuditEntries(ids, reason);
-      const gone = new Set(ids);
-      setLogs((prev) => prev.filter((log) => !gone.has(log.id)));
-      setNotice(`${deleted} audit entr${deleted === 1 ? "y" : "ies"} deleted and recorded in the purge log.`);
-    } catch (deleteError) {
-      setNotice(`Not deleted: ${deleteError.message}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  useEffect(() => {
-    let alive = true;
-    /* With no `field`, this is the whole project's history rather than one
-       cell's: that is the only place a project-level event — "created by hand",
-       a target archived — can be read at all, because those are not filed under
-       any editable column. */
-    let query = supabase.from("project_manual_update_audit")
-      .select("id, column_name, field_key, old_value, new_value, source, action, changed_by_username, changed_at")
-      .in("project_id", target.projectIds?.length ? target.projectIds : [target.projectId])
-      .order("changed_at", { ascending: false });
-    if (target.field) query = query.eq("column_name", AUDIT_FIELD_LABELS[target.field]);
-    if (target.targetId) query = query.eq("target_id", target.targetId);
-    query
-      .then(({ data, error: queryError }) => {
-        if (!alive) return;
-        if (queryError) setError(queryError.message);
-        else setLogs(data || []);
-        setLoading(false);
-      });
-    return () => { alive = false; };
-  }, [target]);
-
-  return (
-    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
-         style={{ position: "fixed", inset: 0, zIndex: 20, background: "rgba(22,33,28,.35)",
-                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div role="dialog" aria-modal="true" aria-labelledby="audit-title"
-           style={{ width: "min(680px, 100%)", maxHeight: "80vh", overflow: "auto", background: T.panel,
-                    border: `1px solid ${T.ink}`, borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.25)" }}>
-        <div className="flex items-center justify-between gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
-          <div>
-            <h2 id="audit-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 700, textTransform: "uppercase" }}>
-              Audit trail · {target.field ? AUDIT_DISPLAY_LABELS[target.field] : "Whole project"}
-            </h2>
-            <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>Project ID: {target.projectDisplayId || target.projectId}</div>
-          </div>
-          <button type="button" onClick={onClose} aria-label="Close audit trail"
-                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink, padding: "3px 8px", cursor: "pointer" }}>×</button>
-        </div>
-        <div style={{ padding: 16 }}>
-          {loading && <div style={{ color: T.inkFaint, fontSize: 12 }}>Loading audit history…</div>}
-          {error && <div style={{ color: T.bad, fontSize: 12 }}>Could not load audit history: {error}</div>}
-          {!loading && !error && !logs.length && <div style={{ color: T.inkFaint, fontSize: 12 }}>
-            {target.field ? "No saved changes for this cell yet." : "Nothing has been recorded against this project yet."}
-          </div>}
-          {notice && <div style={{ marginBottom: 10, fontFamily: MONO, fontSize: 11,
-                                   color: notice.startsWith("Not deleted") ? T.bad : T.collected }}>{notice}</div>}
-          {!loading && !error && logs.length > 0 && (
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-              <thead><tr>
-                {[["When", "left"], ...(target.field ? [] : [["Column", "left"]]), ["Activity", "left"], ["User", "left"], ["Previous value", "left"], ["New value", "left"]].map(([label, align]) => (
-                  <th key={label} style={{ padding: "6px 7px", textAlign: align, borderBottom: `2px solid ${T.ink}`,
-                                            fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{label}</th>
-                ))}
-                {isAdmin && <th style={{ padding: "6px 7px", textAlign: "right", borderBottom: `2px solid ${T.ink}`,
-                                         fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>Delete</th>}
-              </tr></thead>
-              <tbody>{logs.map((log) => (
-                <tr key={log.id}>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap", fontFamily: MONO, fontSize: 10.5 }}>
-                    {new Date(log.changed_at).toLocaleString()}
-                  </td>
-                  {!target.field && (
-                    <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap",
-                                 fontFamily: MONO, fontSize: 10.5 }}>
-                      {AUDIT_DISPLAY_LABELS[log.field_key] || log.column_name}
-                    </td>
-                  )}
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap",
-                               color: log.action === "create" ? T.collected
-                                 : log.source === "excel" ? T.works : T.inkSoft, fontWeight: 600 }}>
-                    {log.action === "create" && log.field_key === "project" ? "Project created"
-                      : log.source === "excel" ? "Excel updated" : "Manual edit"}
-                  </td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}` }}>{log.changed_by_username}</td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>{auditValue(target.field || log.field_key, log.old_value)}</td>
-                  <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, fontWeight: 600 }}>{auditValue(target.field || log.field_key, log.new_value)}</td>
-                  {isAdmin && (
-                    <td style={{ padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "right" }}>
-                      <button type="button" disabled={busy}
-                              onClick={() => purge([log.id], "this audit entry")}
-                              title="Permanently delete this audit entry"
-                              style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.bad,
-                                       borderRadius: 2, padding: "1px 6px", fontSize: 10.5,
-                                       cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1 }}>
-                        Delete
-                      </button>
-                    </td>
-                  )}
-                </tr>
-              ))}</tbody>
-            </table>
-          )}
-          {/* Administrator-only, and deliberately below the table rather than
-              beside the close button: clearing a cell's whole history is not a
-              control anybody should reach for on the way out of the modal. */}
-          {isAdmin && !loading && !error && logs.length > 0 && (
-            <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${T.ruleSoft}`,
-                          display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-              <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
-                Deleted entries are copied to the purge log with your name and reason.
-              </span>
-              <button type="button" disabled={busy}
-                      onClick={() => purge(logs.map((log) => log.id), "the whole history for this cell")}
-                      style={{ border: `1px solid ${T.bad}`, background: T.panel, color: T.bad,
-                               borderRadius: 2, padding: "3px 9px", fontSize: 11,
-                               cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1 }}>
-                {busy ? "Deleting…" : `Delete all ${logs.length} shown`}
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 
 /* The words assembleProjects substitutes for an absent value. Listing them as
@@ -2021,7 +1613,7 @@ function UnsavedReloadModal({ cellCount, rowIds, saving, onSave, onDiscard, onCa
 /* The one cell that stands in for the six target columns. It has to read at a
    glance, so it leads with the count and names only the worst standing — that
    is the part that decides whether somebody needs to open it. */
-function TargetSummaryCell({ record, onOpen }) {
+function TargetSummaryCell({ record, onOpen, disabled = false }) {
   /* Not a button when the list could not be loaded. Manage targets would open
      on an empty list, and adding a target there would duplicate whatever this
      project already has. Saying nothing is known is the only honest state. */
@@ -2047,13 +1639,13 @@ function TargetSummaryCell({ record, onOpen }) {
   const tone = worst ? BUCKET_COLOR[worst] : s.active === 0 ? T.inkFaint : T.inkSoft;
 
   return (
-    <button type="button" onClick={onOpen}
+    <button type="button" onClick={onOpen} disabled={disabled}
             title={`Manage targets for ${record.id}`}
             aria-label={`Manage targets for ${record.id} — ${label}${detail ? ", " + detail : ""}`}
-            style={{ width: "100%", textAlign: "left", cursor: "pointer", borderRadius: 2,
+            style={{ width: "100%", textAlign: "left", cursor: disabled ? "default" : "pointer", borderRadius: 2,
                      border: `1px solid ${worst ? tone : T.ruleSoft}`,
                      background: worst ? BUCKET_COLOR[worst] + "14" : T.panel,
-                     padding: "3px 7px", font: "inherit", lineHeight: 1.35 }}>
+                     padding: "3px 7px", font: "inherit", lineHeight: 1.35, opacity: disabled ? 0.72 : 1 }}>
       <span style={{ fontFamily: MONO, fontSize: 11.5, fontWeight: 600,
                      color: s.active === 0 ? T.inkFaint : T.ink }}>
         {s.active === 0 ? "+ " : ""}{label}
@@ -2096,14 +1688,14 @@ const SAVE_SHORTCUT_LABEL = typeof navigator !== "undefined"
 const SAVE_COL_W = 46;
 const saveColWidth = { width: SAVE_COL_W, minWidth: SAVE_COL_W, maxWidth: SAVE_COL_W };
 
-function SaveCell({ id, unsaved, saving, onSave }) {
+function SaveCell({ id, unsaved, saving, onSave, disabled = false }) {
   const label = saving ? `Saving ${id}…`
     : unsaved ? `Save changes for ${id}`
     : `No unsaved changes for ${id}`;
   return (
     <td style={{ padding: "3px 4px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center", ...saveColWidth }}>
       <button type="button" title={label} aria-label={label}
-              onClick={() => onSave(id)} disabled={!unsaved || saving}
+              onClick={() => onSave(id)} disabled={disabled || !unsaved || saving}
               style={{ display: "inline-flex", alignItems: "center", justifyContent: "center",
                        width: 24, height: 22, borderRadius: 2, padding: 0,
                        border: `1px solid ${unsaved ? T.collected : T.ruleSoft}`,
@@ -2122,7 +1714,8 @@ function SaveCell({ id, unsaved, saving, onSave }) {
 function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAll, onAuditCell,
                       onManageTargets, multipleTargetsEnabled, isAdmin, dirtyIds, dirtyCount, savingIds,
                       onDeleteProject, onViewDuplicates, duplicateCount, emptyLabel, onAddProject,
-                      onProjectHistory }) {
+                      onProjectHistory, readOnly = false, targetReadOnly = false, readOnlyReason = "" }) {
+  const duplicatesPending = duplicateCount === null;
   /* Position of the ID-column context menu, in viewport coordinates, or null. */
   const [idMenu, setIdMenu] = useState(null);
 
@@ -2161,6 +1754,17 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
     return d;
   }, [rows, sort]);
 
+  /* Only the rows on screen are given a DOM node. `data` above is untouched and
+     still holds every matching project — the totals in tfoot, the export, and
+     everything computed in ProjectLedger all read it, not the rendered slice. */
+  const scrollRef = useRef(null);
+  const virtual = useVirtualRows({
+    scrollRef,
+    count: data.length,
+    keyAt: (index) => data[index]?.id,
+  });
+  const spanAll = cols.length + 1;
+
   const th = { position: "sticky", top: 0, background: T.paper2, zIndex: 3, textAlign: "left", padding: "7px 9px",
     borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase",
     letterSpacing: ".06em", cursor: "pointer", whiteSpace: "nowrap" };
@@ -2189,7 +1793,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
             + Add project
           </button>
         )}
-        <button onClick={onSaveAll} disabled={!dirtyCount || savingIds.size > 0}
+        <button onClick={onSaveAll} disabled={readOnly || !dirtyCount || savingIds.size > 0}
                 className="project-save-action rounded-sm px-2.5 py-1 text-xs"
                 aria-label={`Save changes (${SAVE_SHORTCUT_LABEL})`}
                 title={`Save changes (${SAVE_SHORTCUT_LABEL}) — saves every row with unsaved edits`}
@@ -2200,9 +1804,11 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
           <svg className="project-action-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M5 3h12l2 2v16H5z"/><path d="M8 3v6h8V3M8 21v-6h8v6"/></svg>
           <span className="project-action-label">{savingIds.size ? "Saving…" : `Save changes${dirtyCount ? ` (${dirtyCount})` : ""}`}</span>
         </button>
-        <button onClick={() => onExport(data)} className="project-export-action rounded-sm px-2.5 py-1 text-xs"
+        <button onClick={() => onExport(data)} disabled={readOnly}
+                className="project-export-action rounded-sm px-2.5 py-1 text-xs"
                 aria-label="Export filtered CSV" title="Export filtered CSV"
-                style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft }}>
+                style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft,
+                         opacity: readOnly ? 0.55 : 1 }}>
           <svg className="project-action-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v3h14v-3"/></svg>
           <span className="project-action-label">Export filtered CSV</span>
         </button>
@@ -2221,7 +1827,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
               answer the menu gives rather than something the reader has to
               infer from an option that is missing. At zero there is nothing to
               show, so it reports 0 instead of opening an empty table. */}
-          <button type="button" role="menuitem" disabled={!duplicateCount}
+          <button type="button" role="menuitem" disabled={duplicatesPending || !duplicateCount}
                   onClick={() => { setIdMenu(null); onViewDuplicates(); }}
                   style={{ display: "block", width: "100%", textAlign: "left", border: "none",
                            background: "none", padding: "6px 9px", fontSize: 12,
@@ -2230,11 +1836,13 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
             View duplicate Project IDs
             <span style={{ float: "right", fontFamily: MONO, fontSize: 11, fontWeight: 700,
                            color: duplicateCount ? T.works : T.inkFaint }}>
-              {duplicateCount}
+              {duplicatesPending ? "…" : duplicateCount}
             </span>
           </button>
           <div style={{ padding: "0 9px 5px", fontSize: 10, color: T.inkFaint, lineHeight: 1.4 }}>
-            {duplicateCount
+            {duplicatesPending
+              ? "Checking duplicate Project IDs in the background…"
+              : duplicateCount
               ? "Project IDs appearing on more than one row, across years or otherwise."
               : "No Project ID appears more than once."}
           </div>
@@ -2267,7 +1875,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
           {emptyLabel || "No projects match these filters."}
         </div>
       ) : (
-        <div className="overflow-auto" style={{ maxHeight: 620 }}>
+        <div ref={scrollRef} className="overflow-auto" style={{ maxHeight: 620 }}>
           <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 12 }}>
             <thead>
               <tr>
@@ -2292,8 +1900,21 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
               </tr>
             </thead>
             <tbody>
-              {data.map((r, ri) => (
-                <tr key={r.id + "|" + ri}>
+              {/* Stands in for the rows scrolled off the top. Without it the
+                  scrollbar would describe only the mounted slice and the table
+                  would jump to the top the moment anything re-rendered. */}
+              {virtual.padTop > 0 && (
+                <tr aria-hidden="true">
+                  <td colSpan={spanAll} style={{ height: virtual.padTop, padding: 0, border: "none" }} />
+                </tr>
+              )}
+              {data.slice(virtual.start, virtual.end).map((r, offset) => {
+                /* The absolute position in the filtered list, not the position
+                   within the rendered window — the key has to stay stable as
+                   the window slides past a row. */
+                const ri = virtual.start + offset;
+                return (
+                <tr key={r.id + "|" + ri} ref={virtual.measureRef(r.id)}>
                   {cols.map((c) => {
                     const v = r[c.k];
                     const base = { padding: "6px 9px", borderBottom: `1px solid ${T.ruleSoft}`, verticalAlign: "top" };
@@ -2305,7 +1926,8 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                     if (c.group) base.background = "#F2F6F1";
                     if (c.targets) return (
                       <td key={c.k} style={{ ...base, ...wStyle, padding: "3px 5px" }}>
-                        <TargetSummaryCell record={r} onOpen={() => onManageTargets(r)} />
+                        <TargetSummaryCell record={r} onOpen={() => onManageTargets(r)}
+                                           disabled={readOnly || targetReadOnly} />
                       </td>
                     );
                     if (c.targetField && r.targetsUnavailable) return (
@@ -2322,11 +1944,14 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                                       targetId: c.targetField ? r.primaryTarget?.id : null,
                                       field: c.k, value: v });
                       }} onClick={(e) => {
-                        if (!e.target.matches("input, select")) e.currentTarget.querySelector("input, select")?.focus();
+                        if (!readOnly && !(targetReadOnly && c.targetField) && !e.target.matches("input, select"))
+                          e.currentTarget.querySelector("input, select")?.focus();
                       }}
                           style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA",
-                                   cursor: c.edit === "status" ? "pointer" : "text" }}>
+                                   cursor: readOnly || (targetReadOnly && c.targetField) ? "default" : c.edit === "status" ? "pointer" : "text" }}
+                          title={readOnly || (targetReadOnly && c.targetField) ? readOnlyReason : undefined}>
                         <EditCell value={v} type={c.edit} wrap={c.wrap} onChange={(nv) => onEdit(r.id, c.k, nv)}
+                                  disabled={readOnly || (targetReadOnly && c.targetField)}
                         />
                       </td>
                     );
@@ -2381,9 +2006,16 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                       )}
                     </td>;
                   })}
-                  <SaveCell id={r.id} unsaved={dirtyIds.has(r.id)} saving={savingIds.has(r.id)} onSave={onSaveRow} />
+                  <SaveCell id={r.id} unsaved={dirtyIds.has(r.id)} saving={savingIds.has(r.id)}
+                            onSave={onSaveRow} disabled={readOnly} />
                 </tr>
-              ))}
+                );
+              })}
+              {virtual.padBottom > 0 && (
+                <tr aria-hidden="true">
+                  <td colSpan={spanAll} style={{ height: virtual.padBottom, padding: 0, border: "none" }} />
+                </tr>
+              )}
             </tbody>
             <tfoot>
               <tr>
@@ -2435,34 +2067,6 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
    project is carried as a reference so that no aggregate can accidentally sum
    a project's balance once per target. */
 
-/* "Behind target" used to sit here too. No branch ever assigned it — the
-   scoring was simplified at some point and the bucket was left behind, so it
-   silently contributed nothing to the standings bar and a constant zero to the
-   "behind" figure in the KPI beneath it. It has been removed. */
-const BUCKET_COLOR = {
-  "Overdue": T.bad, "Critical": "#D2A21C",
-  "On track": T.collected, "Delivered on time": T.collected, "Delivered": T.inkSoft,
-};
-const DRAFT_COLOR = T.inkFaint;
-
-/* the two standings that demand action are filled rather than outlined, so they
-   carry across a room; everything else stays a quiet outline */
-const BUCKET_PILL = {
-  "Overdue":  { bg: T.bad,     fg: "#FFFFFF", bd: T.bad,     weight: 700 },
-  "Critical": { bg: "#F0CB45", fg: T.ink,     bd: "#C79E1E", weight: 700 },
-};
-/* every standing renders at the same size so the column reads as one control,
-   sized to the longest label ("Delivered on time") */
-const PILL_BASE = {
-  display: "inline-block", width: 112, textAlign: "center", padding: "2px 6px",
-  borderRadius: 999, fontSize: 10, lineHeight: "13px", whiteSpace: "nowrap",
-};
-const pillStyle = (b) => {
-  const s = BUCKET_PILL[b];
-  return s
-    ? { ...PILL_BASE, background: s.bg, color: s.fg, border: `1px solid ${s.bd}`, fontWeight: s.weight }
-    : { ...PILL_BASE, background: "transparent", color: BUCKET_COLOR[b], border: `1px solid ${BUCKET_COLOR[b]}`, fontWeight: 500 };
-};
 
 /* How many rows the worklist opens with. The rest are one click away rather
    than gone: this used to be three separate caps (10 action items, 8 on track,
@@ -2742,569 +2346,6 @@ function TargetAnalysis({ rows }) {
    no control to mis-click, which is stronger than any warning.
 ------------------------------------------------- */
 
-const TARGET_COLUMNS = [
-  /* wraps for the same reason the ledger row's Balance Work does — this is the
-     field being typed into, so it is the first place the full text has to be
-     readable back */
-  { k: "scope", label: SCOPE_LABEL, type: "text", w: 200, wrap: true },
-  { k: "target_qty", label: "Target qty", type: "qty", w: 92 },
-  { k: "unit", label: "Unit", type: "text", w: 80 },
-  { k: "start_date", label: "Start date", type: "date", w: 132 },
-  { k: "target_completion", label: "Target completion", type: "date", w: 132 },
-  { k: "actual_output", label: "Actual output", type: "qty", w: 96 },
-];
-
-const emptyTarget = () => ({
-  scope: "", target_qty: "", unit: "", start_date: "",
-  target_completion: "", actual_completion: "", actual_output: "",
-});
-
-const draftPill = {
-  ...PILL_BASE, background: "transparent", color: DRAFT_COLOR,
-  border: `1px dashed ${DRAFT_COLOR}`, fontWeight: 500,
-};
-
-/* ---------------- target history ----------------
-   Read-only, and layered above Manage targets rather than replacing it, so
-   checking what changed never costs unsaved edits.
-
-   The per-cell audit trail on the ledger row is left exactly as it was: it
-   answers "what happened to this one field", which is still the right question
-   for status, contract and remarks. It cannot answer this one. Target fields no
-   longer have cells of their own to right-click, and a save that touched four
-   fields of one target reads as four unrelated entries there. This view groups
-   by the save.
-------------------------------------------------- */
-
-const ACTION_TONE = {
-  create: T.collected,
-  update: T.cash,
-  archive: T.inkFaint,
-  restore: T.works,
-};
-
-const DATE_FIELD_KEYS = new Set(["start_date", "target_completion", "actual_completion"]);
-
-/* Stored as text, so it is shown as text — except for dates, which are written
-   as ISO and read badly that way. Nothing else is reinterpreted: a quantity is
-   displayed exactly as it was recorded, because reformatting an audit value
-   risks showing something other than what was saved. */
-const historyValue = (fieldKey, value) => {
-  if (isBlankValue(value)) return "—";
-  return DATE_FIELD_KEYS.has(fieldKey) ? fmtDate(value) : String(value);
-};
-
-const targetLabel = (target) =>
-  target?.scope || (target?.archived_at ? "Archived target" : `Target with no ${SCOPE_LABEL}`);
-
-function TargetHistoryModal({ project, targets, focusTargetId = null, onClose }) {
-  const stored = useMemo(() => (targets || []).filter((t) => t && t.id && !String(t.id).startsWith("new:")),
-    [targets]);
-  const ids = useMemo(() => stored.map((t) => t.id), [stored]);
-  const scopeById = useMemo(() => new Map(stored.map((t) => [t.id, targetLabel(t)])), [stored]);
-
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [selected, setSelected] = useState(focusTargetId || "all");
-
-  /* The initial state is already "loading", so nothing is set synchronously
-     here: the modal is mounted fresh each time it is opened, and `targets` is
-     the stored list, which does not change while it is open. */
-  useEffect(() => {
-    let alive = true;
-    loadTargetHistory(ids)
-      .then((data) => { if (alive) { setRows(data); setError(""); setLoading(false); } })
-      .catch((e) => { if (alive) { setError(e.message || String(e)); setLoading(false); } });
-    return () => { alive = false; };
-  }, [ids]);
-
-  /* Every target's rows are fetched once and narrowed here, so switching
-     between targets costs no request and the whole-project view is free. */
-  const events = useMemo(() => groupTargetHistory(
-    selected === "all" ? rows : rows.filter((r) => r.target_id === selected),
-  ), [rows, selected]);
-
-  const heading = { padding: "6px 7px", textAlign: "left", borderBottom: `1px solid ${T.ruleSoft}`,
-    fontFamily: DISPLAY, fontSize: 9.5, textTransform: "uppercase", letterSpacing: ".05em", color: T.inkFaint };
-
-  return (
-    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
-         style={{ position: "fixed", inset: 0, zIndex: 26, background: "rgba(22,33,28,.35)",
-                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div role="dialog" aria-modal="true" aria-labelledby="target-history-title"
-           style={{ width: "min(760px, 100%)", maxHeight: "84vh", display: "flex", flexDirection: "column",
-                    background: T.panel, border: `1px solid ${T.ink}`, borderRadius: 2,
-                    boxShadow: "0 18px 50px rgba(0,0,0,.25)" }}>
-
-        <div className="flex items-start justify-between gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
-          <div style={{ minWidth: 0 }}>
-            <h2 id="target-history-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 700, textTransform: "uppercase" }}>
-              Target history
-            </h2>
-            <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 11, color: T.inkSoft }}>
-              {project.displayId || project.id}{project.name ? ` — ${project.name}` : ""}
-            </div>
-          </div>
-          <button type="button" onClick={onClose} aria-label="Close target history"
-                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
-                           padding: "3px 8px", cursor: "pointer" }}>×</button>
-        </div>
-
-        {stored.length > 1 && (
-          <div className="px-4 py-2" style={{ borderBottom: `1px solid ${T.ruleSoft}`, background: T.paper2 }}>
-            <label style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkSoft }}>
-              Show{" "}
-              <select value={selected} onChange={(e) => setSelected(e.target.value)}
-                      aria-label="Which target to show history for"
-                      style={{ fontFamily: MONO, fontSize: 11, color: T.ink, background: T.panel,
-                               border: `1px solid ${T.rule}`, borderRadius: 2, padding: "2px 5px" }}>
-                <option value="all">All targets ({stored.length})</option>
-                {stored.map((t) => (
-                  <option key={t.id} value={t.id}>{targetLabel(t)}{t.archived_at ? " · archived" : ""}</option>
-                ))}
-              </select>
-            </label>
-          </div>
-        )}
-
-        <div style={{ overflow: "auto", flex: 1, padding: "12px 16px" }}>
-          {loading && <div style={{ color: T.inkFaint, fontSize: 12 }}>Loading target history…</div>}
-          {error && <div role="alert" style={{ color: T.bad, fontSize: 12 }}>Could not load target history: {error}</div>}
-          {!loading && !error && !events.length && (
-            <div className="py-8 text-center text-xs" style={{ color: T.inkFaint, lineHeight: 1.7 }}>
-              {ids.length === 0
-                ? <>No saved targets yet.<br />History starts once a target is saved.</>
-                : <>No recorded changes yet.<br />Every save from this point on is listed here.</>}
-            </div>
-          )}
-
-          {!loading && !error && events.map((event) => {
-            const tone = ACTION_TONE[event.action] || T.inkSoft;
-            /* Whose target this was matters only when several are on screen. */
-            const scope = selected === "all"
-              ? (event.targetScope || scopeById.get(event.targetId) || null)
-              : null;
-            return (
-              <div key={event.key} style={{ border: `1px solid ${T.ruleSoft}`, borderRadius: 2, marginBottom: 10 }}>
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2"
-                     style={{ background: T.paper2, borderBottom: isEventOnly(event) ? "none" : `1px solid ${T.ruleSoft}` }}>
-                  <span style={{ ...PILL_BASE, width: "auto", minWidth: 66, background: tone + "1A",
-                                 color: tone, border: `1px solid ${tone}55`, fontWeight: 600 }}>
-                    {actionLabel(event.action)}
-                  </span>
-                  <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.ink }}>
-                    {event.changedAt ? new Date(event.changedAt).toLocaleString() : "Date not recorded"}
-                  </span>
-                  <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkSoft }}>· {event.user}</span>
-                  {scope && (
-                    <span style={{ fontSize: 10.5, color: T.inkSoft, minWidth: 0, overflow: "hidden",
-                                   textOverflow: "ellipsis", whiteSpace: "nowrap" }}>· {scope}</span>
-                  )}
-                  {/* Rows written before the targets table existed carry no
-                      batch, and were made on the ledger row rather than here.
-                      Saying so is more honest than presenting them as if they
-                      came from this modal. */}
-                  {event.source === "panel" && (
-                    <span style={{ fontFamily: MONO, fontSize: 10, color: T.inkFaint }}>· from the ledger row</span>
-                  )}
-                </div>
-
-                {!isEventOnly(event) && (
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
-                    <thead><tr>
-                      <th style={{ ...heading, width: 170 }}>Field</th>
-                      <th style={heading}>Previous value</th>
-                      <th style={heading}>New value</th>
-                    </tr></thead>
-                    <tbody>
-                      {event.fields.map((field, i) => (
-                        <tr key={`${event.key}:${field.fieldKey || field.label}:${i}`}>
-                          <td style={{ padding: "6px 7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>
-                            {field.label}
-                          </td>
-                          <td style={{ padding: "6px 7px", borderBottom: `1px solid ${T.ruleSoft}`,
-                                       fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
-                            {historyValue(field.fieldKey, field.from)}
-                          </td>
-                          <td style={{ padding: "6px 7px", borderBottom: `1px solid ${T.ruleSoft}`,
-                                       fontFamily: MONO, fontSize: 10.5, color: T.ink, fontWeight: 600 }}>
-                            {historyValue(field.fieldKey, field.to)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="px-4 py-2" style={{ borderTop: `1px solid ${T.rule}`, background: T.paper2 }}>
-          <span className="text-[10.5px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-            One entry per save. Archiving keeps a target and its history on record — nothing here is ever deleted.
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function TargetsModal({ project, onClose, onSaved, isAdmin }) {
-  const stored = useMemo(() => project.targets || [], [project.targets]);
-  const originals = useMemo(() => new Map(stored.map((t) => [t.id, t])), [stored]);
-
-  const [rows, setRows] = useState(() => stored.map((t) => ({
-    ...t,
-    target_qty: t.target_qty ?? "", unit: t.unit ?? "", scope: t.scope ?? "",
-    start_date: t.start_date ?? "", target_completion: t.target_completion ?? "",
-    actual_completion: t.actual_completion ?? "", actual_output: t.actual_output ?? "",
-  })));
-  const [showArchived, setShowArchived] = useState(false);
-  /* null while closed; { targetId } while open, where a null targetId means the
-     whole project. Opening it changes nothing about the edits in progress. */
-  const [history, setHistory] = useState(null);
-  const [errors, setErrors] = useState({});
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  const nextId = useRef(0);
-  const today = useMemo(() => todayMs(), []);
-
-  const isPendingArchived = (r) => Boolean((r.archived_at && !r._restore) || r._archive);
-  const visible = rows.filter((r) => showArchived || !isPendingArchived(r));
-  const archivedCount = rows.filter(isPendingArchived).length;
-
-  const edit = (id, field, value) =>
-    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
-
-  const addTarget = () => {
-    const id = `new:${nextId.current++}`;
-    setRows((prev) => [...prev, { id, _isNew: true, ...emptyTarget() }]);
-    setMessage("");
-  };
-
-  /* A new row has never been written, so discarding it is just dropping it.
-     A stored one is archived: it stops counting towards tracking but stays on
-     record, which is the right answer for real work that ended. Deleting is a
-     separate control below, for administrators, and is not the default. */
-  const removeTarget = (row) => {
-    if (row._isNew) { setRows((prev) => prev.filter((r) => r.id !== row.id)); return; }
-    const name = row.scope || "this target";
-    if (!window.confirm(`Archive ${name}? It stops counting towards tracking but stays on record and can be restored.`)) return;
-    setRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, _archive: true, _restore: false } : r)));
-  };
-  const restoreTarget = (row) =>
-    setRows((prev) => prev.map((r) => (r.id === row.id
-      ? { ...r, _restore: Boolean(r.archived_at) && !r._restore, _archive: false } : r)));
-
-  /* Unlike every other control here this one does not wait for Save. A delete
-     cannot be part of a batch that might be abandoned half-way: the row and its
-     history are gone the moment the database returns, so the modal reloads from
-     the server immediately rather than holding a list that no longer matches. */
-  const deleteTarget = async (row) => {
-    const name = row.scope || "this target";
-    const reason = confirmPermanentDelete(
-      `${name}`,
-      `The target and every audit entry recorded against it will be destroyed. Archiving keeps it on record instead.`,
-    );
-    if (!reason) return;
-    setBusy(true);
-    setMessage("");
-    try {
-      const result = await deleteTargetPermanently(row.id, reason);
-      setRows((prev) => prev.filter((r) => r.id !== row.id));
-      await onSaved(`Deleted ${name} and ${result?.audit_rows_deleted ?? 0} audit entr${result?.audit_rows_deleted === 1 ? "y" : "ies"}. Recorded in the purge log.`);
-      onClose();
-    } catch (deleteError) {
-      setMessage(`Not deleted: ${deleteError.message}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /* Live standing, computed from what is currently typed rather than from what
-     was last saved, so the pill answers the row in front of you. */
-  const standingOf = (row) => {
-    if (isPendingArchived(row)) return { label: "Archived", style: draftPill };
-    if (!isTrackable(row)) return { label: "Draft", style: draftPill };
-    return { label: assessTarget(project, row, today).bucket, style: null };
-  };
-
-  const changedRows = () => {
-    const creates = [], updates = [], archives = [], restores = [];
-    for (const row of rows) {
-      const before = originals.get(row.id);
-      if (row._isNew) { if (!row._archive) creates.push(row); continue; }
-      if (row._archive && !before.archived_at) { archives.push(before); continue; }
-      if (row._restore && before.archived_at) restores.push(before);
-      if (row._archive) continue;
-      const differs = TARGET_FIELDS.some(([field]) =>
-        String(blankToNull(row[field]) ?? "") !== String(before[field] ?? ""));
-      if (differs) updates.push({ id: row.id, before, after: row });
-    }
-    return { creates, updates, archives, restores };
-  };
-
-  const save = async () => {
-    const { creates, updates, archives, restores } = changedRows();
-    if (!creates.length && !updates.length && !archives.length && !restores.length) {
-      setMessage("Nothing to save.");
-      return;
-    }
-
-    const found = {};
-    for (const row of creates) {
-      const e = validateTarget(row, { isNew: true });
-      if (Object.keys(e).length) found[row.id] = e;
-    }
-    for (const { id, after } of updates) {
-      const e = validateTarget(after, { isNew: false });
-      if (Object.keys(e).length) found[id] = e;
-    }
-    setErrors(found);
-    if (Object.keys(found).length) {
-      setMessage("Fix the highlighted fields before saving.");
-      return;
-    }
-
-    setBusy(true);
-    setMessage("");
-    try {
-      await saveTargets({ projectId: project.id, creates, updates, archives, restores });
-      const parts = [
-        creates.length && `${creates.length} added`,
-        updates.length && `${updates.length} updated`,
-        archives.length && `${archives.length} archived`,
-        restores.length && `${restores.length} restored`,
-      ].filter(Boolean);
-      await onSaved(`Targets for ${project.id}: ${parts.join(", ")}.`);
-      onClose();
-    } catch (error) {
-      setMessage(`Could not save: ${error.message}`);
-      setBusy(false);
-    }
-  };
-
-  const pending = changedRows();
-  const pendingCount = pending.creates.length + pending.updates.length
-    + pending.archives.length + pending.restores.length;
-
-  const close = () => {
-    if (pendingCount && !window.confirm("Discard unsaved target changes?")) return;
-    onClose();
-  };
-
-  const head = { padding: "6px 8px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY,
-    fontSize: 9.5, textTransform: "uppercase", letterSpacing: ".06em", whiteSpace: "nowrap", textAlign: "left" };
-
-  return (
-    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}
-         style={{ position: "fixed", inset: 0, zIndex: 24, background: "rgba(22,33,28,.35)",
-                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div role="dialog" aria-modal="true" aria-labelledby="targets-title"
-           style={{ width: "min(1120px, 100%)", maxHeight: "86vh", display: "flex", flexDirection: "column",
-                    background: T.panel, border: `1px solid ${T.ink}`, borderRadius: 2,
-                    boxShadow: "0 18px 50px rgba(0,0,0,.25)" }}>
-
-        {/* project context — read-only, and deliberately not inputs */}
-        <div className="px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
-          <div className="flex items-start justify-between gap-3">
-            <div style={{ minWidth: 0 }}>
-              <h2 id="targets-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 700, textTransform: "uppercase" }}>
-                Manage targets
-              </h2>
-              <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 12, color: T.ink, fontWeight: 600 }}>
-                {project.displayId || project.id}{project.name ? ` — ${project.name}` : ""}
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              {/* Disabled rather than hidden when there is nothing to show, so
-                  the control does not appear and disappear as targets are
-                  added. A new row has no history until it is saved. */}
-              <button type="button" onClick={() => setHistory({ targetId: null })} disabled={!stored.length}
-                      title={stored.length ? "Every recorded change to this project's targets" : "No saved targets yet"}
-                      style={{ border: `1px solid ${stored.length ? T.rule : T.ruleSoft}`, background: T.paper2,
-                               color: stored.length ? T.inkSoft : T.inkFaint, borderRadius: 2,
-                               padding: "3px 9px", fontSize: 11, whiteSpace: "nowrap",
-                               cursor: stored.length ? "pointer" : "default" }}>
-                History
-              </button>
-              <button type="button" onClick={close} aria-label="Close manage targets"
-                      style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
-                               padding: "3px 8px", cursor: "pointer" }}>×</button>
-            </div>
-          </div>
-          <div style={{ marginTop: 6, fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
-            {project.district} · {project.engineer} · Status {project.status} · Contract {money(project.contract)}
-            <span style={{ color: T.inkFaint }}> · project information, edited on the ledger row</span>
-          </div>
-        </div>
-
-        {/* targets */}
-        <div style={{ overflow: "auto", flex: 1, padding: "12px 16px" }}>
-          {visible.length === 0 ? (
-            <div className="py-8 text-center text-xs" style={{ color: T.inkFaint, lineHeight: 1.7 }}>
-              No targets yet.<br />Add one to start tracking this project's deliverables.
-            </div>
-          ) : (
-            <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: 12 }}>
-              <thead>
-                <tr>
-                  {TARGET_COLUMNS.map((c) => (
-                    <th key={c.k} style={{ ...head, width: c.w, minWidth: c.w }}>
-                      {c.label}{c.k === "scope" && <span aria-hidden="true" style={{ color: T.bad, marginLeft: 3 }}>*</span>}
-                    </th>
-                  ))}
-                  <th style={{ ...head, width: 124, minWidth: 124 }}>Standing</th>
-                  <th style={{ ...head, width: 96, minWidth: 96, textAlign: "center" }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visible.map((row) => {
-                  const rowErrors = errors[row.id] || {};
-                  const archived = isPendingArchived(row);
-                  const standing = standingOf(row);
-                  const warnings = archived ? [] : targetWarnings(row);
-                  return (
-                    <tr key={row.id} style={archived ? { opacity: 0.55 } : undefined}>
-                      {TARGET_COLUMNS.map((c) => (
-                        <td key={c.k} style={{ padding: "3px 4px", borderBottom: `1px solid ${T.ruleSoft}`,
-                                               verticalAlign: "top",
-                                               background: rowErrors[c.k] ? "#FBEEEC" : row._isNew ? "#F3F8F4" : "transparent" }}>
-                          {archived ? (
-                            <span style={{ fontFamily: c.type === "text" ? BODY : MONO, fontSize: 11.5,
-                                           padding: "1px 4px", display: "block", color: T.inkSoft }}>
-                              {row[c.k] === "" || row[c.k] === null ? "—" : String(row[c.k])}
-                            </span>
-                          ) : (
-                            <EditCell value={row[c.k]} type={c.type} wrap={c.wrap} onChange={(v) => edit(row.id, c.k, v)} />
-                          )}
-                          {rowErrors[c.k] && (
-                            <div style={{ color: T.bad, fontSize: 10, padding: "1px 4px" }}>{rowErrors[c.k]}</div>
-                          )}
-                          {/* a migrated target legitimately has no scope; say so
-                              rather than inventing one */}
-                          {c.k === "scope" && !archived && !row._isNew && !row.scope && !rowErrors.scope && (
-                            <div style={{ color: T.inkFaint, fontSize: 10, fontStyle: "italic", padding: "1px 4px" }}>
-                              No {SCOPE_LABEL} specified
-                            </div>
-                          )}
-                        </td>
-                      ))}
-                      <td style={{ padding: "5px 6px", borderBottom: `1px solid ${T.ruleSoft}`, verticalAlign: "top" }}>
-                        <span style={standing.style || pillStyle(standing.label)}>{standing.label}</span>
-                        {warnings.map((w) => (
-                          <div key={w} style={{ color: T.works, fontSize: 10, marginTop: 3, lineHeight: 1.3 }}>{w}</div>
-                        ))}
-                      </td>
-                      <td style={{ padding: "5px 6px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center", verticalAlign: "top" }}>
-                        <div className="flex flex-col items-center gap-1">
-                        {row.archived_at ? (
-                          <button type="button" onClick={() => restoreTarget(row)}
-                                  title={row._restore ? "Cancel this restore" : "Bring this target back into tracking"}
-                                  style={{ border: `1px solid ${row._restore ? T.collected : T.rule}`,
-                                           background: row._restore ? "#E4EFEC" : T.paper2,
-                                           color: row._restore ? T.collected : T.inkSoft,
-                                           borderRadius: 2, padding: "2px 7px", fontSize: 10.5, cursor: "pointer" }}>
-                            {row._restore ? "Restoring" : "Restore"}
-                          </button>
-                        ) : (
-                          <button type="button" onClick={() => removeTarget(row)}
-                                  title={row._isNew ? "Discard this new target" : "Archive this target"}
-                                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.inkSoft,
-                                           borderRadius: 2, padding: "2px 7px", fontSize: 10.5, cursor: "pointer" }}>
-                            {row._isNew ? "Discard" : "Archive"}
-                          </button>
-                        )}
-                        {/* A row that has never been saved has nothing to show,
-                            so it gets no control rather than an empty view. */}
-                        {!row._isNew && (
-                          <button type="button" onClick={() => setHistory({ targetId: row.id })}
-                                  title={`Every recorded change to ${row.scope || "this target"}`}
-                                  style={{ border: "none", background: "none", color: T.inkFaint,
-                                           padding: "0 2px", fontSize: 10, textDecoration: "underline",
-                                           cursor: "pointer" }}>
-                            History
-                          </button>
-                        )}
-                        {/* Administrators only, and last in the stack: Archive
-                            stays the obvious control and this one has to be
-                            reached for deliberately. */}
-                        {isAdmin && !row._isNew && (
-                          <button type="button" disabled={busy} onClick={() => deleteTarget(row)}
-                                  title="Permanently delete this target and its audit history"
-                                  style={{ border: "none", background: "none", color: T.bad,
-                                           padding: "0 2px", fontSize: 10, textDecoration: "underline",
-                                           cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1 }}>
-                            Delete
-                          </button>
-                        )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            <button type="button" onClick={addTarget}
-                    style={{ border: `1px solid ${T.collected}`, background: "#E4EFEC", color: T.collected,
-                             borderRadius: 2, padding: "4px 10px", fontFamily: DISPLAY, fontWeight: 700,
-                             fontSize: 11, textTransform: "uppercase", letterSpacing: ".04em", cursor: "pointer" }}>
-              + Add target
-            </button>
-            {archivedCount > 0 && (
-              <label className="text-[11px]" style={{ fontFamily: MONO, color: T.inkSoft, cursor: "pointer" }}>
-                <input type="checkbox" checked={showArchived} onChange={() => setShowArchived(!showArchived)}
-                       style={{ accentColor: T.collected, marginRight: 5 }} />
-                Show archived ({archivedCount})
-              </label>
-            )}
-            <span className="text-[10.5px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-              {SCOPE_LABEL} is required for a new target. A target with no quantity and no completion date stays a draft
-              and is not tracked.
-            </span>
-          </div>
-        </div>
-
-        {/* actions */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
-             style={{ borderTop: `1px solid ${T.rule}`, background: T.paper2 }}>
-          <div className="text-[11.5px]" role={message.startsWith("Could") || message.startsWith("Fix") ? "alert" : undefined}
-               style={{ fontFamily: MONO, color: message.startsWith("Could") || message.startsWith("Fix") ? T.bad : T.inkSoft }}>
-            {message || `${rows.filter((r) => !isPendingArchived(r)).length} target${rows.filter((r) => !isPendingArchived(r)).length === 1 ? "" : "s"}${pendingCount ? ` · ${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"}` : ""}`}
-          </div>
-          <div className="flex items-center gap-2">
-            <button type="button" onClick={close} disabled={busy}
-                    style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft,
-                             borderRadius: 2, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>
-              Cancel
-            </button>
-            <button type="button" onClick={save} disabled={busy || !pendingCount}
-                    style={{ border: `1px solid ${pendingCount ? T.collected : T.rule}`,
-                             background: pendingCount ? T.collected : T.paper2,
-                             color: pendingCount ? T.paper2 : T.inkFaint, borderRadius: 2,
-                             padding: "5px 14px", fontFamily: DISPLAY, fontWeight: 700, fontSize: 12,
-                             cursor: pendingCount ? "pointer" : "default" }}>
-              {busy ? "Saving…" : `Save changes${pendingCount ? ` (${pendingCount})` : ""}`}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Layered above this modal rather than replacing it, and reading the
-          targets as they are stored rather than as they are being edited —
-          history is what happened, not what is about to. */}
-      {history && (
-        <TargetHistoryModal project={project} targets={stored} focusTargetId={history.targetId}
-                            onClose={() => setHistory(null)} />
-      )}
-    </div>
-  );
-}
 
 function PasswordChangePanel({ onDone }) {
   const [password, setPassword] = useState("");
@@ -3357,445 +2398,17 @@ function PasswordChangePanel({ onDone }) {
   </div>;
 }
 
-const formatUploadDateTime = (value) => {
-  const date = new Date(value);
-  if (!value || Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
-};
 
-function DatasetHistoryModal({ onClose, onRestore }) {
-  const [versions, setVersions] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [restoringId, setRestoringId] = useState("");
 
-  useEffect(() => {
-    let alive = true;
-    loadDatasetVersions()
-      .then((rows) => { if (alive) setVersions(rows); })
-      .catch((err) => { if (alive) setError(err.message); })
-      .finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
-  }, []);
-
-  const restore = async (version) => {
-    const label = version.source_label || "this saved dataset";
-    if (!window.confirm(`Restore the shared Project Ledger to “${label}”?\n\nThe current imported data will be backed up first. Manual edits, targets and their audit history will not be changed.`)) return;
-    setRestoringId(version.id);
-    setError("");
-    try {
-      await onRestore(version);
-    } catch (err) {
-      setError(err.message);
-      setRestoringId("");
-    }
-  };
-
-  return (
-    <div role="dialog" aria-modal="true" aria-labelledby="dataset-history-title"
-         style={{ position: "fixed", inset: 0, zIndex: 45, background: "rgba(22,33,28,.45)",
-                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div style={{ width: "min(760px,100%)", maxHeight: "min(720px,90vh)", overflow: "auto",
-                    background: T.panel, border: `1px solid ${T.ink}`, boxShadow: "0 18px 50px rgba(22,33,28,.22)" }}>
-        <div className="flex items-start justify-between gap-4 px-4 py-3"
-             style={{ borderBottom: `1px solid ${T.rule}` }}>
-          <div>
-            <h2 id="dataset-history-title" style={{ fontFamily: DISPLAY, fontSize: 14, fontWeight: 800,
-                                                     textTransform: "uppercase", letterSpacing: ".045em" }}>
-              Previous shared data
-            </h2>
-            <p className="mt-1 text-[11.5px]" style={{ color: T.inkSoft }}>
-              Each entry is the complete imported ledger saved immediately before an Excel update or restore.
-              Restoring changes imported project and collection data only; manual edits, targets and audit history stay as they are.
-            </p>
-          </div>
-          <button type="button" onClick={onClose} disabled={Boolean(restoringId)}
-                  aria-label="Close previous data"
-                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
-                           padding: "3px 8px", cursor: restoringId ? "default" : "pointer" }}>×</button>
-        </div>
-
-        <div className="p-4">
-          {loading && <div style={{ color: T.inkSoft, fontSize: 12 }}>Loading restore points…</div>}
-          {error && <div role="alert" className="mb-3 px-3 py-2"
-                         style={{ color: T.bad, background: "#FBEEEC", border: `1px solid ${T.bad}55`, fontSize: 12 }}>
-            Could not restore data: {error}
-          </div>}
-          {!loading && !error && versions.length === 0 && (
-            <div className="px-3 py-8 text-center" style={{ color: T.inkSoft, background: T.paper2,
-                                                            border: `1px solid ${T.ruleSoft}`, fontSize: 12 }}>
-              No restore point exists yet. The system creates the first one immediately before the next successful Excel update.
-            </div>
-          )}
-          {versions.length > 0 && (
-            <div style={{ border: `1px solid ${T.ruleSoft}` }}>
-              {versions.map((version, index) => (
-                <div key={version.id} className="flex flex-wrap items-center justify-between gap-3 px-3 py-3"
-                     style={{ background: index % 2 ? T.paper2 : T.panel,
-                              borderBottom: index === versions.length - 1 ? "none" : `1px solid ${T.ruleSoft}` }}>
-                  <div style={{ minWidth: 0, flex: "1 1 420px" }}>
-                    <div className="text-[10px] uppercase tracking-wider" style={{ fontFamily: MONO, color: T.inkFaint }}>
-                      {version.saved_reason === "before_restore" ? "Saved before a restore" : "Saved before an Excel update"}
-                      {` · ${formatUploadDateTime(version.saved_at)}`}
-                    </div>
-                    <div className="mt-1 truncate text-xs" title={version.source_label || "No source label"}
-                         style={{ color: T.ink, fontWeight: 600 }}>
-                      {version.source_label || "No source label"}
-                    </div>
-                    <div className="mt-1 text-[10.5px]" style={{ fontFamily: MONO, color: T.inkSoft }}>
-                      {version.project_count || 0} projects · originally uploaded by {version.uploaded_by_username || "Unknown user"}
-                      {version.uploaded_at ? ` · ${formatUploadDateTime(version.uploaded_at)}` : ""}
-                    </div>
-                  </div>
-                  <button type="button" onClick={() => restore(version)} disabled={Boolean(restoringId)}
-                          style={{ border: `1px solid ${T.collected}`, background: restoringId === version.id ? T.paper2 : "#E4EFEC",
-                                   color: T.collected, borderRadius: 2, padding: "6px 11px", fontFamily: DISPLAY,
-                                   fontWeight: 700, fontSize: 11, textTransform: "uppercase",
-                                   cursor: restoringId ? "default" : "pointer", opacity: restoringId && restoringId !== version.id ? .45 : 1 }}>
-                    {restoringId === version.id ? "Restoring…" : "Restore this data"}
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ExcelDataButton({ count, disabled, onClick }) {
-  return <button type="button" onClick={onClick} disabled={disabled} aria-label={`View ${count} uploaded Excel file${count === 1 ? "" : "s"}`}
-    title={count ? "View uploaded Excel files" : "No Excel files uploaded"}
-    style={{ position: "relative", width: 34, height: 31, display: "inline-flex", alignItems: "center", justifyContent: "center", border: `1px solid ${count ? T.collected : T.rule}`, background: count ? "#E4EFEC" : T.paper2, color: count ? T.collected : T.inkFaint, opacity: disabled && count ? .6 : 1, cursor: count && !disabled ? "pointer" : "default" }}>
-    <svg width="19" height="19" viewBox="0 0 24 24" aria-hidden="true">
-      <path fill="currentColor" d="M13 2h6a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2h-6V2Z" opacity=".28" />
-      <path fill="currentColor" d="M3 5.3 14 3v18L3 18.7V5.3Zm3.1 3.1 1.8 3-2 3.2h2l1-1.8 1 1.8h2l-2-3.3 1.8-2.9H9.8L9 9.9l-.9-1.5h-2Z" />
-      <path fill="currentColor" d="M15.5 7H19v1.5h-3.5V7Zm0 3.2H19v1.5h-3.5v-1.5Zm0 3.3H19V15h-3.5v-1.5Z" />
-    </svg>
-    <span style={{ position: "absolute", top: -7, right: -7, minWidth: 18, height: 18, padding: "0 4px", borderRadius: 10, display: "inline-flex", alignItems: "center", justifyContent: "center", background: count ? T.ink : T.rule, color: T.paper2, border: `2px solid ${T.panel}`, fontFamily: MONO, fontSize: 9, fontWeight: 700 }}>{count}</span>
-  </button>;
-}
-
-/* Which of the administrator features one user may reach. Named permissions
-   rather than a second role, because the useful grants here are individually
-   sized: somebody who should see who is signed in almost never also needs to
-   destroy audit history. */
-function AccessModal({ user, granted, onToggle, onClose, busy }) {
-  const isAdmin = user.role === "admin";
-  return (
-    <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}
-         style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(22,33,28,.45)",
-                  display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div role="dialog" aria-modal="true" aria-labelledby="access-title"
-           style={{ width: "min(600px, 100%)", maxHeight: "86vh", overflow: "auto", background: T.panel,
-                    border: `1px solid ${T.ink}`, borderRadius: 2, boxShadow: "0 18px 50px rgba(0,0,0,.28)" }}>
-        <div className="flex items-start justify-between gap-3" style={{ padding: "12px 16px", borderBottom: `1px solid ${T.rule}` }}>
-          <div>
-            <h2 id="access-title" style={{ fontFamily: DISPLAY, fontSize: 13, fontWeight: 800, textTransform: "uppercase" }}>
-              Access · {user.username || user.email}
-            </h2>
-            <div style={{ marginTop: 3, fontSize: 11.5, color: T.inkSoft }}>
-              {isAdmin
-                ? "Administrators hold every permission. Change the role to grant these individually."
-                : "Each permission is granted separately and takes effect the next time this user loads the panel."}
-            </div>
-          </div>
-          <button type="button" onClick={onClose} aria-label="Close access"
-                  style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink, padding: "3px 8px", cursor: "pointer" }}>×</button>
-        </div>
-
-        <div style={{ padding: 16 }}>
-          {LEDGER_PERMISSIONS.map((permission) => {
-            const on = isAdmin || granted.has(permission.k);
-            return (
-              <label key={permission.k}
-                     style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "9px 0",
-                              borderBottom: `1px solid ${T.ruleSoft}`,
-                              cursor: isAdmin || busy ? "default" : "pointer", opacity: isAdmin ? 0.6 : 1 }}>
-                <input type="checkbox" checked={on} disabled={isAdmin || busy}
-                       onChange={(e) => onToggle(permission.k, e.target.checked)}
-                       style={{ marginTop: 2, width: 15, height: 15 }} />
-                <span>
-                  <span style={{ fontWeight: 600, fontSize: 12.5 }}>{permission.label}</span>
-                  {/* Said here rather than discovered later: two of these hide a
-                      control without being able to stop a determined request. */}
-                  {!permission.enforced && (
-                    <span title={permission.note}
-                          style={{ marginLeft: 6, fontFamily: MONO, fontSize: 9.5, color: T.works,
-                                   border: `1px solid ${T.works}55`, borderRadius: 2, padding: "0 4px" }}>
-                      UI only
-                    </span>
-                  )}
-                  <span style={{ display: "block", fontSize: 11, color: T.inkSoft, marginTop: 2 }}>
-                    {permission.detail}
-                  </span>
-                  {!permission.enforced && (
-                    <span style={{ display: "block", fontSize: 10, color: T.inkFaint, marginTop: 2 }}>
-                      {permission.note}
-                    </span>
-                  )}
-                </span>
-              </label>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AdminPanel({ onClose, currentUserId, onMultipleTargetsChanged }) {
-  const [users, setUsers] = useState([]);
-  const [captchaEnabled, setCaptchaEnabled] = useState(true);
-  const [temporary, setTemporary] = useState({});
-  const [resetSuccess, setResetSuccess] = useState({});
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  const [uploadOwner, setUploadOwner] = useState(null);
-  const [uploads, setUploads] = useState([]);
-  const [uploadsBusy, setUploadsBusy] = useState(false);
-  const [uploadMessage, setUploadMessage] = useState("");
-  const [fileBusy, setFileBusy] = useState("");
-  const [preview, setPreview] = useState(null);
-  const [previewSheet, setPreviewSheet] = useState("");
-  const [access, setAccess] = useState(new Map());
-  const [accessUser, setAccessUser] = useState(null);
-  const [accessBusy, setAccessBusy] = useState(false);
-
-  /* Grants live in their own table with their own RPCs, not behind the
-     admin-users edge function, because they are ordinary rows in this database
-     rather than anything needing the service key. Loaded by the mount effect
-     above; changed one at a time below. */
-  const toggleAccess = async (userId, permission, grantIt) => {
-    setAccessBusy(true);
-    const { error } = await supabase.rpc("set_ledger_permission", {
-      p_user_id: userId, p_permission: permission, p_granted: grantIt,
-    });
-    setAccessBusy(false);
-    if (error) { setMessage(`Could not change access: ${error.message}`); return; }
-    /* Updated in place rather than reloaded: the answer is known, and a reload
-       would close over a stale list while the request was in flight. */
-    setAccess((prev) => {
-      const next = new Map(prev);
-      const set = new Set(next.get(userId) || []);
-      if (grantIt) set.add(permission); else set.delete(permission);
-      next.set(userId, set);
-      return next;
-    });
-  };
-
-  const call = async (body) => {
-    setBusy(true); setMessage("");
-    const { data, error } = await supabase.functions.invoke("admin-users", { body });
-    setBusy(false);
-    if (error || data?.error) { setMessage(error?.message || data.error); return null; }
-    return data;
-  };
-  const uploadCall = async (body) => {
-    const { data, error } = await supabase.functions.invoke("admin-users", { body });
-    if (error || data?.error) throw new Error(error?.message || data.error);
-    return data;
-  };
-  const load = async () => { const data = await call({ action: "list" }); if (data) setUsers(data.users || []); };
-  useEffect(() => {
-    let alive = true;
-    supabase.functions.invoke("admin-users", { body: { action: "list" } }).then(({ data, error }) => {
-      if (!alive) return;
-      setBusy(false);
-      if (error || data?.error) setMessage(error?.message || data.error);
-      else { setUsers(data?.users || []); setCaptchaEnabled(data?.captcha_enabled !== false); }
-    });
-    /* Deferred with the users request rather than called straight from the
-       effect body, so nothing sets state during the render that scheduled it. */
-    supabase.rpc("list_ledger_permissions").then(({ data, error }) => {
-      if (!alive) return;
-      if (error) { setMessage(`Could not read access settings: ${error.message}`); return; }
-      const map = new Map();
-      for (const row of data || []) {
-        if (!map.has(row.user_id)) map.set(row.user_id, new Set());
-        map.get(row.user_id).add(row.permission);
-      }
-      setAccess(map);
-    });
-    return () => { alive = false; };
-  }, []);
-  const resetPassword = async (id) => {
-    const value = temporary[id] || "";
-    if (value.length < 6 || value.length > 8) { setMessage("Enter a temporary password between 6 and 8 characters."); return; }
-    const data = await call({ action: "reset-password", user_id: id, temporary_password: value });
-    if (data) { setMessage(`Temporary password created for ${users.find((u) => u.id === id)?.username || "the selected user"}.`); setResetSuccess((p) => ({ ...p, [id]: true })); setTemporary((p) => ({ ...p, [id]: "" })); await load(); }
-  };
-  const toggleBan = async (u) => { const data = await call({ action: u.banned_until ? "unban" : "ban", user_id: u.id }); if (data) await load(); };
-  const toggleCaptcha = async () => {
-    const data = await call({ action: "set-captcha", enabled: !captchaEnabled });
-    if (data) setCaptchaEnabled(data.captcha_enabled !== false);
-  };
-  const toggleMultipleTargets = async (selectedUser) => {
-    const enabled = !selectedUser.multiple_targets_enabled;
-    const data = await call({ action: "set-multiple-targets", user_id: selectedUser.id, enabled });
-    if (!data) return;
-    setUsers((previous) => previous.map((item) => (item.id === selectedUser.id
-      ? { ...item, multiple_targets_enabled: enabled } : item)));
-    if (selectedUser.id === currentUserId) onMultipleTargetsChanged(enabled);
-    setMessage(`Multiple targets ${enabled ? "enabled" : "disabled"} for ${selectedUser.username || selectedUser.email || "the selected user"}.`);
-  };
-  const openUploads = async (owner) => {
-    setUploadOwner(owner); setUploads([]); setPreview(null); setUploadMessage(""); setUploadsBusy(true);
-    try {
-      const data = await uploadCall({ action: "list-uploads", user_id: owner.id });
-      setUploads(data.uploads || []);
-    } catch (error) {
-      setUploadMessage(error.message);
-    } finally {
-      setUploadsBusy(false);
-    }
-  };
-  const closeUploads = () => { setUploadOwner(null); setUploads([]); setPreview(null); setUploadMessage(""); };
-  const viewUpload = async (upload) => {
-    setFileBusy(`view-${upload.id}`); setUploadMessage(""); setPreview({ upload, loading: true });
-    try {
-      const { url } = await uploadCall({ action: "file-url", upload_id: upload.id, download: false });
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`The workbook could not be opened (${response.status}).`);
-      const workbook = XLSX.read(await response.arrayBuffer(), { type: "array" });
-      const sheets = Object.fromEntries(workbook.SheetNames.map((name) => [name,
-        XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, raw: false, defval: "" })
-          .slice(0, 100).map((row) => (Array.isArray(row) ? row.slice(0, 30) : [])),
-      ]));
-      const firstSheet = workbook.SheetNames[0] || "";
-      setPreviewSheet(firstSheet);
-      setPreview({ upload, sheets, sheetNames: workbook.SheetNames });
-    } catch (error) {
-      setPreview({ upload, error: error.message });
-    } finally {
-      setFileBusy("");
-    }
-  };
-  const downloadUpload = async (upload) => {
-    setFileBusy(`download-${upload.id}`); setUploadMessage("");
-    try {
-      const { url } = await uploadCall({ action: "file-url", upload_id: upload.id, download: true });
-      const link = document.createElement("a");
-      link.href = url; link.download = upload.original_filename; document.body.appendChild(link); link.click(); link.remove();
-    } catch (error) {
-      setUploadMessage(error.message);
-    } finally {
-      setFileBusy("");
-    }
-  };
-
-  const actionButton = { padding: "4px 7px", border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink, fontSize: 11 };
-  const previewRows = preview?.sheets?.[previewSheet] || [];
-  return <div style={{ position: "fixed", inset: 0, zIndex: 25, background: "rgba(22,33,28,.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-    <div style={{ width: "min(1100px,100%)", maxHeight: "85vh", overflow: "auto", background: T.panel, border: `1px solid ${T.ink}` }}>
-      <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
-        <h2 style={{ fontFamily: DISPLAY, fontSize: 14, textTransform: "uppercase" }}>User management</h2>
-        <button type="button" onClick={onClose} style={{ border: `1px solid ${T.rule}`, background: T.paper2, padding: "3px 8px" }}>×</button>
-      </div>
-      <div style={{ padding: 16 }}>
-        {message && <div role="status" style={{ marginBottom: 10, color: message.includes("error") || message.includes("required") ? T.bad : T.inkSoft, fontSize: 12 }}>{message}</div>}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, padding: "10px 12px", marginBottom: 14, background: T.paper2, border: `1px solid ${T.rule}` }}>
-          <div>
-            <div style={{ fontFamily: DISPLAY, fontSize: 11, textTransform: "uppercase" }}>Live CAPTCHA protection</div>
-            <div style={{ marginTop: 3, color: T.inkSoft, fontSize: 11 }}>Require hCaptcha on sign-in and password recovery.</div>
-          </div>
-          <button type="button" disabled={busy} onClick={toggleCaptcha} style={{ minWidth: 92, padding: "6px 9px", border: `1px solid ${captchaEnabled ? T.collected : T.bad}`, background: captchaEnabled ? "#E4EFEC" : "#FBEEEC", color: captchaEnabled ? T.collected : T.bad, fontFamily: DISPLAY, fontWeight: 700, fontSize: 11 }}>
-            {captchaEnabled ? "Enabled" : "Disabled"}
-          </button>
-        </div>
-        <div className="overflow-auto"><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-          <thead><tr>{["Username", "Email", "Role", "Status", "Temporary password", "Data", "Multiple targets", "Access", "Actions"].map((h) => <th key={h} style={{ textAlign: "left", padding: "6px 7px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{h}</th>)}</tr></thead>
-          <tbody>{users.map((u) => <tr key={u.id}>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO }}>{u.username || "—"}</td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.email || "—"}</td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}>{u.role}</td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, color: u.banned_until ? T.bad : T.collected }}>{u.banned_until ? "Blocked" : "Active"}</td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}` }}><input type="password" minLength={6} maxLength={8} placeholder="6–8 characters" value={temporary[u.id] || ""} onChange={(e) => setTemporary((p) => ({ ...p, [u.id]: e.target.value }))} style={{ width: 150, padding: "4px 6px", border: `1px solid ${T.rule}`, fontFamily: MONO, fontSize: 11 }} /></td>
-            <td style={{ padding: "8px 12px 8px 7px", borderBottom: `1px solid ${T.ruleSoft}` }}><ExcelDataButton count={Number(u.upload_count) || 0} disabled={busy || !u.upload_count} onClick={() => openUploads(u)} /></td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}>
-              <button type="button" disabled={busy} onClick={() => toggleMultipleTargets(u)}
-                      title="Enable or disable the multiple-target modal for this user"
-                      style={{ ...actionButton, minWidth: 74,
-                               border: `1px solid ${u.multiple_targets_enabled ? T.collected : T.rule}`,
-                               background: u.multiple_targets_enabled ? "#E4EFEC" : T.paper2,
-                               color: u.multiple_targets_enabled ? T.collected : T.inkSoft }}>
-                {u.multiple_targets_enabled ? "Enabled" : "Disabled"}
-              </button>
-            </td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center" }}>
-              {/* A key, because what this opens is which doors this person can
-                  open — not a settings cog, which would read as preferences. */}
-              <button type="button" disabled={busy} onClick={() => setAccessUser(u)}
-                      aria-label={`Access for ${u.username || u.email}`}
-                      title={u.role === "admin"
-                        ? "Administrator — holds every permission"
-                        : `Access: ${(access.get(u.id)?.size || 0)} of ${LEDGER_PERMISSIONS.length} granted`}
-                      style={{ display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer",
-                               border: `1px solid ${T.rule}`, background: T.paper2, borderRadius: 2,
-                               padding: "3px 7px", color: T.ink }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true" fill="none"
-                     stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="8" cy="12" r="4" /><path d="M12 12h9M17 12v4M20.5 12v3" />
-                </svg>
-                <span style={{ fontFamily: MONO, fontSize: 10.5,
-                               color: u.role === "admin" ? T.collected : T.inkSoft }}>
-                  {u.role === "admin" ? "all" : `${access.get(u.id)?.size || 0}/${LEDGER_PERMISSIONS.length}`}
-                </span>
-              </button>
-            </td>
-            <td style={{ padding: 7, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}><button type="button" disabled={busy} onClick={() => resetPassword(u.id)} style={{ ...actionButton, marginRight: 6, background: resetSuccess[u.id] ? "#E4EFEC" : T.paper2, color: resetSuccess[u.id] ? T.collected : T.ink }}>{resetSuccess[u.id] ? "Created ✓" : "Reset"}</button><button type="button" disabled={busy} onClick={() => toggleBan(u)} style={{ ...actionButton, border: `1px solid ${u.banned_until ? T.collected : T.bad}`, color: u.banned_until ? T.collected : T.bad }}>{u.banned_until ? "Unblock" : "Block"}</button></td>
-          </tr>)}</tbody>
-        </table></div>
-      </div>
-    </div>
-
-    {uploadOwner && <div style={{ position: "fixed", inset: 0, zIndex: 28, background: "rgba(22,33,28,.58)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div style={{ width: "min(980px,100%)", maxHeight: "88vh", overflow: "auto", background: T.panel, border: `1px solid ${T.ink}`, boxShadow: "0 18px 55px rgba(22,33,28,.24)" }}>
-        <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${T.rule}` }}>
-          <div><h3 style={{ fontFamily: DISPLAY, fontSize: 13, textTransform: "uppercase" }}>Uploaded Excel files</h3><div style={{ marginTop: 2, color: T.inkSoft, fontSize: 11 }}>{uploadOwner.username || uploadOwner.email || "User"} · {uploads.length} file{uploads.length === 1 ? "" : "s"}</div></div>
-          <button type="button" onClick={closeUploads} style={{ border: `1px solid ${T.rule}`, background: T.paper2, padding: "3px 8px" }}>×</button>
-        </div>
-        <div style={{ padding: 16 }}>
-          {uploadMessage && <div role="alert" style={{ marginBottom: 10, color: T.bad, fontSize: 12 }}>{uploadMessage}</div>}
-          {uploadsBusy ? <div style={{ padding: 20, color: T.inkSoft, textAlign: "center", fontSize: 12 }}>Loading uploaded files…</div> : uploads.length === 0 ? <div style={{ padding: 20, color: T.inkSoft, textAlign: "center", fontSize: 12 }}>No uploaded Excel files were found.</div> :
-            <div className="overflow-auto"><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-              <thead><tr>{["Excel title", "Uploaded date and time", "Actions"].map((h) => <th key={h} style={{ textAlign: "left", padding: "7px 8px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase" }}>{h}</th>)}</tr></thead>
-              <tbody>{uploads.map((upload) => <tr key={upload.id}>
-                <td style={{ padding: 8, borderBottom: `1px solid ${T.ruleSoft}`, fontFamily: MONO, overflowWrap: "anywhere" }}>{upload.original_filename}</td>
-                <td style={{ padding: 8, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}>{formatUploadDateTime(upload.uploaded_at)}</td>
-                <td style={{ padding: 8, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap" }}><button type="button" disabled={Boolean(fileBusy)} onClick={() => viewUpload(upload)} style={{ ...actionButton, marginRight: 6 }}>{fileBusy === `view-${upload.id}` ? "Opening…" : "View"}</button><button type="button" disabled={Boolean(fileBusy)} onClick={() => downloadUpload(upload)} style={actionButton}>{fileBusy === `download-${upload.id}` ? "Preparing…" : "Download"}</button></td>
-              </tr>)}</tbody>
-            </table></div>}
-
-          {preview && <div style={{ marginTop: 16, border: `1px solid ${T.rule}`, background: T.paper2 }}>
-            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2" style={{ borderBottom: `1px solid ${T.ruleSoft}` }}>
-              <div style={{ fontFamily: MONO, fontSize: 11, fontWeight: 700, overflowWrap: "anywhere" }}>{preview.upload.original_filename}</div>
-              <div className="flex items-center gap-2">{preview.sheetNames?.length > 0 && <select value={previewSheet} onChange={(e) => setPreviewSheet(e.target.value)} style={{ padding: "4px 7px", border: `1px solid ${T.rule}`, background: T.panel, fontSize: 11 }}>{preview.sheetNames.map((name) => <option key={name} value={name}>{name}</option>)}</select>}<button type="button" onClick={() => setPreview(null)} style={actionButton}>Close preview</button></div>
-            </div>
-            {preview.loading ? <div style={{ padding: 24, color: T.inkSoft, textAlign: "center", fontSize: 12 }}>Reading workbook…</div> : preview.error ? <div role="alert" style={{ padding: 14, color: T.bad, fontSize: 12 }}>{preview.error}</div> : <><div className="overflow-auto" style={{ maxHeight: 330 }}><table style={{ borderCollapse: "collapse", minWidth: "100%", fontFamily: MONO, fontSize: 10 }}><tbody>{previewRows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex} style={{ maxWidth: 260, padding: "4px 6px", borderRight: `1px solid ${T.ruleSoft}`, borderBottom: `1px solid ${T.ruleSoft}`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: rowIndex === 0 ? 700 : 400 }}>{String(cell)}</td>)}</tr>)}</tbody></table></div><div style={{ padding: "6px 9px", color: T.inkFaint, fontSize: 10 }}>Preview shows the first 100 rows and 30 columns of the selected sheet.</div></>}
-          </div>}
-        </div>
-      </div>
-    </div>}
-    {accessUser && (
-      <AccessModal
-        user={accessUser}
-        granted={access.get(accessUser.id) || new Set()}
-        busy={accessBusy}
-        onToggle={(permission, grantIt) => toggleAccess(accessUser.id, permission, grantIt)}
-        onClose={() => setAccessUser(null)} />
-    )}
-  </div>;
-}
 
 /* ---------------- app ---------------- */
 
 export default function ProjectLedger({ user, onSignOut }) {
   const [store, setStore] = useState(EMPTY_STORE);
-  const [sourceLabel, setSourceLabel] = useState("Loading…");
+  const [sourceLabel, setSourceLabel] = useState("Checking shared server…");
   const [uploadedBy, setUploadedBy] = useState("");
-  const [dataReady, setDataReady] = useState(false);
+  const [dataset, setDataset] = useState(() => ({ status: "loading", value: null, error: "" }));
+  const [datasetAttempt, setDatasetAttempt] = useState(0);
   const [log, setLog] = useState([]);
   const [busy, setBusy] = useState(false);
   const [datasetHistoryOpen, setDatasetHistoryOpen] = useState(false);
@@ -3804,7 +2417,13 @@ export default function ProjectLedger({ user, onSignOut }) {
      A failure that renders as "nothing found" is what let a save overwrite
      stored values with the blanks it was showing. See ./lib/panelData. */
   const [manual, setManual] = useState(loadingState);
+  const [manualAttempt, setManualAttempt] = useState(0);
   const [targets, setTargets] = useState(loadingState);
+  const [targetsAttempt, setTargetsAttempt] = useState(0);
+  const [profile, setProfile] = useState(loadingState);
+  const [profileAttempt, setProfileAttempt] = useState(0);
+  const [permissions, setPermissions] = useState(loadingState);
+  const [permissionsAttempt, setPermissionsAttempt] = useState(0);
   const [manageTarget, setManageTarget] = useState(null);
   const [drafts, setDrafts] = useState({});
   const [savingIds, setSavingIds] = useState(new Set());
@@ -3818,81 +2437,146 @@ export default function ProjectLedger({ user, onSignOut }) {
   const [deletingProject, setDeletingProject] = useState(null);
   const [reloadPrompt, setReloadPrompt] = useState(false);
   const [presence, setPresence] = useState({ users: [], error: "" });
-  const [permissions, setPermissions] = useState(null);
   const [duplicatesOnly, setDuplicatesOnly] = useState(false);
+  const [duplicateState, setDuplicateState] = useState(() => ({ source: null, value: null }));
   const [addingProject, setAddingProject] = useState(false);
 
   const userId = user?.id;
 
-  useEffect(() => {
-    let alive = true;
-    /* Settled independently and deliberately. Awaiting them together meant one
-       rejection discarded the other's result, so a missing targets table took
-       every hand-typed status, contract and remark off the screen with it. */
-    once("manual+targets", () => Promise.allSettled([loadManual(), loadTargets()])).then(([m, t]) => {
-      if (!alive) return;
-      const manualState = settleLoad(m);
-      const targetState = settleLoad(t);
-      setManual(manualState);
-      setTargets(targetState);
-      const problems = [
-        hasFailed(manualState) && `saved project updates (${manualState.error})`,
-        hasFailed(targetState) && `targets (${targetState.error})`,
-      ].filter(Boolean);
-      if (problems.length) setSaveMessage(`Could not load ${problems.join(" and ")}.`);
-    });
-    if (isConfigured && supabase && userId) {
-      /* Shared for the same reason as the loads above, and it matters more here
-         than it looks: a discarded profile row leaves `role` at its "user"
-         default, so an administrator silently loses the admin UI. */
-      once(`profile:${userId}`, () => supabase.from("profiles")
-        .select("username, role, force_password_change, multiple_targets_enabled")
-        .eq("id", userId).maybeSingle())
-        .then(({ data }) => {
-          if (!alive || !data) return;
-          if (data.username) setUsername(data.username);
-          setRole(data.role || "user");
-          setForcePasswordChange(Boolean(data.force_password_change));
-          setMultipleTargetsEnabled(Boolean(data.multiple_targets_enabled));
-        });
-    }
-    return () => { alive = false; };
-    /* Keyed on the user's ID and not on the user object. AuthGate hands down
-       `session.user`, and a token refresh produces a new object with the same
-       contents — so depending on the object re-ran this whole load on every
-       refresh, throwing away whatever was still in flight each time. */
-  }, [userId]);
+  useLayoutEffect(() => {
+    recordLedgerStartupSince("shell.commit_after_auth", "authenticated", { outcome: "ok" });
+    markLedgerStartupPoint("shell_committed");
+  }, []);
 
   /* Apply the shared dataset on initial load and after an import or restore. */
-  const applyDataset = (row) => {
+  const applyDataset = useCallback((row) => {
+    const finish = startLedgerTiming("dataset.apply");
     if (!row) {
       setStore(EMPTY_STORE);
       setSourceLabel(isConfigured ? NO_DATA_LABEL : "Supabase not configured — imports cannot be saved");
       setUploadedBy("");
+      finish({ outcome: "ok", projectCount: 0 });
       return;
     }
     setStore(row.store);
     setSourceLabel(row.label || `${row.store.coll.length} projects`);
     setUploadedBy(row.username ? `uploaded by ${row.username}${row.at ? " · " + fmtDate(row.at.slice(0, 10)) : ""}` : "");
-  };
+    finish({ outcome: "ok", projectCount: row.store.dim.size });
+  }, []);
 
   useEffect(() => {
     let alive = true;
-    once("dataset", () => withTimeout(loadDataset(), DATASET_TIMEOUT_MS, "The saved ledger"))
+    loadCurrentDataset()
       .then((row) => {
         if (!alive) return;
         applyDataset(row);
-        setDataReady(true);
-      }).catch((error) => {
+        setDataset({ status: "ready", value: row, error: "" });
+      })
+      .catch((error) => {
         if (!alive) return;
-        setSourceLabel("Could not load the saved ledger");
-        setLog([{ warn: true, text: `Could not load the saved ledger: ${error.message}. Reload the page to try again.` }]);
-        setDataReady(true);
+        setSourceLabel("Latest ledger unavailable");
+        setDataset({ status: "failed", value: null, error: error.message || String(error) });
       });
     return () => { alive = false; };
-  }, []);
+  }, [datasetAttempt, applyDataset]);
+
+  useEffect(() => {
+    let alive = true;
+    once(`manual:${userId}:${manualAttempt}`, () => withTimeout(loadManual(), SECONDARY_LOAD_TIMEOUT_MS, "Saved project updates"))
+      .then((value) => { if (alive) setManual(settleLoad({ status: "fulfilled", value })); })
+      .catch((error) => { if (alive) setManual(settleLoad({ status: "rejected", reason: error })); });
+    return () => { alive = false; };
+  }, [userId, manualAttempt]);
+
+  useEffect(() => {
+    let alive = true;
+    once(`targets:${userId}:${targetsAttempt}`, () => withTimeout(loadTargets(), SECONDARY_LOAD_TIMEOUT_MS, "Project targets"))
+      .then((value) => { if (alive) setTargets(settleLoad({ status: "fulfilled", value })); })
+      .catch((error) => { if (alive) setTargets(settleLoad({ status: "rejected", reason: error })); });
+    return () => { alive = false; };
+  }, [userId, targetsAttempt]);
+
+  useEffect(() => {
+    let alive = true;
+    once(`profile:${userId}:${profileAttempt}`, () => withTimeout(loadProfile(userId), SECONDARY_LOAD_TIMEOUT_MS, "Account settings"))
+      .then((value) => {
+        if (!alive) return;
+        setProfile(settleLoad({ status: "fulfilled", value }));
+        if (value.username) setUsername(value.username);
+        setRole(value.role || "user");
+        setForcePasswordChange(Boolean(value.force_password_change));
+        setMultipleTargetsEnabled(Boolean(value.multiple_targets_enabled));
+      })
+      .catch((error) => { if (alive) setProfile(settleLoad({ status: "rejected", reason: error })); });
+    return () => { alive = false; };
+  }, [userId, profileAttempt]);
+
+  useEffect(() => {
+    let alive = true;
+    once(`permissions:${userId}:${permissionsAttempt}`, () => withTimeout(loadMyPermissions(), SECONDARY_LOAD_TIMEOUT_MS, "Access controls"))
+      .then((value) => { if (alive) setPermissions(settleLoad({ status: "fulfilled", value })); })
+      .catch((error) => { if (alive) setPermissions(settleLoad({ status: "rejected", reason: error })); });
+    return () => { alive = false; };
+  }, [userId, permissionsAttempt]);
+
+  const readiness = ledgerReadiness({
+    datasetStatus: dataset.status,
+    manualStatus: manual.status,
+    targetsStatus: targets.status,
+    profileStatus: profile.status,
+    forcePasswordChange,
+  });
+  const dataReady = readiness.datasetReady;
+  const coreReadyReported = useRef(false);
+  const firstRowsReported = useRef(false);
+  const editingReadyReported = useRef(false);
+  const startupSettledReported = useRef(false);
+
+  useEffect(() => {
+    if (!readiness.coreReady || coreReadyReported.current) return;
+    coreReadyReported.current = true;
+    recordLedgerStartupSince("ledger.core_ready_after_auth", "authenticated", {
+      outcome: "ok", datasetReady: true, manualReady: true, profileReady: true,
+      targetsReady: readiness.targetsReady, permissionsReady: isReady(permissions),
+    });
+  }, [readiness.coreReady, readiness.targetsReady, permissions]);
+
+  useEffect(() => {
+    if (!readiness.mutationsReady || editingReadyReported.current) return;
+    editingReadyReported.current = true;
+    recordLedgerStartupSince("ledger.editing_ready_after_auth", "authenticated", {
+      outcome: "ok", datasetReady: true, manualReady: true, profileReady: true,
+      targetsReady: readiness.targetsReady, permissionsReady: isReady(permissions),
+    });
+  }, [readiness.mutationsReady, readiness.targetsReady, permissions]);
+
+  useEffect(() => {
+    const settled = [dataset, manual, targets, profile, permissions]
+      .every((state) => state.status !== "loading");
+    if (!settled || startupSettledReported.current) return;
+    startupSettledReported.current = true;
+    recordLedgerStartupSince("ledger.all_startup_requests_settled", "authenticated", {
+      outcome: [dataset, manual, targets, profile, permissions].some(hasFailed) ? "partial" : "ok",
+      datasetReady: readiness.datasetReady,
+      manualReady: readiness.manualReady,
+      targetsReady: readiness.targetsReady,
+      profileReady: readiness.profileReady,
+      permissionsReady: isReady(permissions),
+    });
+  }, [dataset, manual, targets, profile, permissions, readiness]);
+
+  const retryDataset = () => {
+    setDataset({ status: "loading", value: null, error: "" });
+    setSourceLabel("Checking shared server…");
+    setDatasetAttempt((value) => value + 1);
+  };
+  const retryManual = () => { setManual(loadingState()); setManualAttempt((value) => value + 1); };
+  const retryTargets = () => { setTargets(loadingState()); setTargetsAttempt((value) => value + 1); };
+  const retryProfile = () => { setProfile(loadingState()); setProfileAttempt((value) => value + 1); };
+  const retryPermissions = () => { setPermissions(loadingState()); setPermissionsAttempt((value) => value + 1); };
 
   const restorePreviousDataset = async (version) => {
+    if (!readiness.mutationsReady) throw new Error("The current ledger is not ready for shared changes.");
     await restoreDatasetVersion(version.id);
     const restored = await loadDataset();
     applyDataset(restored);
@@ -3900,7 +2584,8 @@ export default function ProjectLedger({ user, onSignOut }) {
     setLog([{ text: `Restored previous shared data: ${version.source_label || "saved dataset"}. Manual edits, targets and audit history were retained.` }]);
   };
 
-  const editManual = (id, field, value) =>
+  const editManual = (id, field, value) => {
+    if (!readiness.mutationsReady || (INLINE_TARGET_FIELD_KEYS.has(field) && !readiness.targetMutationsReady)) return;
     setDrafts((prev) => {
       const row = { ...(prev[id] || {}) };
       row[field] = value;
@@ -3908,10 +2593,7 @@ export default function ProjectLedger({ user, onSignOut }) {
       next[id] = row;
       return next;
     });
-
-  /* "still loading" and "failed" are different: only the first shows a spinner
-     message, but neither may be treated as an answer. */
-  const manualLoading = !isReady(manual) && !hasFailed(manual);
+  };
 
   const dirtyIds = useMemo(() => new Set(Object.keys(drafts)), [drafts]);
   const dirtyCount = useMemo(() => Object.values(drafts)
@@ -3922,6 +2604,10 @@ export default function ProjectLedger({ user, onSignOut }) {
      Every existing caller ignores it and is unaffected. */
   const saveRow = async (id) => {
     if (!drafts[id] || savingIds.has(id)) return false;
+    if (!readiness.mutationsReady) {
+      setSaveMessage(`Could not save ${id}: the latest shared ledger and account settings are not confirmed.`);
+      return false;
+    }
     const draft = drafts[id];
     const manualDraft = {};
     const targetDraft = {};
@@ -4016,6 +2702,10 @@ export default function ProjectLedger({ user, onSignOut }) {
      delete. Failing between the two leaves the DB rows gone and the imported row
      present, which the message says plainly so it can be retried. */
   const deleteProject = async (row, reason) => {
+    if (!readiness.mutationsReady) {
+      setSaveMessage(`Could not delete ${row.id}: the latest shared ledger is not confirmed.`);
+      return;
+    }
     setBusy(true);
     setSaveMessage("");
     try {
@@ -4090,18 +2780,23 @@ export default function ProjectLedger({ user, onSignOut }) {
      added to the build, delete this block and the memos together and let it do
      the work. */
   /* eslint-disable react-hooks/preserve-manual-memoization */
-  const importedRows = useMemo(() => assemble(store.coll, store.dim), [store]);
+  const importedRows = useMemo(() => measureLedgerWork(
+    "projects.assemble",
+    () => assemble(store.coll, store.dim),
+    { projectCount: store.dim.size },
+  ), [store]);
   /* Version-1 datasets had no durable assignment for Project-ID-only manual
      data. Derive it immediately so existing values never disappear while the
      user is waiting to make the first year-aware import; the next save of the
      shared dataset persists the same assignment. */
   const legacyAssignments = useMemo(
-    () => extendLegacyAssignments(store.legacy, importedRows),
+    () => measureLedgerWork("projects.legacy_assignments",
+      () => extendLegacyAssignments(store.legacy, importedRows), { projectCount: importedRows.length }),
     [store.legacy, importedRows],
   );
   /* imported columns and hand-typed columns are merged only at render time — an
      import rebuilds `importedRows` and never touches `manual` */
-  const records = useMemo(() => {
+  const records = useMemo(() => measureLedgerWork("projects.merge_and_derive", () => {
     const today = todayMs();
     return importedRows.map((r) => {
       const key = projectKey(r.id);
@@ -4173,8 +2868,20 @@ export default function ProjectLedger({ user, onSignOut }) {
           .filter(set).join(" ").toLowerCase();
       return merged;
     });
-  }, [importedRows, manual, drafts, targets, legacyAssignments, multipleTargetsEnabled]);
+  }, {
+    projectCount: importedRows.length,
+    manualReady: isReady(manual),
+    targetsReady: isReady(targets),
+  }), [importedRows, manual, drafts, targets, legacyAssignments, multipleTargetsEnabled]);
   /* eslint-enable react-hooks/preserve-manual-memoization */
+
+  useEffect(() => {
+    if (!readiness.coreReady || !records.length || firstRowsReported.current) return;
+    firstRowsReported.current = true;
+    recordLedgerStartupSince("ledger.first_rows_ready_after_auth", "authenticated", {
+      outcome: "ok", projectCount: records.length,
+    });
+  }, [readiness.coreReady, records.length]);
 
   /* Ctrl+S (Cmd+S on a Mac) saves every pending change — the same work the Save
      changes button does, and nothing the buttons cannot already do. Both of
@@ -4204,6 +2911,7 @@ export default function ProjectLedger({ user, onSignOut }) {
       /* Saying nothing here reads as a broken shortcut, so each case that
          declines to save says why in the same place a save would report. */
       if (!isConfigured) { setSaveMessage("Could not save: Supabase is not configured."); return; }
+      if (!readiness.mutationsReady) { setSaveMessage("Could not save: the latest shared ledger and account settings are not confirmed."); return; }
       if (busy || savingIds.size) return;
       if (!dirtyCount) { setSaveMessage("No unsaved changes."); return; }
       saveAll();
@@ -4211,7 +2919,7 @@ export default function ProjectLedger({ user, onSignOut }) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dialogOpen, busy, savingIds, dirtyCount, dirtyIds, drafts]);
+  }, [dialogOpen, busy, savingIds, dirtyCount, dirtyIds, drafts, readiness.mutationsReady]);
 
   /* Losing typed values to a refresh.
 
@@ -4261,11 +2969,28 @@ export default function ProjectLedger({ user, onSignOut }) {
      opposite of what it is for. Beating continues while the tab is in the
      background, because a backgrounded tab is still the panel being open. */
   useEffect(() => {
-    if (!user?.id || !isConfigured) return undefined;
-    recordPresence();
-    const beat = setInterval(recordPresence, PRESENCE_BEAT_MS);
-    return () => clearInterval(beat);
-  }, [user?.id]);
+    if (!user?.id || !isConfigured || !readiness.coreReady) return undefined;
+    let alive = true;
+    let beat;
+    let idle;
+    let timer;
+    const start = () => {
+      if (!alive) return;
+      recordPresence();
+      beat = setInterval(recordPresence, PRESENCE_BEAT_MS);
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      idle = window.requestIdleCallback(start, { timeout: 2_000 });
+    } else {
+      timer = window.setTimeout(start, 0);
+    }
+    return () => {
+      alive = false;
+      if (idle !== undefined) window.cancelIdleCallback?.(idle);
+      if (timer !== undefined) window.clearTimeout(timer);
+      if (beat !== undefined) clearInterval(beat);
+    };
+  }, [user?.id, readiness.coreReady]);
 
   /* Only administrators poll, so nobody else spends a request every 30 seconds
      on a list they are not allowed to see and would be refused anyway. */
@@ -4273,7 +2998,8 @@ export default function ProjectLedger({ user, onSignOut }) {
     /* No state is reset on the way out: the strip is only rendered for an
        admin, so a leftover list is never shown, and clearing it here would be a
        synchronous setState in an effect for no visible gain. */
-    if (!isConfigured || !Array.isArray(permissions) || !permissions.includes("view_presence")) return undefined;
+    if (!isConfigured || !readiness.coreReady || !isReady(permissions)
+        || !permissions.value.includes("view_presence")) return undefined;
     let alive = true;
     const read = async () => {
       try {
@@ -4289,13 +3015,14 @@ export default function ProjectLedger({ user, onSignOut }) {
     read();
     const poll = setInterval(read, PRESENCE_POLL_MS);
     return () => { alive = false; clearInterval(poll); };
-  }, [permissions]);
+  }, [permissions, readiness.coreReady]);
 
   /* Returns an error sentence for the form to print, or "" when it worked.
      Saved to the shared dataset immediately rather than held locally: a project
      only this browser knows about is not in the ledger in any sense that
      matters, and the next person to import would never see it. */
   const createProject = async (input) => {
+    if (!readiness.mutationsReady) return "The latest shared ledger and account settings must be confirmed first.";
     const built = buildManualProject(
       { ...input, swa: input.swa === "" || input.swa === undefined ? "" : fractionFromPercent(input.swa) },
       { currentYear: new Date().getFullYear() },
@@ -4366,19 +3093,9 @@ export default function ProjectLedger({ user, onSignOut }) {
     onSignOut();
   };
 
-  /* null until the answer arrives, and every gate treats null as "no". Drawing
-     a control and taking it away once the real answer lands is worse than a
-     brief absence, and offering an action the database will refuse is worse. */
-  useEffect(() => {
-    if (!isConfigured || !user?.id) return undefined;   // stays null, which reads as no access
-    let alive = true;
-    loadMyPermissions()
-      .then((list) => { if (alive) setPermissions(list); })
-      .catch(() => { if (alive) setPermissions([]); });
-    return () => { alive = false; };
-  }, [user?.id, role]);
-
-  const can = (permission) => Array.isArray(permissions) && permissions.includes(permission);
+  /* Loading and failure both deny access. Supabase RLS/RPC checks remain the
+     authority; this only decides which controls can be drawn. */
+  const can = (permission) => isReady(permissions) && permissions.value.includes(permission);
 
   const reloadNow = () => { allowUnload.current = true; window.location.reload(); };
 
@@ -4392,10 +3109,22 @@ export default function ProjectLedger({ user, onSignOut }) {
   };
 
   const handleFiles = async (files) => {
+    if (!readiness.mutationsReady) {
+      setLog([{ warn: true, text: "Import is locked until the latest shared ledger and account settings are confirmed." }]);
+      return;
+    }
     setBusy(true);
     const out = [];
     const acceptedFiles = [];
     let coll = store.coll, dim = store.dim, gotColl = false, gotMaster = false;
+    let XLSX;
+    try {
+      XLSX = await loadXlsx();
+    } catch (error) {
+      setLog([{ warn: true, text: error.message }]);
+      setBusy(false);
+      return;
+    }
     for (const f of files) {
       try {
         let accepted = false;
@@ -4502,13 +3231,56 @@ export default function ProjectLedger({ user, onSignOut }) {
      to say so rather than sitting there looking as though it still applies.
      Non-admins never reach this mode and their filters behave exactly as
      before. */
-  const duplicates = useMemo(() => duplicateProjectIds(records), [records]);
+  const duplicateAccess = can("view_duplicates");
+  const duplicatesReady = duplicateState.source === importedRows && duplicateState.value;
+  const duplicates = duplicatesReady
+    ? duplicateState.value
+    : { groups: [], identities: new Set(), rowCount: 0 };
+
+  /* Duplicate identities depend only on the authoritative/imported project
+     rows, not on manual cell drafts, targets, filtering or sorting. Compute the
+     tool after the core table has had a chance to commit, and only for somebody
+     allowed to open it. A right-click while this is pending shows "Checking…"
+     rather than forcing the normal ledger render to do the work. */
+  useEffect(() => {
+    if (!duplicateAccess || !importedRows.length || duplicateState.source === importedRows) return undefined;
+    let alive = true;
+    let idle;
+    let timer;
+    const compute = () => {
+      if (!alive) return;
+      const value = measureLedgerWork("projects.duplicates", () => duplicateProjectIds(importedRows), {
+        projectCount: importedRows.length,
+      });
+      if (alive) setDuplicateState({ source: importedRows, value });
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      idle = window.requestIdleCallback(compute, { timeout: 3_000 });
+    } else {
+      timer = window.setTimeout(compute, 0);
+    }
+    return () => {
+      alive = false;
+      if (idle !== undefined) window.cancelIdleCallback?.(idle);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [duplicateAccess, importedRows, duplicateState.source]);
   /* Guarded on the role as well as the flag, so a role that changes while the
      view is open drops straight back to the ordinary filtered table. */
   const duplicateView = can("view_duplicates") && duplicatesOnly;
-  const rows = duplicateView
-    ? records.filter((r) => duplicates.identities.has(r.identity))
-    : records.filter((r) => passes(r, null));
+  /* Memoised because the identity of this array, not just its contents, is
+     load-bearing: LedgerTable sorts it in a useMemo keyed on it. Rebuilt fresh
+     on every render, that sort re-ran — and handed the table a new array — for
+     changes that had nothing to do with the rows, down to the 30-second
+     presence poll. The filtering itself is unchanged, and still runs over every
+     record rather than over what happens to be on screen. */
+  const rows = useMemo(
+    () => (duplicateView
+      ? records.filter((r) => duplicates.identities.has(r.identity))
+      : records.filter((r) => passes(r, null))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [duplicateView, records, duplicates.identities, query, filters],
+  );
 
   const countsFor = (dimKey) => {
     const m = new Map();
@@ -4568,6 +3340,15 @@ export default function ProjectLedger({ user, onSignOut }) {
   const anyActive = activeSegs.length > 0 || query.length > 0;
   /* nothing to filter, chart or total until a workbook has been imported */
   const empty = records.length === 0;
+  const mutationLockReason = dataset.status === "failed"
+    ? "The latest shared ledger could not be loaded. Retry before changing shared data."
+    : hasFailed(manual)
+      ? "Saved project updates are unavailable. Retry before editing or importing."
+      : hasFailed(profile)
+        ? "Account settings are unavailable. Retry before editing or importing."
+        : forcePasswordChange
+          ? "Change the temporary password before editing shared data."
+          : "Project Ledger is still confirming the latest shared data and account settings.";
 
   return (
     <div style={{
@@ -4588,11 +3369,13 @@ export default function ProjectLedger({ user, onSignOut }) {
            70%  { transform: scale(2.6); opacity: 0; }
            100% { transform: scale(2.6); opacity: 0; }
          }
+         @keyframes ledgerSpin { to { transform: rotate(360deg); } }
          .ledger-pulse-ring { animation: ledgerPulse 2.4s ease-out infinite; }
          /* Somebody who has asked for less motion still needs to see who is
             online; they just do not need it moving. */
          @media (prefers-reduced-motion: reduce) {
            .ledger-pulse-ring { animation: none; opacity: .35; }
+           .ledger-startup-spinner { animation: none !important; }
          }` }} />
 
       <div className="mx-auto max-w-[1480px] px-4 pb-16">
@@ -4606,7 +3389,7 @@ export default function ProjectLedger({ user, onSignOut }) {
           </div>
           <div className="flex items-end gap-4 text-right text-[11px] leading-relaxed" style={{ fontFamily: MONO, color: T.inkSoft }}>
             <div>
-              {records.length} projects loaded<br />
+              {dataReady ? records.length : "—"} projects loaded<br />
               master from QMB Projects + QM Licenses
             </div>
             {can("view_presence") && <PresenceStrip presence={presence} currentUsername={username} />}
@@ -4635,12 +3418,25 @@ export default function ProjectLedger({ user, onSignOut }) {
           </div>
         </header>
 
+        <LedgerStartupStatus
+          dataset={dataset} manual={manual} targets={targets} profile={profile} permissions={permissions}
+          onRetry={{
+            "Latest ledger": retryDataset,
+            "Saved updates": retryManual,
+            Targets: retryTargets,
+            "Account settings": retryProfile,
+            "Access controls": retryPermissions,
+          }} />
+
         <ImportPanel onLoad={handleFiles} sourceLabel={sourceLabel} uploadedBy={uploadedBy}
-                     log={log} busy={busy} onPrevious={() => setDatasetHistoryOpen(true)}
+                     log={log} busy={busy} disabled={!readiness.mutationsReady}
+                     disabledReason={mutationLockReason}
+                     onPrevious={() => setDatasetHistoryOpen(true)}
                      canRestorePrevious={can("previous_data")}
                      forceOpen={dataReady && empty} />
 
-        {empty ? <EmptyLedger loading={!dataReady} configured={isConfigured} /> : <>
+        {empty ? <EmptyLedger loading={dataset.status === "loading"} unavailable={dataset.status === "failed"}
+                              configured={isConfigured} /> : <>
 
         <FilterBar q={q} setQ={setQ} filters={filters} countsFor={countsFor}
                    onToggle={toggle} onClearOne={clearOne} onClearAll={clearAll} anyActive={anyActive}
@@ -4729,12 +3525,12 @@ export default function ProjectLedger({ user, onSignOut }) {
               <GroupChart rows={rows} groupBy={groupBy} onGroupBy={setGroupBy} />
             </div>
 
-            {(manualLoading || saveMessage) && (
+            {saveMessage && (
               <div className="mb-2 px-3 py-2 text-xs" role={saveMessage.startsWith("Could") ? "alert" : undefined}
                    style={{ color: saveMessage.startsWith("Could") ? T.bad : T.inkSoft,
                             background: saveMessage.startsWith("Could") ? "#FBEEEC" : T.paper2,
                             border: `1px solid ${saveMessage.startsWith("Could") ? T.bad + "55" : T.rule}` }}>
-                {manualLoading ? "Loading saved project updates…" : saveMessage}
+                {saveMessage}
               </div>
             )}
             <LedgerTable rows={rows} sort={sort} onSort={onSort} onExport={exportCsv} onEdit={editManual}
@@ -4742,11 +3538,14 @@ export default function ProjectLedger({ user, onSignOut }) {
                          savingIds={savingIds} onAuditCell={setAuditTarget}
                          onManageTargets={setManageTarget} multipleTargetsEnabled={multipleTargetsEnabled}
                          isAdmin={role === "admin"}
-                         onDeleteProject={can("delete_project") ? setDeletingProject : undefined}
-                         onViewDuplicates={can("view_duplicates") ? () => setDuplicatesOnly(true) : undefined}
-                         duplicateCount={duplicates.groups.length}
+                         readOnly={!readiness.mutationsReady}
+                         targetReadOnly={!readiness.targetMutationsReady}
+                         readOnlyReason={mutationLockReason}
+                         onDeleteProject={readiness.mutationsReady && can("delete_project") ? setDeletingProject : undefined}
+                         onViewDuplicates={duplicateAccess ? () => setDuplicatesOnly(true) : undefined}
+                         duplicateCount={duplicateAccess && !duplicatesReady ? null : duplicates.groups.length}
                          emptyLabel={duplicateView ? "No Project ID appears more than once." : undefined}
-                         onAddProject={can("add_project") ? () => setAddingProject(true) : undefined}
+                         onAddProject={readiness.mutationsReady && can("add_project") ? () => setAddingProject(true) : undefined}
                          onProjectHistory={(r) => setAuditTarget({ projectId: r.auditId || r.id, projectIds: r.auditIds,
                                                                    projectDisplayId: r.displayId, field: null })} />
 
@@ -4754,9 +3553,15 @@ export default function ProjectLedger({ user, onSignOut }) {
               ...record,
               targets: record.primaryTarget ? [record.primaryTarget] : [],
             }))} />
-            {auditTarget && <AuditModal key={`${auditTarget.projectId}:${auditTarget.field}`} target={auditTarget}
-                                        isAdmin={can("delete_audit")}
-                                        onClose={() => setAuditTarget(null)} />}
+            {auditTarget && (
+              <LazyDialog key={`${auditTarget.projectId}:${auditTarget.field}`}
+                          label="the audit trail" load={loadAuditModal}
+                          onClose={() => setAuditTarget(null)}>
+                {(AuditModal) => <AuditModal target={auditTarget}
+                                             isAdmin={can("delete_audit")}
+                                             onClose={() => setAuditTarget(null)} />}
+              </LazyDialog>
+            )}
             {addingProject && (
               <AddProjectModal
                 busy={busy}
@@ -4791,31 +3596,46 @@ export default function ProjectLedger({ user, onSignOut }) {
                   setDeletingProject(null);
                 }} />
             )}
-            {multipleTargetsEnabled && manageTarget && (
-              <TargetsModal
-                key={manageTarget.id}
-                /* re-read from `records` so the modal always sees the current
-                   target list, including one it has just saved */
-                project={records.find((r) => r.id === manageTarget.id) || manageTarget}
-                onSaved={refreshTargets}
-                isAdmin={can("delete_project")}
-                onClose={() => setManageTarget(null)} />
+            {multipleTargetsEnabled && readiness.targetMutationsReady && manageTarget && (
+              <LazyDialog key={manageTarget.id} label="Manage targets" load={loadTargetsModal}
+                          onClose={() => setManageTarget(null)}>
+                {(TargetsModal) => (
+                  <TargetsModal
+                    /* re-read from `records` so the modal always sees the current
+                       target list, including one it has just saved */
+                    project={records.find((r) => r.id === manageTarget.id) || manageTarget}
+                    onSaved={refreshTargets}
+                    isAdmin={can("delete_project")}
+                    onClose={() => setManageTarget(null)} />
+                )}
+              </LazyDialog>
             )}
         </div>
 
         </>}
 
         {adminOpen && (
-          <AdminPanel
-            currentUserId={user?.id}
-            onMultipleTargetsChanged={(enabled) => {
-              setMultipleTargetsEnabled(enabled);
-              if (!enabled) setManageTarget(null);
-            }}
-            onClose={() => setAdminOpen(false)} />
+          <LazyDialog label="User management" load={loadAdminPanel}
+                      onClose={() => setAdminOpen(false)}>
+            {(AdminPanel) => (
+              <AdminPanel
+                currentUserId={user?.id}
+                onMultipleTargetsChanged={(enabled) => {
+                  setMultipleTargetsEnabled(enabled);
+                  if (!enabled) setManageTarget(null);
+                }}
+                onClose={() => setAdminOpen(false)} />
+            )}
+          </LazyDialog>
         )}
         {role === "admin" && datasetHistoryOpen && (
-          <DatasetHistoryModal onClose={() => setDatasetHistoryOpen(false)} onRestore={restorePreviousDataset} />
+          <LazyDialog label="Previous data" load={loadDatasetHistory}
+                      onClose={() => setDatasetHistoryOpen(false)}>
+            {(DatasetHistoryModal) => (
+              <DatasetHistoryModal onClose={() => setDatasetHistoryOpen(false)}
+                                   onRestore={restorePreviousDataset} />
+            )}
+          </LazyDialog>
         )}
         {forcePasswordChange && <PasswordChangePanel onDone={() => setForcePasswordChange(false)} />}
       </div>
