@@ -5,7 +5,7 @@ import * as XLSX from "xlsx";
 import {
   MASTER_START_YEAR, normalizeText, readMasterWorkbook, readCollectiblesWorkbook, assembleProjects,
   extendLegacyAssignments, resolvedEntry, importedChanges,
-  IMPORT_SHEET_RULES, classifyWorkbookSheets, unrecognizedWorkbookLog,
+  IMPORT_SHEET_RULES, IMPORT_AUDIT_FIELDS, classifyWorkbookSheets, unrecognizedWorkbookLog,
   mergeMasterDimensions, mergeCollectionRows, removeProjectFromStore, duplicateProjectIds,
   buildManualProject, addProjectToStore, appendDatasetNote, setWorkbookSheetReader,
 } from "./projectImport.js";
@@ -689,4 +689,65 @@ test("reading a workbook without the Excel library loaded throws instead of repo
 
   const { dim } = readMasterWorkbook(book, { currentYear: 2026 });
   assert.ok(dim.size > 0, "and the same workbook reads normally once the reader is registered again");
+});
+
+/* ---------------- panel-only dates are out of the import's reach ---------------- */
+
+/* NTP date and Completion date are entered in the panel with a date picker and
+   have no workbook source. A workbook may carry an "NTP" or "NOTICE TO PROCEED"
+   column, but what sits there is descriptive text — so an import must not read
+   it, must not write these fields, and must not record a change against them.
+   Three separate mechanisms keep that true; each is asserted below, because any
+   one of them failing on its own would let a workbook overwrite typed dates. */
+
+test("a workbook column called NTP is not read into the project row", () => {
+  const book = workbook({
+    "QMB PROJECTS": [
+      ["Project ID", "Year", "District", "NTP", "Notice to Proceed", "Completion Date", "Contract Amount"],
+      ["NTP-1", 2026, "NORTH", "NTP issued 5 Jan, verbal", "see attached memo", "target only", 1_000_000],
+    ],
+  });
+  const { dim } = readMasterWorkbook(book, { currentYear: 2026 });
+  const record = dim.get("NTP-1 - 2026");
+  assert.ok(record, "the project itself is still imported");
+  assert.equal(record.district, "NORTH", "the columns that ARE mapped still work");
+  assert.equal(record.ntpDate, undefined, "an NTP heading is not mapped to anything");
+  assert.equal(record.completionDate, undefined);
+  assert.equal(record.ntp_date, undefined);
+
+  const [row] = assembleProjects([], dim);
+  assert.equal(row.ntpDate, undefined,
+    "and nothing reaches the assembled row, so the manual value has nothing underneath it");
+  assert.equal(row.completionDate, undefined);
+});
+
+test("the Excel audit diff cannot record a change to the panel-only dates", () => {
+  const audited = IMPORT_AUDIT_FIELDS.map(([field]) => field);
+  assert.equal(audited.includes("ntpDate"), false,
+    "listing it here is what would let an import write an audit row for it");
+  assert.equal(audited.includes("completionDate"), false);
+
+  /* even handed rows that carry the fields, the diff ignores them */
+  const before = [{ id: "A - 2026", district: "NORTH", ntpDate: "2026-01-05", completionDate: "2026-09-30" }];
+  const after = [{ id: "A - 2026", district: "SOUTH", ntpDate: "2026-02-02", completionDate: "2026-12-31" }];
+  const changes = importedChanges(before, after);
+  assert.deepEqual(changes.map((c) => c.field_key), ["district"],
+    "only the genuinely imported column is recorded");
+});
+
+test("re-importing a workbook leaves a typed NTP date untouched", () => {
+  /* the merge the panel performs: imported first, manual over the top */
+  const imported = assembleProjects([], readMasterWorkbook(workbook({
+    "QMB PROJECTS": [
+      ["Project ID", "Year", "District", "NTP", "Contract Amount"],
+      ["NTP-1", 2026, "SOUTH", "re-issued, see memo 12", 2_000_000],
+    ],
+  }), { currentYear: 2026 }).dim)[0];
+  const manual = { ntpDate: "2026-01-05", completionDate: "2026-09-30" };
+  const merged = { ...imported, ...manual };
+
+  assert.equal(merged.district, "SOUTH", "the workbook still updates what it owns");
+  assert.equal(merged.contract, 2_000_000);
+  assert.equal(merged.ntpDate, "2026-01-05", "the typed date survives the new workbook");
+  assert.equal(merged.completionDate, "2026-09-30");
 });

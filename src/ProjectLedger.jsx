@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
+import { memo, useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { supabase, isConfigured } from "./lib/supabase";
 import { projectKey, todayMs, assessTargets, assessProjectTargets, atRiskExposure, distinctProjectCount, isArchived, aggregateProjectTargets, validateTarget, selectPrimaryTarget, SCOPE_LABEL } from "./lib/targets";
 import {
@@ -12,10 +12,11 @@ import {
 } from "./lib/ledgerStartup";
 /* Module scope the on-demand dialogs also need — see ./ledger/shared.jsx for
    why it no longer lives in this file. */
-import { once, fmtDate, T, DISPLAY, BODY, MONO, money, compact, qty, pct, PROJECT_STATUS_OPTIONS, AUDIT_FIELD_LABELS, AUDIT_DISPLAY_LABELS, auditValue, BUCKET_COLOR, pillStyle, emptyTarget } from "./ledger/shared";
+import { once, blankToNull, fmtDate, T, DISPLAY, BODY, MONO, money, compact, qty, pct, PROJECT_STATUS_OPTIONS, AUDIT_FIELD_LABELS, AUDIT_DISPLAY_LABELS, auditValue, BUCKET_COLOR, pillStyle, emptyTarget } from "./ledger/shared";
 import EditCell from "./ledger/EditCell";
 import LazyDialog from "./ledger/LazyDialog";
 import { loadDialog } from "./ledger/loadDialog";
+import { analyseSwa, swaBands, SWA_DEFAULT_VIEW, SWA_PARITY_BAND } from "./lib/swaMonitor";
 import { useVirtualRows } from "./ledger/useVirtualRows";
 import {
   AUDIT_TABLE, numOrNull, newBatchId, callTargetRpc, saveTargets, loadXlsx,
@@ -255,7 +256,7 @@ async function loadManual() {
   const finishRequest = startLedgerTiming("manual.request_and_json");
   try {
     const { data, error } = await supabase.from("project_manual_updates")
-      .select("project_id, status, contract_amount, remarks, engineer, swa");
+      .select("project_id, status, contract_amount, remarks, engineer, swa, ntp_date, completion_date");
     finishRequest({ outcome: error ? "error" : "ok", manualCount: data?.length || 0 });
     if (error) throw error;
     return measureLedgerWork("manual.map", () => {
@@ -269,6 +270,10 @@ async function loadManual() {
            the workbook supplied for every project nobody has typed one against. */
         if (row.engineer !== null && row.engineer !== undefined && row.engineer !== "") values.engineer = row.engineer;
         if (row.swa !== null && row.swa !== undefined) values.swa = row.swa;
+        /* Nothing imported sits under these, so an absent one is simply blank
+           rather than something that would uncover a workbook value. */
+        if (row.ntp_date) values.ntpDate = row.ntp_date;
+        if (row.completion_date) values.completionDate = row.completion_date;
         byKey.set(projectKey(row.project_id), { storedId: row.project_id, values });
       }
       return byKey;
@@ -333,6 +338,10 @@ async function saveManualRow(id, values, oldValues, userId, username, changedFie
        screen and what the audit compared against. */
     engineer: normalizeManualValue("engineer", values.engineer) || null,
     swa: numOrNull(values.swa),
+    /* Blank clears the date. There is no imported value to fall back to, so
+       cleared means cleared. */
+    ntp_date: blankToNull(values.ntpDate),
+    completion_date: blankToNull(values.completionDate),
     updated_by: userId,
     updated_at: new Date().toISOString(),
   }, { onConflict: "project_id" });
@@ -340,7 +349,8 @@ async function saveManualRow(id, values, oldValues, userId, username, changedFie
 
   const batchId = newBatchId();
   const auditFields = [["status", "Status"], ["contract", "Contract"], ["note", "Remarks"],
-    ["engineer", "Senior engineer"], ["swa", "SWA %"]];
+    ["engineer", "Senior engineer"], ["swa", "SWA %"],
+    ["ntpDate", "NTP date"], ["completionDate", "Completion date"]];
   const changes = auditFields
     .filter(([field]) => !changedFields || changedFields.has(field))
     .filter(([field]) => String(oldValues?.[field] ?? "") !== String(values?.[field] ?? ""))
@@ -508,6 +518,11 @@ const COLS = [
   { k: "location", label: "Location" },
   { k: "status", label: "Status", edit: "status", w: 160 },
   { k: "contract", label: "Contract", edit: "amount", money: true, w: 101 },
+  /* Panel-only dates, entered with a picker. No workbook column feeds either of
+     them — see 20260904000000_project_manual_ntp_completion.sql for why an
+     "NTP" heading in a future workbook must stay unread. */
+  { k: "ntpDate", label: "NTP date", edit: "date", w: 128 },
+  { k: "completionDate", label: "Completion date", edit: "date", w: 142 },
   /* no `pct: true`: an editable cell formats itself, and two formatters on one
      column is how they drift apart */
   { k: "swa", label: "SWA %", edit: "pct", w: 92 },
@@ -2464,6 +2479,552 @@ function PasswordChangePanel({ onDone }) {
 
 
 
+/* ---------------- SWA monitoring ----------------
+   Brought across from the Sirpatworks build unchanged in behaviour. Every field
+   it reads — swa, billpct, contract, bal, cg, district, engineer — already
+   exists on this panel's rows, and Panel, Kpi, sum, money and compact are the
+   same helpers, so nothing had to be re-derived to make it fit.
+
+   It is fed `rows`, the filtered set, so it always describes the selection on
+   screen rather than the whole ledger.
+------------------------------------------------- */
+
+/* Physical accomplishment plotted against financial billing. The diagonal is
+   parity; everything below it is work delivered but not yet invoiced, which is
+   collectible the moment a billing goes out. Above the line is billing that has
+   run ahead of accomplishment. */
+/* The plot area is deliberately SQUARE. Both axes run 0-100, so parity is only
+   a 45-degree line when a point of accomplishment occupies the same width as a
+   point of billing. The chart used to be 500x248, which drew that line at about
+   26 degrees and made a project ten points below it look nothing like a project
+   ten points right of it — the same fact, read two different ways. */
+const SWA_PLOT = 340;
+const PAD = { l: 54, r: 18, t: 18, b: 50 };
+const W = PAD.l + SWA_PLOT + PAD.r;
+const H = PAD.t + SWA_PLOT + PAD.b;
+const swaX = (v) => PAD.l + (v / 100) * SWA_PLOT;
+const swaY = (v) => H - PAD.b - (v / 100) * SWA_PLOT;
+
+/* The tolerance band that decides the three colours, drawn rather than left to
+   be inferred: everything inside it is "within 5pt of parity". Clipped to the
+   plot at both ends, which is why it is a six-sided polygon and not a ribbon. */
+const SWA_BAND_SHAPE = [[0, 0], [0, SWA_PARITY_BAND], [100 - SWA_PARITY_BAND, 100],
+  [100, 100], [100, 100 - SWA_PARITY_BAND], [SWA_PARITY_BAND, 0]]
+  .map(([x, y]) => `${swaX(x)},${swaY(y)}`).join(" ");
+
+/* The plot itself, so the panel and the enlarged view render exactly the same
+   chart rather than two that have to be kept in step. `maxWidth` is the only
+   difference between them. */
+function SwaScatter({ marks, plotted, maxWidth }) {
+  /* Square, and centred rather than stretched: preserveAspectRatio keeps the
+     45-degree parity line honest at any width it is given. */
+  return (
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label={`Accomplishment against billing for ${plotted} projects`}
+       style={{ width: "100%", maxWidth, height: "auto", display: "block", margin: "0 auto" }}>
+    {/* plot ground, so the bubbles sit on a surface rather than on the panel */}
+    <rect x={PAD.l} y={PAD.t} width={SWA_PLOT} height={SWA_PLOT}
+          fill={T.paper2} stroke={T.ruleSoft} />
+
+    {/* the +/-5pt tolerance band, drawn so the colour rule is visible */}
+    <polygon points={SWA_BAND_SHAPE} fill={T.collected} fillOpacity={0.08} />
+
+    {[0, 25, 50, 75, 100].map((g) => (
+      <g key={g}>
+        <line x1={PAD.l} x2={W - PAD.r} y1={swaY(g)} y2={swaY(g)}
+              stroke={T.ruleSoft} strokeDasharray="2 4" />
+        <line y1={PAD.t} y2={H - PAD.b} x1={swaX(g)} x2={swaX(g)}
+              stroke={T.ruleSoft} strokeDasharray="2 4" />
+        <text x={PAD.l - 9} y={swaY(g) + 3.5} textAnchor="end"
+              style={{ fontFamily: MONO, fontSize: 10.5, fontWeight: 500, fill: T.inkSoft }}>{g}%</text>
+        <text x={swaX(g)} y={H - PAD.b + 17} textAnchor="middle"
+              style={{ fontFamily: MONO, fontSize: 10.5, fontWeight: 500, fill: T.inkSoft }}>{g}%</text>
+      </g>
+    ))}
+
+    {/* parity */}
+    <line x1={swaX(0)} y1={swaY(0)} x2={swaX(100)} y2={swaY(100)}
+          stroke={T.ink} strokeWidth="1.1" strokeOpacity={0.75} />
+
+    {/* Which half of the chart is which. Placed well away from the
+        line so they read as regions, not as data. */}
+    <text x={swaX(6)} y={swaY(88)}
+          style={{ fontFamily: DISPLAY, fontSize: 9.5, fontWeight: 700, fill: T.retention,
+                   letterSpacing: ".07em" }}>
+      BILLED AHEAD OF WORK
+    </text>
+    <text x={swaX(94)} y={swaY(8)} textAnchor="end"
+          style={{ fontFamily: DISPLAY, fontSize: 9.5, fontWeight: 700, fill: T.works,
+                   letterSpacing: ".07em" }}>
+      WORK DONE, NOT BILLED
+    </text>
+
+    {/* Every filtered project with both figures, never a sample
+        or a cap — a monitor that quietly omitted projects would be
+        worse than no monitor. Geometry and tone come precomputed
+        from `marks` so this loop only places nodes. */}
+
+    <g className="swa-marks">
+      {marks.map((m) => (
+        <circle key={m.id} cx={m.cx} cy={m.cy} r={m.r}
+                fill={m.tone} fillOpacity={0.42} stroke={m.tone}
+                strokeOpacity={0.95} strokeWidth="1">
+          <title>{m.title}</title>
+        </circle>
+      ))}
+    </g>
+
+    {/* axis rules last, so nothing overlaps them */}
+    <line x1={PAD.l} x2={W - PAD.r} y1={H - PAD.b} y2={H - PAD.b} stroke={T.rule} />
+    <line x1={PAD.l} x2={PAD.l} y1={PAD.t} y2={H - PAD.b} stroke={T.rule} />
+
+    <text x={PAD.l + SWA_PLOT / 2} y={H - 8} textAnchor="middle"
+          style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
+      SWA % — PHYSICAL ACCOMPLISHMENT
+    </text>
+    <text transform={`translate(13,${PAD.t + SWA_PLOT / 2}) rotate(-90)`} textAnchor="middle"
+          style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
+      BILLED %
+    </text>
+  </svg>
+  );
+}
+
+/* The legend, shown under the plot in both places. */
+function SwaScatterLegend() {
+  return (
+  <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
+    <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-[-1px]" style={{ background: T.works }} />below the line — work done, not billed</span>
+    <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-[-1px]" style={{ background: T.collected }} />within 5pt of parity — the shaded band</span>
+    <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-[-1px]" style={{ background: T.retention }} />billed ahead of work</span>
+    <span>bubble size = balance for collection</span>
+  </div>
+  );
+}
+
+/* The enlarged, pannable plot.
+ *
+ *  Zooming a scatter is only useful if it actually separates the bubbles, and
+ *  that does not happen for free: scale the whole drawing and two overlapping
+ *  circles grow along with the gap between them, staying exactly as overlapped
+ *  as they were. So the positions scale and the RADII DO NOT — each bubble is
+ *  drawn at `r / k`, which lands it back at a constant size on screen while the
+ *  distance between centres grows with k. That is what pulls a cluster apart.
+ *
+ *  Same reasoning for stroke widths, and for the gridlines: anything measured
+ *  in screen pixels is divided by k so it stays that many pixels.
+ *
+ *  Bubble area still means balance for collection, at every zoom level, because
+ *  the radius is constant rather than merely unscaled.
+ */
+const SWA_ZOOM_MAX = 24;
+const SWA_MINI = 100;
+/* A project at 100% built and 100% billed sits exactly on the corner of the
+   plot, so a tight clip cut three quarters of its bubble away. The marks are
+   clipped to a slightly larger box than the grid is — wide enough for the
+   biggest bubble plus its stroke — so a project on any edge is drawn whole and
+   can be pointed at. */
+const SWA_MARK_BLEED = 14;
+/* How far past the edge the view may be pushed. Without it the clamp holds the
+   plot edge flush with the frame edge, which pins an extreme project against
+   the side of the window: visible, but awkward to hover and impossible to bring
+   into clear space. Maps overscroll for the same reason. */
+const SWA_OVERSCROLL = SWA_PLOT * 0.25;
+/* plot-space coordinate -> overview coordinate */
+const miniAt = (v) => ((v - PAD.l) / SWA_PLOT) * SWA_MINI;
+const SWA_TICKS = (k) => {
+  /* finer gradations as the view narrows, so the axis keeps saying something */
+  const step = k >= 8 ? 2 : k >= 3 ? 5 : 10;
+  const out = [];
+  for (let v = 0; v <= 100; v += step) out.push(v);
+  return out;
+};
+
+function SwaScatterMap({ marks, plotted }) {
+  const frameRef = useRef(null);
+  const [k, setK] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const drag = useRef(null);
+
+  /* Keeps the plot covering its frame: you can never pan the chart off screen
+     and be left looking at nothing. */
+  const clamp = useCallback((next, scale) => {
+    const lo = { x: (PAD.l + SWA_PLOT) * (1 - scale) - SWA_OVERSCROLL,
+                 y: (PAD.t + SWA_PLOT) * (1 - scale) - SWA_OVERSCROLL };
+    const hi = { x: PAD.l * (1 - scale) + SWA_OVERSCROLL,
+                 y: PAD.t * (1 - scale) + SWA_OVERSCROLL };
+    return { x: Math.min(hi.x, Math.max(lo.x, next.x)), y: Math.min(hi.y, Math.max(lo.y, next.y)) };
+  }, []);
+
+  const zoomAbout = useCallback((focus, nextK) => {
+    const scale = Math.min(SWA_ZOOM_MAX, Math.max(1, nextK));
+    setK(scale);
+    setPan((prev) => (scale === 1 ? { x: 0, y: 0 }
+      : clamp({ x: focus.x - (focus.x - prev.x) * (scale / k),
+                y: focus.y - (focus.y - prev.y) * (scale / k) }, scale)));
+  }, [k, clamp]);
+
+  const framePoint = (event) => {
+    const ctm = frameRef.current?.getScreenCTM();
+    if (!ctm) return null;
+    return new DOMPoint(event.clientX, event.clientY).matrixTransform(ctm.inverse());
+  };
+
+  /* Registered by hand rather than with onWheel: React attaches wheel handlers
+     passively, and a passive listener cannot preventDefault, so the page would
+     scroll away underneath the chart being zoomed. */
+  useEffect(() => {
+    const el = frameRef.current;
+    if (!el) return undefined;
+    const onWheel = (event) => {
+      event.preventDefault();
+      const at = framePoint(event);
+      if (at) zoomAbout(at, k * (event.deltaY < 0 ? 1.16 : 1 / 1.16));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [k, zoomAbout]);
+
+  const onPointerDown = (event) => {
+    if (k === 1) return;
+    const at = framePoint(event);
+    if (!at) return;
+    drag.current = { from: at, pan };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const onPointerMove = (event) => {
+    if (!drag.current) return;
+    const at = framePoint(event);
+    if (!at) return;
+    setPan(clamp({ x: drag.current.pan.x + (at.x - drag.current.from.x),
+                   y: drag.current.pan.y + (at.y - drag.current.from.y) }, k));
+  };
+  const endDrag = (event) => {
+    if (!drag.current) return;
+    drag.current = null;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+  };
+
+  const reset = () => { setK(1); setPan({ x: 0, y: 0 }); };
+  const centre = { x: PAD.l + SWA_PLOT / 2, y: PAD.t + SWA_PLOT / 2 };
+
+  /* frame position of a data value, after the current pan and zoom */
+  const fx = (v) => swaX(v) * k + pan.x;
+  const fy = (v) => swaY(v) * k + pan.y;
+  const within = (n, lo, hi) => n >= lo - 0.5 && n <= hi + 0.5;
+  const ticks = SWA_TICKS(k);
+
+  const btn = { border: `1px solid ${T.rule}`, background: T.panel, color: T.ink, borderRadius: 2,
+    padding: "2px 9px", fontFamily: MONO, fontSize: 12, cursor: "pointer", lineHeight: 1.5 };
+
+  /* Double-click is the other gesture people expect from a map: in at the
+     point, and back out again with a modifier. */
+  const onDoubleClick = (event) => {
+    const at = framePoint(event);
+    if (at) zoomAbout(at, event.shiftKey || event.altKey ? k / 2 : k * 2);
+  };
+
+  /* The overview. Its dots never move, so they are built once and only the
+     viewport rectangle over them is redrawn as you pan. Rendered only while
+     zoomed, because at 1x it would only repeat the chart beside it. */
+  const miniDots = useMemo(() => marks.map((m) => (
+    <circle key={m.id} cx={miniAt(m.cx)} cy={miniAt(m.cy)} r={1.1} fill={m.tone} fillOpacity={0.75} />
+  )), [marks]);
+
+  const seen = {
+    x: miniAt((PAD.l - pan.x) / k), y: miniAt((PAD.t - pan.y) / k),
+    w: (SWA_PLOT / k) / SWA_PLOT * SWA_MINI, h: (SWA_PLOT / k) / SWA_PLOT * SWA_MINI,
+  };
+  const jumpTo = (event) => {
+    const box = event.currentTarget.getBoundingClientRect();
+    const bx = PAD.l + ((event.clientX - box.left) / box.width) * SWA_PLOT;
+    const by = PAD.t + ((event.clientY - box.top) / box.height) * SWA_PLOT;
+    setPan(clamp({ x: (PAD.l + SWA_PLOT / 2) - bx * k, y: (PAD.t + SWA_PLOT / 2) - by * k }, k));
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      <div className="mb-1.5 flex flex-wrap items-center gap-2" style={{ flex: "none" }}>
+        <button type="button" style={btn} aria-label="Zoom out"
+                onClick={() => zoomAbout(centre, k / 1.5)} disabled={k <= 1}>−</button>
+        <button type="button" style={btn} aria-label="Zoom in"
+                onClick={() => zoomAbout(centre, k * 1.5)} disabled={k >= SWA_ZOOM_MAX}>+</button>
+        <button type="button" style={{ ...btn, fontSize: 10.5 }} onClick={reset} disabled={k === 1}>Reset</button>
+        <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkSoft }}>{k.toFixed(1)}×</span>
+        <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
+          scroll or double-click to zoom · {k > 1 ? "drag to pan · " : ""}hover a bubble for its project
+        </span>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, position: "relative", display: "flex",
+                    alignItems: "center", justifyContent: "center" }}>
+
+      <svg ref={frameRef} viewBox={`0 0 ${W} ${H}`} role="img"
+           aria-label={`Accomplishment against billing for ${plotted} projects, zoomable`}
+           onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+           onPointerUp={endDrag} onPointerCancel={endDrag}
+           className={k > 1 ? "swa-map swa-map-pannable" : "swa-map"}
+           onDoubleClick={onDoubleClick}
+           style={{ width: "100%", height: "100%", display: "block", touchAction: "none" }}>
+        <defs>
+          <clipPath id="swa-plot-clip">
+            <rect x={PAD.l} y={PAD.t} width={SWA_PLOT} height={SWA_PLOT} />
+          </clipPath>
+          <clipPath id="swa-mark-clip">
+            <rect x={PAD.l - SWA_MARK_BLEED} y={PAD.t - SWA_MARK_BLEED}
+                  width={SWA_PLOT + SWA_MARK_BLEED * 2} height={SWA_PLOT + SWA_MARK_BLEED * 2} />
+          </clipPath>
+        </defs>
+
+        <rect x={PAD.l} y={PAD.t} width={SWA_PLOT} height={SWA_PLOT} fill={T.paper2} stroke={T.ruleSoft} />
+
+        <g clipPath="url(#swa-plot-clip)">
+          <g transform={`translate(${pan.x} ${pan.y}) scale(${k})`}>
+            <polygon points={SWA_BAND_SHAPE} fill={T.collected} fillOpacity={0.08} />
+            {ticks.map((g) => (
+              <g key={g}>
+                <line x1={swaX(0)} x2={swaX(100)} y1={swaY(g)} y2={swaY(g)}
+                      stroke={T.ruleSoft} strokeWidth={1 / k} strokeDasharray={`${2 / k} ${4 / k}`} />
+                <line y1={swaY(0)} y2={swaY(100)} x1={swaX(g)} x2={swaX(g)}
+                      stroke={T.ruleSoft} strokeWidth={1 / k} strokeDasharray={`${2 / k} ${4 / k}`} />
+              </g>
+            ))}
+            <line x1={swaX(0)} y1={swaY(0)} x2={swaX(100)} y2={swaY(100)}
+                  stroke={T.ink} strokeWidth={1.1 / k} strokeOpacity={0.75} />
+
+          </g>
+        </g>
+
+        {/* Bubbles sit in their own, roomier clip so an extreme project is not
+            sliced by the plot edge. Same transform, so they stay registered
+            with the grid above. */}
+        <g clipPath="url(#swa-mark-clip)">
+          <g transform={`translate(${pan.x} ${pan.y}) scale(${k})`}>
+            {/* radius held at screen size — see the note above this component */}
+            <g className="swa-marks">
+              {marks.map((m) => (
+                <circle key={m.id} cx={m.cx} cy={m.cy} r={m.r / k}
+                        fill={m.tone} fillOpacity={0.42} stroke={m.tone}
+                        strokeOpacity={0.95} strokeWidth={1 / k}>
+                  <title>{m.title}</title>
+                </circle>
+              ))}
+            </g>
+          </g>
+        </g>
+
+        {/* Axis labels live outside the transform, so they keep their size and
+            only appear while their gradation is actually on screen. */}
+        {ticks.map((g) => (
+          <g key={g}>
+            {within(fy(g), PAD.t, PAD.t + SWA_PLOT) && (
+              <text x={PAD.l - 9} y={fy(g) + 3.5} textAnchor="end"
+                    style={{ fontFamily: MONO, fontSize: 10.5, fontWeight: 500, fill: T.inkSoft }}>{g}%</text>
+            )}
+            {within(fx(g), PAD.l, PAD.l + SWA_PLOT) && (
+              <text x={fx(g)} y={H - PAD.b + 17} textAnchor="middle"
+                    style={{ fontFamily: MONO, fontSize: 10.5, fontWeight: 500, fill: T.inkSoft }}>{g}%</text>
+            )}
+          </g>
+        ))}
+
+        <line x1={PAD.l} x2={W - PAD.r} y1={H - PAD.b} y2={H - PAD.b} stroke={T.rule} />
+        <line x1={PAD.l} x2={PAD.l} y1={PAD.t} y2={H - PAD.b} stroke={T.rule} />
+        <text x={PAD.l + SWA_PLOT / 2} y={H - 8} textAnchor="middle"
+              style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
+          SWA % — PHYSICAL ACCOMPLISHMENT
+        </text>
+        <text transform={`translate(13,${PAD.t + SWA_PLOT / 2}) rotate(-90)`} textAnchor="middle"
+              style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
+          BILLED %
+        </text>
+      </svg>
+
+      {k > 1 && (
+        <svg viewBox={`0 0 ${SWA_MINI} ${SWA_MINI}`} onClick={jumpTo}
+             aria-label="Overview — click to move the view"
+             style={{ position: "absolute", right: 6, bottom: 6, width: 108, height: 108,
+                      background: T.panel, border: `1px solid ${T.rule}`, cursor: "pointer",
+                      boxShadow: "0 2px 10px rgba(12,20,16,.18)" }}>
+          {miniDots}
+          <rect x={seen.x} y={seen.y} width={seen.w} height={seen.h}
+                fill={T.ink} fillOpacity={0.08} stroke={T.ink} strokeWidth={1.2} />
+        </svg>
+      )}
+      </div>
+    </div>
+  );
+}
+
+/* memo, because `rows` is memoised upstream but ProjectLedger is not: a
+   presence poll every 30s, a dialog opening, a permissions refresh all
+   re-render the parent without touching the filtered rows. Without this the
+   scatter reconciled its ~1,100 SVG nodes each time for no change at all. */
+const SwaMonitor = memo(function SwaMonitor({ rows }) {
+  const [mode, setMode] = useState(SWA_DEFAULT_VIEW);
+
+  /* One pass over the filtered rows for every figure the panel prints. `rows`
+     is the same merged, filtered set the table and every other panel reads, so
+     a manual SWA override — and an unsaved draft of one — is already in it. */
+  const { points: pts, plotted, missing: noSwa, unbilled, unbilledMoney, overbilled, avgSwa } =
+    useMemo(() => analyseSwa(rows), [rows]);
+
+  /* Scatter geometry resolved once per dataset rather than per render, so the
+     render loop below is a plain map over ready values. */
+  const marks = useMemo(() => {
+    const maxBal = pts.reduce((top, p) => Math.max(top, p.bal || 0), 1);
+    /* Largest first, so a small project is never hidden underneath a large one.
+       Sorted on a copy — `pts` is memoised and shared with the KPI figures. */
+    return pts.slice().sort((a, b) => (b.bal || 0) - (a.bal || 0)).map((p) => ({
+      id: p.id,
+      cx: swaX(p.swaP), cy: swaY(p.billP),
+      r: 3 + Math.sqrt((p.bal || 0) / maxBal) * 9,
+      tone: p.lag > SWA_PARITY_BAND ? T.works : p.lag < -SWA_PARITY_BAND ? T.retention : T.collected,
+      /* carried for the readout below the chart, so picking a bubble needs no
+         second lookup back into the rows */
+      swaP: p.swaP, billP: p.billP, lag: p.lag, cg: p.cg, bal: p.bal,
+      district: p.district, engineer: p.engineer, name: p.name,
+      title: `${p.id}\nSWA ${p.swaP.toFixed(1)}% · billed ${p.billP.toFixed(1)}%\nbalance works ${money(p.cg)}\n${p.district} · ${p.engineer}`,
+    }));
+  }, [pts]);
+
+  /* The plot fills the panel, but 555 bubbles on a 340-unit field crowd
+     together. Rather than thinning the data or making the panel taller for
+     everybody, the same chart opens as large as the screen allows. */
+  const [zoomed, setZoomed] = useState(false);
+  useEffect(() => {
+    if (!zoomed) return undefined;
+    const esc = (e) => { if (e.key === "Escape") setZoomed(false); };
+    document.addEventListener("keydown", esc);
+    return () => document.removeEventListener("keydown", esc);
+  }, [zoomed]);
+
+  /* Spread is not computed until it is asked for. The panel opens on Scatter,
+     and a session that never switches never pays for the deciles. */
+  const bands = useMemo(() => (mode === "spread" ? swaBands(pts) : null), [mode, pts]);
+  const bandMax = bands ? Math.max(1, ...bands.map((b) => b.bal)) : 1;
+
+  return (
+    <Panel title="SWA monitoring — accomplishment against billing" right={
+      <div className="flex items-center gap-2">
+        <span className="text-[11px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
+          {plotted} plotted{noSwa ? ` · ${noSwa} without SWA` : ""}
+        </span>
+        {mode === "scatter" && (
+          <button type="button" onClick={() => setZoomed(true)}
+                  title="View the scatter full size"
+                  aria-label="View the scatter full size"
+                  className="rounded-sm px-2 py-1"
+                  style={{ border: `1px solid ${T.rule}`, background: T.panel, color: T.inkSoft,
+                           lineHeight: 0, cursor: "pointer" }}>
+            {/* magnifier with a plus — the same shape people expect for "bigger" */}
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+              <circle cx="10.5" cy="10.5" r="6.5" />
+              <line x1="15.5" y1="15.5" x2="21" y2="21" />
+              <line x1="10.5" y1="7.5" x2="10.5" y2="13.5" />
+              <line x1="7.5" y1="10.5" x2="13.5" y2="10.5" />
+            </svg>
+          </button>
+        )}
+        {["scatter", "spread"].map((m) => (
+          <button key={m} onClick={() => setMode(m)} className="rounded-sm px-2 py-1 text-[11px]"
+                  style={{ border: `1px solid ${mode === m ? T.ink : T.rule}`,
+                           background: mode === m ? T.ink : T.panel,
+                           color: mode === m ? T.paper2 : T.inkSoft, textTransform: "capitalize" }}>{m}</button>
+        ))}
+      </div>
+    }>
+      {pts.length === 0 ? (
+        <div className="py-10 text-center text-xs" style={{ color: T.inkFaint }}>
+          No projects with both an SWA % and a billing figure in this selection.
+        </div>
+      ) : (
+        <>
+          <div className="mb-3 grid gap-2.5" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))" }}>
+            <Kpi label="Avg SWA" value={avgSwa === null ? "—" : avgSwa.toFixed(1) + "%"}
+                 meta="weighted by contract" />
+            <Kpi label="Done, not billed" value={unbilled.length} color={T.works}
+                 meta="accomplishment leads billing by 5pt+" />
+            <Kpi label="Value to invoice" value={compact(unbilledMoney)} color={T.works} meta={money(unbilledMoney)} />
+            <Kpi label="Billed ahead of work" value={overbilled.length} color={T.retention}
+                 meta="billing leads accomplishment by 5pt+" />
+          </div>
+
+          {mode === "scatter" ? (
+            <>
+              <SwaScatter marks={marks} plotted={plotted} maxWidth={560} />
+              <SwaScatterLegend />
+
+              {zoomed && (
+                <div role="presentation"
+                     onMouseDown={(e) => { if (e.target === e.currentTarget) setZoomed(false); }}
+                     style={{ position: "fixed", inset: 0, zIndex: 30, background: "rgba(22,33,28,.55)",
+                              display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+                  <div role="dialog" aria-modal="true" aria-label="SWA monitoring, full size"
+                       /* A fixed frame with the chart flexing inside it, rather
+                          than a chart sized in vh inside a scrolling box. The
+                          old arrangement made an 84vh square compete with the
+                          header, controls and legend for the same 96vh, so the
+                          bottom of the plot fell below the fold. */
+                       style={{ background: T.panel, border: `1px solid ${T.ink}`, borderRadius: 2,
+                                boxShadow: "0 18px 50px rgba(0,0,0,.3)", padding: "12px 14px 10px",
+                                width: "min(96vw, 1180px)", height: "min(94vh, 940px)",
+                                display: "flex", flexDirection: "column", minHeight: 0 }}>
+                    <div className="mb-2 flex items-center justify-between gap-4" style={{ flex: "none" }}>
+                      <div>
+                        <div style={{ fontFamily: DISPLAY, fontSize: 12, fontWeight: 700,
+                                      textTransform: "uppercase", letterSpacing: ".05em" }}>
+                          SWA monitoring — accomplishment against billing
+                        </div>
+                        <div style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkFaint, marginTop: 2 }}>
+                          {plotted} plotted{noSwa ? ` · ${noSwa} without SWA` : ""}
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => setZoomed(false)} aria-label="Close the full size view"
+                              style={{ border: `1px solid ${T.rule}`, background: T.paper2, color: T.ink,
+                                       padding: "3px 9px", cursor: "pointer", fontFamily: MONO }}>×</button>
+                    </div>
+                    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+                      <SwaScatterMap marks={marks} plotted={plotted} />
+                    </div>
+                    <div style={{ flex: "none" }}><SwaScatterLegend /></div>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="mb-1 text-[10px] uppercase tracking-widest"
+                   style={{ fontFamily: DISPLAY, fontWeight: 600, color: T.inkSoft }}>
+                Balance for collection by SWA band
+              </div>
+              {(bands || []).map((b) => (
+                <div key={b.lo} className="mb-1.5 flex items-center gap-2 text-[11px]">
+                  <span className="shrink-0 text-right" style={{ width: 58, fontFamily: MONO, color: T.inkSoft }}>
+                    {b.lo}–{b.hi}%
+                  </span>
+                  <span className="h-4 flex-1" style={{ background: T.paper2, border: `1px solid ${T.ruleSoft}` }}>
+                    <span className="block h-full" style={{ width: (b.bal / bandMax) * 100 + "%",
+                          background: b.lo >= 90 ? T.collected : b.lo >= 50 ? T.retention : T.works }} />
+                  </span>
+                  <span className="shrink-0 text-right" style={{ width: 74, fontFamily: MONO, color: T.inkSoft }}>{compact(b.bal)}</span>
+                  <span className="shrink-0 text-right" style={{ width: 58, fontFamily: MONO, color: T.inkFaint }}>{b.n} proj</span>
+                </div>
+              ))}
+              <div className="mt-2 text-[10px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
+                Money sitting in low-SWA bands is exposed — little has been built, yet it is carried as collectible.
+                High bands are close to done and should convert quickly.
+              </div>
+            </>
+          )}
+
+        </>
+      )}
+    </Panel>
+  );
+});
+
 /* ---------------- app ---------------- */
 
 export default function ProjectLedger({ user, onSignOut }) {
@@ -3438,6 +3999,20 @@ export default function ProjectLedger({ user, onSignOut }) {
             so nothing is fetched from a third party here. What remains is the
             animation, which has to live with the component that uses it. */
 
+         /* SWA scatter. Each bubble carries a native <title>, but nothing on
+            screen said so — the cursor and a firmer edge on hover are what
+            invite somebody to rest on one and read it. CSS rather than React
+            state, so hovering 555 bubbles costs no renders. */
+         /* grab/grabbing belongs to :active, which cannot be expressed inline —
+            and reading the drag ref during render to fake it is exactly what
+            React forbids. */
+         .swa-map-pannable { cursor: grab; }
+         .swa-map-pannable:active { cursor: grabbing; }
+
+         .swa-marks circle { cursor: help; transition: fill-opacity .12s ease, stroke-width .12s ease; }
+         .swa-marks circle:hover { fill-opacity: .8; stroke-width: 2; }
+         @media (prefers-reduced-motion: reduce) { .swa-marks circle { transition: none; } }
+
          /* The presence dot. The ring expands and fades once a cycle rather than
             the dot itself blinking: a blinking dot reads as a warning, a slow
             ring reads as a pulse — which is what it is. */
@@ -3602,6 +4177,14 @@ export default function ProjectLedger({ user, onSignOut }) {
               <GroupChart rows={rows} groupBy={groupBy} onGroupBy={setGroupBy} />
             </div>
 
+            {/* Between the by-group chart and the projects it describes: the
+                charts above summarise the selection, this reads it against
+                billing, and the table below is the detail behind both. Fed the
+                same filtered `rows` as everything else on the page. */}
+            <div style={{ marginTop: 18 }}>
+              <SwaMonitor rows={rows} />
+            </div>
+
             {saveMessage && (
               <div className="mb-2 px-3 py-2 text-xs" role={saveMessage.startsWith("Could") ? "alert" : undefined}
                    style={{ color: saveMessage.startsWith("Could") ? T.bad : T.inkSoft,
@@ -3639,6 +4222,7 @@ export default function ProjectLedger({ user, onSignOut }) {
                 the useMemo inside TargetAnalysis never hit and assessTargets
                 re-ran over every project each time anything changed. */}
             <TargetAnalysis rows={rows} />
+
             {auditTarget && (
               <LazyDialog key={`${auditTarget.projectId}:${auditTarget.field}`}
                           label="the audit trail" load={loadAuditModal}

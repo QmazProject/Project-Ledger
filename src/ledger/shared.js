@@ -143,7 +143,12 @@ export const pct = (n) => (n === null || n === undefined || !isFinite(n) ? "—"
 export const AUDIT_FIELD_LABELS = Object.fromEntries([
   ...IMPORT_AUDIT_FIELDS,
   ...TARGET_FIELDS,
+  /* Panel-only fields. Deliberately listed here and NOT in IMPORT_AUDIT_FIELDS:
+     that list is what the Excel diff walks, so a key added there would let an
+     import record a change against a column no import is allowed to touch. */
   ["note", "Remarks"],
+  ["ntpDate", "NTP date"],
+  ["completionDate", "Completion date"],
 ]);
 
 /* ...and the name to show above that history, which is the one on the column. */
