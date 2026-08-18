@@ -75,6 +75,7 @@ export const targetColumns = (v) => ({
   target_completion: blankToNull(v.target_completion),
   actual_completion: blankToNull(v.actual_completion),
   actual_output: numOrNull(v.actual_output),
+  remarks: blankToNull(v.remarks),
 });
 
 /* PostgREST surfaces a RAISE EXCEPTION as an error with the raised message,
@@ -128,6 +129,7 @@ export async function saveTargets({ projectId, creates = [], updates = [], archi
       p_target_completion: c.target_completion,
       p_actual_completion: c.actual_completion,
       p_actual_output: c.actual_output,
+      p_remarks: c.remarks,
       p_batch_id: batchId,
     }));
   }
@@ -150,6 +152,7 @@ export async function saveTargets({ projectId, creates = [], updates = [], archi
       p_target_completion: c.target_completion,
       p_actual_completion: c.actual_completion,
       p_actual_output: c.actual_output,
+      p_remarks: c.remarks,
       p_batch_id: batchId,
     });
   }

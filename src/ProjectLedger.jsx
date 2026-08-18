@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { supabase, isConfigured } from "./lib/supabase";
-import { projectKey, todayMs, assessTargets, assessProjectTargets, atRiskExposure, distinctProjectCount, isArchived, validateTarget, selectPrimaryTarget, SCOPE_LABEL } from "./lib/targets";
+import { projectKey, todayMs, assessTargets, assessProjectTargets, atRiskExposure, distinctProjectCount, isArchived, aggregateProjectTargets, validateTarget, selectPrimaryTarget, SCOPE_LABEL } from "./lib/targets";
 import {
   settleLoad, loadingState, isReady, hasFailed, projectTargets, targetsLabel,
   buildManualSave, normalizeManualValue, fractionFromPercent,
@@ -285,7 +285,7 @@ async function loadTargets() {
   const finishRequest = startLedgerTiming("targets.request_and_json");
   try {
     const { data, error } = await supabase.from(TARGET_TABLE)
-      .select("id, project_id, project_key, scope, target_qty, unit, start_date, target_completion, actual_completion, actual_output, archived_at, created_at, updated_at");
+      .select("id, project_id, project_key, scope, target_qty, unit, start_date, target_completion, actual_completion, actual_output, remarks, archived_at, created_at, updated_at");
     finishRequest({ outcome: error ? "error" : "ok", targetCount: data?.length || 0 });
     if (error) throw error;
     return measureLedgerWork("targets.map_and_sort", () => {
@@ -546,8 +546,37 @@ const INLINE_TARGET_COLS = [
   { k: "start_date", label: "Start date", edit: "date", targetField: true, w: 132 },
   { k: "target_completion", label: "Target completion", edit: "date", targetField: true, w: 132 },
   { k: "actual_output", label: "Actual output", edit: "qty", targetField: true, w: 96 },
+  /* The target's own remark, not the project's. With only one target on the row
+     there is nowhere else to reach it — Manage Targets is unavailable to this
+     user — so it takes the Remarks column, and the project's final remark is
+     hidden for the same reason the Targets cell is. See the `cols` memo. */
+  { k: "remarks", label: "Remarks", edit: "text", targetField: true, w: 190, wrap: true },
 ];
 const INLINE_TARGET_FIELD_KEYS = new Set(INLINE_TARGET_COLS.map((column) => column.k));
+
+/* What the row shows when a project may hold several targets.
+ *
+ * Read-only, and deliberately so: a sum and an earliest-date are answers, not
+ * fields. There is no cell here that could accept a number without the app
+ * having to guess which of the project's targets the number belonged to.
+ * Manage Targets is where targets are edited, and the Targets cell beside these
+ * is how it opens.
+ *
+ * No Unit column: targets can be in m3, km or each, and a single unit beside a
+ * mixed total would be a claim about the total that is not true. The modal's
+ * footer carries the unit, where the individual targets are visible to qualify
+ * it. */
+const MULTI_TARGET_COLS = [
+  { k: "aggTargetQty", label: "Total target qty", targetAgg: "qty", w: 112 },
+  { k: "aggStartDate", label: "Earliest Start date", targetAgg: "date", w: 150 },
+  /* "Earliest" is the business's word for it. Strictly it is the earliest that
+     is not yet delivered, which the header has no room to say — so the hint
+     does, rather than leaving somebody to wonder why a date they can see in
+     Manage Targets is not the one on the row. */
+  { k: "aggTargetCompletion", label: "Earliest target completion", targetAgg: "date", w: 176,
+    hint: "The earliest target completion still outstanding. Targets already delivered are skipped." },
+  { k: "aggActualOutput", label: "Total output qty", targetAgg: "qty", w: 116 },
+];
 
 
 /* ---------------- export ----------------
@@ -1739,7 +1768,18 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
   /* the four collection-detail columns fold away by default; the export always
      carries every column regardless of what is on screen */
   const cols = useMemo(() => COLS
-    .flatMap((column) => (!multipleTargetsEnabled && column.targets ? INLINE_TARGET_COLS : [column]))
+    /* One target per project: the six editable target fields sit inline, and
+       the Targets cell is not shown because there is nothing to manage.
+       Several targets: the Targets cell opens the modal, and the four columns
+       after it report the project's totals rather than any one target. */
+    .flatMap((column) => (column.targets
+      ? (multipleTargetsEnabled ? [column, ...MULTI_TARGET_COLS] : INLINE_TARGET_COLS)
+      : [column]))
+    /* Two fields, one heading. With multiple targets off, Remarks on this row is
+       the target's remark, so the project's own final remark is not shown —
+       there would otherwise be two columns called Remarks holding different
+       things. It stays visible to every user who has the modal. */
+    .filter((column) => multipleTargetsEnabled || column.k !== "note")
     .filter((column) => !column.group || showCollection), [showCollection, multipleTargetsEnabled]);
   const groupCount = COLS.filter((c) => c.group === "collection").length;
   const data = useMemo(() => {
@@ -1888,7 +1928,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                         ? (e) => { e.preventDefault(); setIdMenu({ x: e.clientX, y: e.clientY }); }
                         : undefined}
                       title={c.stick && onViewDuplicates
-                        ? "Right-click for duplicate Project IDs" : undefined}
+                        ? "Right-click for duplicate Project IDs" : c.hint}
                       style={{ ...th, ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w,
                                                  whiteSpace: c.stick ? "nowrap" : "normal" } : {}),
                                color: c.edit ? "#C28A00" : T.ink,
@@ -1928,6 +1968,29 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                       <td key={c.k} style={{ ...base, ...wStyle, padding: "3px 5px" }}>
                         <TargetSummaryCell record={r} onOpen={() => onManageTargets(r)}
                                            disabled={readOnly || targetReadOnly} />
+                      </td>
+                    );
+                    /* A project total, not a field. Rendered read-only, and
+                       with no audit context menu: there is no single cell whose
+                       history this would be. */
+                    if (c.targetAgg) return (
+                      <td key={c.k} style={{ ...base, ...wStyle, fontFamily: MONO, fontSize: 11.5,
+                                             textAlign: c.targetAgg === "qty" ? "right" : "left",
+                                             whiteSpace: "nowrap", color: T.inkSoft }}
+                          title={r.targetsUnavailable
+                            ? "Targets could not be loaded, so this total is unknown."
+                            : c.targetAgg === "date" ? undefined
+                            : r.targetTotals?.unitsMixed
+                              ? "These targets use different units, so this total is not in a single unit."
+                              : r.targetTotals?.unit || undefined}>
+                        {r.targetsUnavailable
+                          ? <span style={{ color: T.inkFaint }}>Unavailable</span>
+                          : v === null || v === undefined || v === ""
+                            ? <span style={{ color: T.inkFaint }}>—</span>
+                            : c.targetAgg === "date" ? fmtDate(v) : qty(v)}
+                        {c.targetAgg === "qty" && !r.targetsUnavailable && r.targetTotals?.unitsMixed && (
+                          <span style={{ color: T.works, marginLeft: 4 }} aria-label="mixed units">*</span>
+                        )}
                       </td>
                     );
                     if (c.targetField && r.targetsUnavailable) return (
@@ -2840,6 +2903,15 @@ export default function ProjectLedger({ user, onSignOut }) {
       merged.targetsUnavailable = targetsOf.unavailable;
       merged.targetSummary = assessProjectTargets(merged, { today });
       merged.primaryTarget = selectPrimaryTarget(merged.targets);
+      /* The whole project reduced to the four figures its row shows when
+         several targets are allowed. Computed here, beside every other derived
+         value, so the table renders it rather than working it out per cell. */
+      const totals = aggregateProjectTargets(merged);
+      merged.targetTotals = totals;
+      merged.aggTargetQty = totals.targetQty;
+      merged.aggActualOutput = totals.actualOutput;
+      merged.aggStartDate = totals.startDate;
+      merged.aggTargetCompletion = totals.targetCompletion;
       /* A draft is a target saved with a Balance Work name but no quantity and
          no completion date. It is stored, listed and editable, but there is
          nothing in it to measure, so every target column on its row renders
@@ -2858,13 +2930,18 @@ export default function ProjectLedger({ user, onSignOut }) {
       if (draft) Object.assign(merged, draft);
 
       /* Balance Work is searchable — it is the one target field somebody would
-         look a project up by. Remarks stays the project's own field. */
-      const scopes = merged.targets.filter((t) => !isArchived(t)).map((t) => t.scope).filter(Boolean);
+         look a project up by. Target remarks joins it because with multiple
+         targets off it is the Remarks column on screen, and a column somebody
+         can read has to be a column they can search. The project's own note is
+         included below and unaffected. */
+      const live = merged.targets.filter((t) => !isArchived(t));
+      const scopes = live.map((t) => t.scope).filter(Boolean);
+      const targetNotes = live.map((t) => t.remarks).filter(Boolean);
       /* handEntered included, or a hand-created project's name and district
          would be on screen and not findable by the search box above it. */
-      if (m || draft || handEntered || scopes.length)
+      if (m || draft || handEntered || scopes.length || targetNotes.length)
         merged._hay = [r._hay, merged.status, merged.contract, merged.note, merged.engineer,
-          merged.name, merged.district, merged.category, merged.location, ...scopes]
+          merged.name, merged.district, merged.category, merged.location, ...scopes, ...targetNotes]
           .filter(set).join(" ").toLowerCase();
       return merged;
     });
@@ -3549,10 +3626,19 @@ export default function ProjectLedger({ user, onSignOut }) {
                          onProjectHistory={(r) => setAuditTarget({ projectId: r.auditId || r.id, projectIds: r.auditIds,
                                                                    projectDisplayId: r.displayId, field: null })} />
 
-            <TargetAnalysis rows={multipleTargetsEnabled ? rows : rows.map((record) => ({
-              ...record,
-              targets: record.primaryTarget ? [record.primaryTarget] : [],
-            }))} />
+            {/* Every target, whether or not this user can manage several.
+                The worklist is read-only, so listing them all grants no access
+                it did not already have — while narrowing it to the row's own
+                target let a project read "On track" with one of its other
+                targets already overdue, in the one panel whose job is to say so.
+                "Collection at risk" is unaffected: atRiskExposure counts a
+                project's balance once however many of its targets are listed.
+
+                Passing `rows` straight through also matters for rendering. The
+                mapped copy this replaced built a new array on every render, so
+                the useMemo inside TargetAnalysis never hit and assessTargets
+                re-ran over every project each time anything changed. */}
+            <TargetAnalysis rows={rows} />
             {auditTarget && (
               <LazyDialog key={`${auditTarget.projectId}:${auditTarget.field}`}
                           label="the audit trail" load={loadAuditModal}

@@ -66,26 +66,88 @@ export function isTrackable(target) {
 
 export const isArchived = (target) => Boolean(target && target.archived_at);
 
+/** Delivered. One definition, used by assessTarget for a target's standing and
+ *  by the project-level aggregate below, so the panel and the worklist can
+ *  never disagree about whether a target is finished.
+ *
+ *  Even a zero-quantity target needs an explicit Actual output save: that is
+ *  the database event which supplies the automatic completion timestamp. */
+export const isTargetDone = (target) => {
+  if (!target) return false;
+  if (target.actual_completion) return true;
+  const qty = num(target.target_qty);
+  const output = num(target.actual_output);
+  return qty !== null && output !== null && output >= qty;
+};
+
+/** Still to be done, and visible as such in the worklist.
+ *
+ *  This is exactly the set of targets that appear in Target tracking and
+ *  priority carrying a Standing that is not Delivered — Overdue, Critical or On
+ *  track. All three conditions matter and each excludes something different:
+ *
+ *    not archived    archiving is how a target is removed.
+ *    trackable       a target with neither a quantity nor a completion date is
+ *                    a draft. It has nothing to measure, so it is given no
+ *                    Standing and never reaches the worklist — but it can still
+ *                    carry a start date, and without this test that date could
+ *                    become the project row's Earliest Start date while the
+ *                    target itself appeared in no worklist anywhere.
+ *    not done        Delivered targets have a Standing, but not one that is
+ *                    waiting on anybody.
+ *
+ *  The project row's two date columns are built from this, so a date on the row
+ *  always belongs to a target somebody can go and find in the worklist. */
+export const isOutstanding = (target) =>
+  !isArchived(target) && isTrackable(target) && !isTargetDone(target);
+
+/** Ranking for the one target the single-target table can show.
+ *
+ *  Ordered by the earliest start date, because that is the target whose work
+ *  began first and so the one the row is meant to describe. `isTrackable` still
+ *  comes first: it only ever separates a draft from a real target, and a draft
+ *  winning the row would leave a start date on screen beside blank quantities.
+ *  A target with no start date at all sorts last and then falls back to the
+ *  original ordering, so a project whose targets carry no start dates keeps
+ *  exactly the row it has always shown. */
+const byEarliestStart = (a, b) => {
+  if (isTrackable(a) !== isTrackable(b)) return isTrackable(a) ? -1 : 1;
+
+  const startA = a.start_date || "";
+  const startB = b.start_date || "";
+  if (Boolean(startA) !== Boolean(startB)) return startA ? -1 : 1;
+  /* ISO dates, so a string comparison is a date comparison. */
+  if (startA !== startB) return startA.localeCompare(startB);
+
+  const dueA = a.target_completion || "9999-12-31";
+  const dueB = b.target_completion || "9999-12-31";
+  return String(dueA).localeCompare(String(dueB))
+    || String(a.created_at || "").localeCompare(String(b.created_at || ""))
+    || String(a.id || "").localeCompare(String(b.id || ""));
+};
+
 /** The legacy table can show one target only. Choose it predictably without
- *  mutating the server-ordered list: nearest completion date first, undated
- *  targets last, then the oldest stored target as the stable tie-breaker.
+ *  mutating the server-ordered list.
+ *
+ *  Outstanding targets are preferred, so delivering the target that started
+ *  first moves the row on to the next one still being worked — the same rule
+ *  the multi-target row's two date columns follow, so a user switching between
+ *  the two modes sees the same target described either way.
+ *
+ *  When every target has been delivered the whole set comes back into the
+ *  running rather than the row going blank. That is not cosmetic: a null here
+ *  makes the save path treat an edit as a brand new target
+ *  (`creates: [after]`), so a blank row would let ordinary typing create a
+ *  duplicate target beside the finished one.
+ *
  *  Archived targets are retained in storage but are never selected. */
 export function selectPrimaryTarget(targets) {
   const active = (Array.isArray(targets) ? targets : []).filter((target) => !isArchived(target));
-  active.sort((a, b) => {
-    /* A draft has no quantity and no deadline, so picking one ahead of a target
-       that has either leaves the single-target table showing a row of blanks
-       while a real target sits behind it. Both are undated, so the date rule
-       below cannot separate them — trackable targets are preferred here first.
-       Among equals the ordering is exactly as it was. */
-    if (isTrackable(a) !== isTrackable(b)) return isTrackable(a) ? -1 : 1;
-    const dueA = a.target_completion || "9999-12-31";
-    const dueB = b.target_completion || "9999-12-31";
-    return String(dueA).localeCompare(String(dueB))
-      || String(a.created_at || "").localeCompare(String(b.created_at || ""))
-      || String(a.id || "").localeCompare(String(b.id || ""));
-  });
-  return active[0] || null;
+  if (!active.length) return null;
+
+  const live = active.filter(isOutstanding);
+  const pool = live.length ? live : active;
+  return pool.slice().sort(byEarliestStart)[0] || null;
 }
 
 /** A target that exists but cannot be tracked yet — typically one where
@@ -114,8 +176,7 @@ export function assessTarget(project, t, today) {
   /* Even a zero-quantity target needs an explicit Actual output save. This
      keeps the standing aligned with the database event that supplies the
      automatic completion timestamp. */
-  const done = Boolean(finish)
-    || (target !== null && recordedActual !== null && recordedActual >= target);
+  const done = isTargetDone(t);
 
   /* Demonstrated capacity: what the crew has actually produced per day since
      starting. Multiplied by the days left and compared against the quantity
@@ -204,6 +265,89 @@ export function assessProjectTargets(project, options = {}) {
   };
 }
 
+/** One project's several targets reduced to the numbers the Project Panel
+ *  shows on its single row.
+ *
+ *  Archived targets are excluded throughout: archiving is how a target is
+ *  removed, so counting one would keep abandoned work in the project's totals.
+ *
+ *  Each field aggregates the way the business asked for, and the reasons differ:
+ *
+ *    targetQty / actualOutput  summed across every target, delivered or not —
+ *                              the project's total commitment and total
+ *                              delivery. Excluding delivered work would make
+ *                              the totals shrink as the project succeeded.
+ *    startDate                 earliest among targets NOT yet delivered.
+ *    targetCompletion          earliest among targets NOT yet delivered.
+ *
+ *  The two dates skip delivered targets for the same reason: together they
+ *  describe the work still outstanding, and a delivered target would keep
+ *  advertising itself long after it stopped mattering. Because both skip on the
+ *  same rule they always describe the same target, so the pair reads as one
+ *  answer rather than two unrelated dates. Delivering the earliest target moves
+ *  both columns to the next one.
+ *    unit                      only when every target agrees. Targets can be in
+ *                              m3, km or each, and a sum across different units
+ *                              is arithmetic without meaning — `unitsMixed`
+ *                              says so rather than picking one and implying the
+ *                              total is in it.
+ *
+ *  Sums stay null when no target carries the value at all, so the panel can
+ *  show "—" rather than a zero nobody entered.
+ */
+export function aggregateProjectTargets(project) {
+  const active = (Array.isArray(project?.targets) ? project.targets : [])
+    .filter((target) => target && !isArchived(target));
+
+  let targetQty = null;
+  let actualOutput = null;
+  let startDate = "";
+  let targetCompletion = "";
+  const units = new Set();
+
+  for (const target of active) {
+    const qty = num(target.target_qty);
+    if (qty !== null) targetQty = (targetQty ?? 0) + qty;
+
+    const output = num(target.actual_output);
+    if (output !== null) actualOutput = (actualOutput ?? 0) + output;
+
+    /* Both dates describe the work still outstanding, so a delivered target is
+       out of the running for either. Deliver the target that starts earliest
+       and the row moves to the next one that has not been delivered, exactly as
+       the completion date does — the two columns always describe the same
+       target, which is the only way the pair reads as one answer.
+
+       ISO dates throughout, so a string comparison is a date comparison. */
+    /* Deliberately not a `continue`: the sums above and the unit below cover
+       every target — delivered, draft or otherwise — because they report what
+       the project has committed to and produced in total. The unit qualifies
+       those sums, so dropping a target's unit here would let a project read as
+       single-unit when its total spans two.
+
+       Only the two dates narrow, and they narrow to exactly what the worklist
+       shows as still waiting. A date on the row that belonged to a draft would
+       point at a target with no Standing in Target tracking and priority. */
+    if (isOutstanding(target)) {
+      const start = target.start_date || "";
+      if (start && (!startDate || start < startDate)) startDate = start;
+
+      const due = target.target_completion || "";
+      if (due && (!targetCompletion || due < targetCompletion)) targetCompletion = due;
+    }
+
+    const unit = String(target.unit ?? "").trim();
+    if (unit) units.add(unit);
+  }
+
+  return {
+    count: active.length,
+    targetQty, actualOutput, startDate, targetCompletion,
+    unit: units.size === 1 ? [...units][0] : "",
+    unitsMixed: units.size > 1,
+  };
+}
+
 /** Every trackable target across every project, ranked the way the worklist
  *  presents them, plus the drafts that were deliberately left out. */
 export function assessTargets(records, options = {}) {
@@ -274,6 +418,12 @@ export const TARGET_FIELDS = [
   ["start_date", "Start date"],
   ["target_completion", "Target completion"],
   ["actual_output", "Actual output"],
+  /* Stored as "Target remarks", never "Remarks". The project keeps its own
+     Remarks column, and AuditModal reads a project-level cell's history by
+     column_name alone — with no target_id filter, because that cell belongs to
+     no target. Sharing the label would pour every target's remark into the
+     project's final-Remarks trail. Same reasoning as Scope/"Balance Work". */
+  ["remarks", "Target remarks"],
 ];
 
 /** Actual completion is no longer editable: the database records it when an
@@ -288,13 +438,19 @@ export const TARGET_HISTORY_FIELDS = [
 
 const blank = (v) => v === null || v === undefined || String(v).trim() === "";
 
-/** Validates one target as the modal would save it. `isNew` tightens the scope
- *  rule: newly created targets must be named, migrated ones legitimately have
- *  no scope yet and must stay editable regardless. */
-export function validateTarget(values, { isNew = false } = {}) {
+/** Validates one target as the modal would save it.
+ *
+ *  Balance Work is optional. It was once required on newly created targets,
+ *  which left migrated targets — that have never had one — as the awkward
+ *  exception the `isNew` flag existed to carve out. The business asked for it
+ *  to be the author's choice, so there is now one rule for every target and
+ *  nothing to except. `isNew` is kept in the signature because callers pass it
+ *  and a future rule may need it again.
+ *
+ *  What is still checked is only what would otherwise be stored wrong: a
+ *  quantity that is not a number, or a date pair in the wrong order. */
+export function validateTarget(values, { isNew = false } = {}) { // eslint-disable-line no-unused-vars
   const errors = {};
-
-  if (isNew && blank(values.scope)) errors.scope = `${SCOPE_LABEL} is required for a new target.`;
 
   for (const [field, label] of [["target_qty", "Target qty"], ["actual_output", "Actual output"]]) {
     if (blank(values[field])) continue;

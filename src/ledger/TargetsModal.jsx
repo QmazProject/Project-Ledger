@@ -3,10 +3,10 @@
    Downloaded on demand rather than at sign-in — see ProjectLedger.jsx for how
    it is loaded and what happens when the download fails. */
 
-import { useState, useMemo, useRef, useEffect } from "react";
-import { todayMs, assessTarget, isTrackable, validateTarget, targetWarnings, TARGET_FIELDS, SCOPE_LABEL } from "../lib/targets";
-import { groupTargetHistory, actionLabel, isEventOnly, isBlankValue } from "../lib/targetHistory";
-import { blankToNull, confirmPermanentDelete, fmtDate, T, DISPLAY, BODY, MONO, money, DRAFT_COLOR, PILL_BASE, pillStyle, emptyTarget } from "./shared";
+import { Fragment, useState, useMemo, useRef, useEffect } from "react";
+import { validateTarget, targetWarnings, aggregateProjectTargets, TARGET_FIELDS, SCOPE_LABEL } from "../lib/targets";
+import { actionLabel, isBlankValue, EVENT_FIELD_KEY } from "../lib/targetHistory";
+import { blankToNull, confirmPermanentDelete, fmtDate, T, DISPLAY, BODY, MONO, money, qty, emptyTarget } from "./shared";
 import EditCell from "./EditCell";
 import { loadTargetHistory, deleteTargetPermanently, saveTargets } from "./data";
 
@@ -20,23 +20,25 @@ const TARGET_COLUMNS = [
   { k: "start_date", label: "Start date", type: "date", w: 132 },
   { k: "target_completion", label: "Target completion", type: "date", w: 132 },
   { k: "actual_output", label: "Actual output", type: "qty", w: 96 },
+  /* Per-target, and not the project's Remarks column — that one is the
+     project's final remark and stays on the ledger row. Stored under the audit
+     label "Target remarks" so the two histories never merge. */
+  { k: "remarks", label: "Remarks", type: "text", w: 190, wrap: true },
 ];
-
-const draftPill = {
-  ...PILL_BASE, background: "transparent", color: DRAFT_COLOR,
-  border: `1px dashed ${DRAFT_COLOR}`, fontWeight: 500,
-};
 
 /* ---------------- target history ----------------
    Read-only, and layered above Manage targets rather than replacing it, so
    checking what changed never costs unsaved edits.
 
-   The per-cell audit trail on the ledger row is left exactly as it was: it
-   answers "what happened to this one field", which is still the right question
-   for status, contract and remarks. It cannot answer this one. Target fields no
-   longer have cells of their own to right-click, and a save that touched four
-   fields of one target reads as four unrelated entries there. This view groups
-   by the save.
+   Laid out as the ledger's audit trail is — one row per change, under the same
+   When / Column / Activity / User / Previous / New headings — because it
+   answers the same question about a different set of fields, and somebody who
+   has read one should not have to learn the other. Target fields have no cells
+   of their own to right-click on the ledger row, so this is where that question
+   gets asked about them.
+
+   It was grouped into cards by save before. The grouping is still legible in
+   the flat table: one save is the rows sharing a timestamp and a user.
 ------------------------------------------------- */
 
 const ACTION_TONE = {
@@ -59,6 +61,33 @@ const historyValue = (fieldKey, value) => {
 
 const targetLabel = (target) =>
   target?.scope || (target?.archived_at ? "Archived target" : `Target with no ${SCOPE_LABEL}`);
+
+/* The heading each field is shown under, taken from the columns of the table
+   directly above this view so the history names a field the way the editor
+   does. Deliberately not AUDIT_DISPLAY_LABELS: that map has to disambiguate
+   `remarks` from the project's own `note` and so calls this one "Target
+   remarks", which is the right name in the project-wide audit trail and the
+   wrong one here, where every row is a target already. */
+const HISTORY_LABELS = {
+  ...Object.fromEntries(TARGET_COLUMNS.map((c) => [c.k, c.label])),
+  /* No longer editable, but older targets carry changes to it. */
+  actual_completion: "Actual completion",
+};
+const historyLabel = (row) =>
+  HISTORY_LABELS[row.field_key] || row.column_name || row.field_key || "—";
+
+/* What the row records. The event rows — field_key "target" — are the target's
+   own life story rather than a change to one of its fields, so they are named
+   for the action. Everything else is a field edit, and the only thing worth
+   distinguishing is where it was typed. */
+const historyActivity = (row) => {
+  if (row.field_key === EVENT_FIELD_KEY) return `Target ${actionLabel(row.action).toLowerCase()}`;
+  if (row.action === "archive" || row.action === "restore") return `Target ${row.action}d`;
+  /* Rows written before the targets table existed carry no batch and were made
+     on the ledger row rather than here. Saying so is more honest than
+     presenting them as if they came from this modal. */
+  return row.source === "panel" ? "Ledger row edit" : "Manual edit";
+};
 
 function TargetHistoryModal({ project, targets, focusTargetId = null, onClose }) {
   const stored = useMemo(() => (targets || []).filter((t) => t && t.id && !String(t.id).startsWith("new:")),
@@ -83,20 +112,28 @@ function TargetHistoryModal({ project, targets, focusTargetId = null, onClose })
   }, [ids]);
 
   /* Every target's rows are fetched once and narrowed here, so switching
-     between targets costs no request and the whole-project view is free. */
-  const events = useMemo(() => groupTargetHistory(
-    selected === "all" ? rows : rows.filter((r) => r.target_id === selected),
-  ), [rows, selected]);
+     between targets costs no request and the whole-project view is free.
 
-  const heading = { padding: "6px 7px", textAlign: "left", borderBottom: `1px solid ${T.ruleSoft}`,
-    fontFamily: DISPLAY, fontSize: 9.5, textTransform: "uppercase", letterSpacing: ".05em", color: T.inkFaint };
+     Read one row per change, the way the ledger's audit trail reads. The saves
+     these came from are still visible — a save that touched four fields is four
+     rows sharing a timestamp and a user — but the question this view is opened
+     to answer is "what happened to this field", and that is a row, not a card
+     to be opened. */
+  const entries = useMemo(
+    () => (selected === "all" ? rows : rows.filter((r) => r.target_id === selected)),
+    [rows, selected],
+  );
+
+  const heading = { padding: "6px 7px", textAlign: "left", borderBottom: `2px solid ${T.ink}`,
+    fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase", letterSpacing: ".05em", whiteSpace: "nowrap" };
+  const cell = { padding: "7px", borderBottom: `1px solid ${T.ruleSoft}`, verticalAlign: "top" };
 
   return (
     <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
          style={{ position: "fixed", inset: 0, zIndex: 26, background: "rgba(22,33,28,.35)",
                   display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
       <div role="dialog" aria-modal="true" aria-labelledby="target-history-title"
-           style={{ width: "min(760px, 100%)", maxHeight: "84vh", display: "flex", flexDirection: "column",
+           style={{ width: "min(940px, 100%)", maxHeight: "84vh", display: "flex", flexDirection: "column",
                     background: T.panel, border: `1px solid ${T.ink}`, borderRadius: 2,
                     boxShadow: "0 18px 50px rgba(0,0,0,.25)" }}>
 
@@ -134,7 +171,7 @@ function TargetHistoryModal({ project, targets, focusTargetId = null, onClose })
         <div style={{ overflow: "auto", flex: 1, padding: "12px 16px" }}>
           {loading && <div style={{ color: T.inkFaint, fontSize: 12 }}>Loading target history…</div>}
           {error && <div role="alert" style={{ color: T.bad, fontSize: 12 }}>Could not load target history: {error}</div>}
-          {!loading && !error && !events.length && (
+          {!loading && !error && !entries.length && (
             <div className="py-8 text-center text-xs" style={{ color: T.inkFaint, lineHeight: 1.7 }}>
               {ids.length === 0
                 ? <>No saved targets yet.<br />History starts once a target is saved.</>
@@ -142,71 +179,62 @@ function TargetHistoryModal({ project, targets, focusTargetId = null, onClose })
             </div>
           )}
 
-          {!loading && !error && events.map((event) => {
-            const tone = ACTION_TONE[event.action] || T.inkSoft;
-            /* Whose target this was matters only when several are on screen. */
-            const scope = selected === "all"
-              ? (event.targetScope || scopeById.get(event.targetId) || null)
-              : null;
-            return (
-              <div key={event.key} style={{ border: `1px solid ${T.ruleSoft}`, borderRadius: 2, marginBottom: 10 }}>
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2"
-                     style={{ background: T.paper2, borderBottom: isEventOnly(event) ? "none" : `1px solid ${T.ruleSoft}` }}>
-                  <span style={{ ...PILL_BASE, width: "auto", minWidth: 66, background: tone + "1A",
-                                 color: tone, border: `1px solid ${tone}55`, fontWeight: 600 }}>
-                    {actionLabel(event.action)}
-                  </span>
-                  <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.ink }}>
-                    {event.changedAt ? new Date(event.changedAt).toLocaleString() : "Date not recorded"}
-                  </span>
-                  <span style={{ fontFamily: MONO, fontSize: 10.5, color: T.inkSoft }}>· {event.user}</span>
-                  {scope && (
-                    <span style={{ fontSize: 10.5, color: T.inkSoft, minWidth: 0, overflow: "hidden",
-                                   textOverflow: "ellipsis", whiteSpace: "nowrap" }}>· {scope}</span>
-                  )}
-                  {/* Rows written before the targets table existed carry no
-                      batch, and were made on the ledger row rather than here.
-                      Saying so is more honest than presenting them as if they
-                      came from this modal. */}
-                  {event.source === "panel" && (
-                    <span style={{ fontFamily: MONO, fontSize: 10, color: T.inkFaint }}>· from the ledger row</span>
-                  )}
-                </div>
-
-                {!isEventOnly(event) && (
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
-                    <thead><tr>
-                      <th style={{ ...heading, width: 170 }}>Field</th>
-                      <th style={heading}>Previous value</th>
-                      <th style={heading}>New value</th>
-                    </tr></thead>
-                    <tbody>
-                      {event.fields.map((field, i) => (
-                        <tr key={`${event.key}:${field.fieldKey || field.label}:${i}`}>
-                          <td style={{ padding: "6px 7px", borderBottom: `1px solid ${T.ruleSoft}`, color: T.inkSoft }}>
-                            {field.label}
+          {!loading && !error && entries.length > 0 && (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead><tr>
+                  <th style={heading}>When</th>
+                  {selected === "all" && <th style={heading}>Target</th>}
+                  <th style={heading}>Column</th>
+                  <th style={heading}>Activity</th>
+                  <th style={heading}>User</th>
+                  <th style={heading}>Previous value</th>
+                  <th style={heading}>New value</th>
+                </tr></thead>
+                <tbody>
+                  {entries.map((row) => {
+                    const tone = ACTION_TONE[row.action] || T.inkSoft;
+                    const isEvent = row.field_key === EVENT_FIELD_KEY;
+                    return (
+                      <tr key={row.id}>
+                        <td style={{ ...cell, whiteSpace: "nowrap", fontFamily: MONO, fontSize: 10.5 }}>
+                          {row.changed_at ? new Date(row.changed_at).toLocaleString() : "Date not recorded"}
+                        </td>
+                        {/* Which target this belonged to matters only when
+                            several are on screen at once. */}
+                        {selected === "all" && (
+                          <td style={{ ...cell, fontSize: 11, color: T.inkSoft, maxWidth: 170,
+                                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                              title={row.target_scope || scopeById.get(row.target_id) || ""}>
+                            {row.target_scope || scopeById.get(row.target_id) || "—"}
                           </td>
-                          <td style={{ padding: "6px 7px", borderBottom: `1px solid ${T.ruleSoft}`,
-                                       fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
-                            {historyValue(field.fieldKey, field.from)}
-                          </td>
-                          <td style={{ padding: "6px 7px", borderBottom: `1px solid ${T.ruleSoft}`,
-                                       fontFamily: MONO, fontSize: 10.5, color: T.ink, fontWeight: 600 }}>
-                            {historyValue(field.fieldKey, field.to)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            );
-          })}
+                        )}
+                        <td style={{ ...cell, whiteSpace: "nowrap", fontFamily: MONO, fontSize: 10.5 }}>
+                          {isEvent ? <span style={{ color: T.inkFaint }}>—</span> : historyLabel(row)}
+                        </td>
+                        <td style={{ ...cell, whiteSpace: "nowrap", color: tone, fontWeight: 600 }}>
+                          {historyActivity(row)}
+                        </td>
+                        <td style={{ ...cell }}>{row.changed_by_username || "Unknown user"}</td>
+                        <td style={{ ...cell, fontFamily: MONO, fontSize: 10.5, color: T.inkFaint }}>
+                          {isEvent ? "—" : historyValue(row.field_key, row.old_value)}
+                        </td>
+                        <td style={{ ...cell, fontFamily: MONO, fontSize: 10.5, fontWeight: 600 }}>
+                          {isEvent ? "—" : historyValue(row.field_key, row.new_value)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         <div className="px-4 py-2" style={{ borderTop: `1px solid ${T.rule}`, background: T.paper2 }}>
           <span className="text-[10.5px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-            One entry per save. Archiving keeps a target and its history on record — nothing here is ever deleted.
+            One row per change; a single save is the rows sharing a timestamp. Archiving keeps a target and its
+            history on record — nothing here is ever deleted.
           </span>
         </div>
       </div>
@@ -232,7 +260,6 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const nextId = useRef(0);
-  const today = useMemo(() => todayMs(), []);
 
   const isPendingArchived = (r) => Boolean((r.archived_at && !r._restore) || r._archive);
   const visible = rows.filter((r) => showArchived || !isPendingArchived(r));
@@ -288,12 +315,6 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
 
   /* Live standing, computed from what is currently typed rather than from what
      was last saved, so the pill answers the row in front of you. */
-  const standingOf = (row) => {
-    if (isPendingArchived(row)) return { label: "Archived", style: draftPill };
-    if (!isTrackable(row)) return { label: "Draft", style: draftPill };
-    return { label: assessTarget(project, row, today).bucket, style: null };
-  };
-
   const changedRows = () => {
     const creates = [], updates = [], archives = [], restores = [];
     for (const row of rows) {
@@ -360,6 +381,17 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
 
   const head = { padding: "6px 8px", borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY,
     fontSize: 9.5, textTransform: "uppercase", letterSpacing: ".06em", whiteSpace: "nowrap", textAlign: "left" };
+  const foot = { padding: "7px 8px", borderTop: `2px solid ${T.ink}`, fontFamily: MONO,
+    fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap", background: T.paper2 };
+
+  /* Totals cover the targets on screen, which is what the reader is adding up.
+     Showing archived rows brings them into the total as well, exactly as the
+     list above does — the alternative is a footer that disagrees with the rows
+     printed directly over it. */
+  const totals = useMemo(
+    () => aggregateProjectTargets({ targets: visible.map((r) => (isPendingArchived(r) ? { ...r, archived_at: null } : r)) }),
+    [visible],
+  );
 
   return (
     <div role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}
@@ -415,11 +447,10 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
               <thead>
                 <tr>
                   {TARGET_COLUMNS.map((c) => (
-                    <th key={c.k} style={{ ...head, width: c.w, minWidth: c.w }}>
-                      {c.label}{c.k === "scope" && <span aria-hidden="true" style={{ color: T.bad, marginLeft: 3 }}>*</span>}
+                    <th key={c.k} style={{ ...head, width: c.w, minWidth: c.w, maxWidth: c.w }}>
+                      {c.label}
                     </th>
                   ))}
-                  <th style={{ ...head, width: 124, minWidth: 124 }}>Standing</th>
                   <th style={{ ...head, width: 96, minWidth: 96, textAlign: "center" }}>Actions</th>
                 </tr>
               </thead>
@@ -427,17 +458,29 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
                 {visible.map((row) => {
                   const rowErrors = errors[row.id] || {};
                   const archived = isPendingArchived(row);
-                  const standing = standingOf(row);
                   const warnings = archived ? [] : targetWarnings(row);
                   return (
-                    <tr key={row.id} style={archived ? { opacity: 0.55 } : undefined}>
+                    <Fragment key={row.id}>
+                    <tr style={archived ? { opacity: 0.55 } : undefined}>
+                      {/* The width is pinned on each cell as well as on the
+                          header. Without a maxWidth the table's auto layout lets
+                          one long Balance Work stretch its column past the 200px
+                          the header was sized to, and the heading stops sitting
+                          over its own values. */}
                       {TARGET_COLUMNS.map((c) => (
                         <td key={c.k} style={{ padding: "3px 4px", borderBottom: `1px solid ${T.ruleSoft}`,
                                                verticalAlign: "top",
+                                               ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w } : {}),
                                                background: rowErrors[c.k] ? "#FBEEEC" : row._isNew ? "#F3F8F4" : "transparent" }}>
                           {archived ? (
+                            /* Same wrapping rules as the textarea this stands
+                               in for. Without them an archived row silently
+                               reflows its text: typed line breaks collapse to
+                               spaces, and a long unbroken value refuses to
+                               break at all. */
                             <span style={{ fontFamily: c.type === "text" ? BODY : MONO, fontSize: 11.5,
-                                           padding: "1px 4px", display: "block", color: T.inkSoft }}>
+                                           padding: "1px 4px", display: "block", color: T.inkSoft,
+                                           ...(c.wrap ? { whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.35 } : {}) }}>
                               {row[c.k] === "" || row[c.k] === null ? "—" : String(row[c.k])}
                             </span>
                           ) : (
@@ -446,21 +489,8 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
                           {rowErrors[c.k] && (
                             <div style={{ color: T.bad, fontSize: 10, padding: "1px 4px" }}>{rowErrors[c.k]}</div>
                           )}
-                          {/* a migrated target legitimately has no scope; say so
-                              rather than inventing one */}
-                          {c.k === "scope" && !archived && !row._isNew && !row.scope && !rowErrors.scope && (
-                            <div style={{ color: T.inkFaint, fontSize: 10, fontStyle: "italic", padding: "1px 4px" }}>
-                              No {SCOPE_LABEL} specified
-                            </div>
-                          )}
                         </td>
                       ))}
-                      <td style={{ padding: "5px 6px", borderBottom: `1px solid ${T.ruleSoft}`, verticalAlign: "top" }}>
-                        <span style={standing.style || pillStyle(standing.label)}>{standing.label}</span>
-                        {warnings.map((w) => (
-                          <div key={w} style={{ color: T.works, fontSize: 10, marginTop: 3, lineHeight: 1.3 }}>{w}</div>
-                        ))}
-                      </td>
                       <td style={{ padding: "5px 6px", borderBottom: `1px solid ${T.ruleSoft}`, textAlign: "center", verticalAlign: "top" }}>
                         <div className="flex flex-col items-center gap-1">
                         {row.archived_at ? (
@@ -506,9 +536,49 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
                         </div>
                       </td>
                     </tr>
+                    {/* Row-level rather than per-cell: these warn about the
+                        relationship between two fields — output above target,
+                        a zero quantity — so they belong to the target, not to
+                        one of its columns. They used to sit under the Standing
+                        pill, which this table no longer has. */}
+                    {warnings.length > 0 && (
+                      <tr>
+                        <td colSpan={TARGET_COLUMNS.length + 1}
+                            style={{ padding: "0 6px 6px", borderBottom: `1px solid ${T.ruleSoft}` }}>
+                          {warnings.map((w) => (
+                            <div key={w} style={{ color: T.works, fontSize: 10, lineHeight: 1.35 }}>{w}</div>
+                          ))}
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   );
                 })}
               </tbody>
+              {/* Sums of what was committed and what has been delivered across
+                  every target in this project. The unit is shown only when all
+                  the targets agree on one — adding m3 to km produces a number
+                  that must not claim to be measured in either. */}
+              <tfoot>
+                <tr>
+                  <td style={foot}>Total</td>
+                  <td style={{ ...foot, textAlign: "right" }}>
+                    {totals.targetQty === null ? "—" : qty(totals.targetQty)}
+                  </td>
+                  <td style={foot}>
+                    {totals.unitsMixed
+                      ? <span style={{ color: T.works }} title="These targets use different units, so the totals are not in a single unit.">mixed</span>
+                      : totals.unit}
+                  </td>
+                  <td style={foot} />
+                  <td style={foot} />
+                  <td style={{ ...foot, textAlign: "right" }}>
+                    {totals.actualOutput === null ? "—" : qty(totals.actualOutput)}
+                  </td>
+                  <td style={foot} />
+                  <td style={foot} />
+                </tr>
+              </tfoot>
             </table>
           )}
 
@@ -527,7 +597,7 @@ export default function TargetsModal({ project, onClose, onSaved, isAdmin }) {
               </label>
             )}
             <span className="text-[10.5px]" style={{ fontFamily: MONO, color: T.inkFaint }}>
-              {SCOPE_LABEL} is required for a new target. A target with no quantity and no completion date stays a draft
+              Every field is optional. A target with no quantity and no completion date stays a draft
               and is not tracked.
             </span>
           </div>
