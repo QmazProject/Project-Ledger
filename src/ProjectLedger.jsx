@@ -936,7 +936,11 @@ function FilterDropdown({ dim, counts, selected, onToggle, onClearOne, open, onO
              style={{ top: "100%", width: Math.max(dim.w, 230), background: T.panel,
                       border: `1px solid ${T.ink}`, boxShadow: "0 18px 40px -20px rgba(22,33,28,.55)" }}>
           {counts.size > 8 && (
-            <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="find\u2026"
+            /* autoFocus makes this the strongest autofill magnet on the page; same opt-outs as
+               the filter bar's search box. */
+            <input type="search" name={`filter-find-${dim.k}`} id={`filter-find-${dim.k}`} autoComplete="off"
+                   data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+                   autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="find…"
                    className="mb-1.5 w-full rounded-sm px-2 py-1 text-xs" style={{ border: `1px solid ${T.rule}` }} />
           )}
           <div className="max-h-64 overflow-auto">
@@ -991,7 +995,14 @@ function FilterBar({ q, setQ, filters, countsFor, onToggle, onClearOne, onClearA
         <div className="project-filter-search relative" style={{ width: 220, minWidth: 160, flex: "1 1 auto", maxWidth: 320 }}>
           <div className="mb-1 text-[9.5px] uppercase"
                style={{ fontFamily: DISPLAY, fontWeight: 600, letterSpacing: ".09em", color: T.inkSoft }}>Search</div>
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="ID, project name, remarks\u2026"
+          {/* Sign-in and the ledger share one URL - AuthGate swaps the login form out for this
+              tree without a navigation - so a password manager re-scanning the DOM sees a bare
+              single text field appear where it was just filling credentials and reads it as a
+              username box. type/name/autoComplete stop the built-in classifiers; the data-*
+              attributes are the opt-outs 1Password, LastPass and Bitwarden honour instead. */}
+          <input type="search" name="project-search" id="project-search" autoComplete="off"
+                 data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+                 value={q} onChange={(e) => setQ(e.target.value)} placeholder="ID, project name, remarks…"
                  className="project-filter-search-input w-full rounded-sm px-2.5 py-1.5 text-xs"
                  style={{ border: `1px solid ${q ? T.ink : T.rule}` }} />
         </div>
@@ -1525,7 +1536,9 @@ function AddProjectModal({ onCancel, onCreate, busy, currentYear }) {
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <div style={{ flex: "1 1 220px" }}>
               <label style={label} htmlFor="add-project-id">Project ID *</label>
-              <input id="add-project-id" autoFocus value={values.projectId} disabled={busy}
+              <input id="add-project-id" name="add-project-id" autoComplete="off"
+                     data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+                     autoFocus value={values.projectId} disabled={busy}
                      onChange={(e) => set("projectId", e.target.value)}
                      placeholder="e.g. 26HD0023" style={{ ...field, fontFamily: MONO }} />
             </div>
