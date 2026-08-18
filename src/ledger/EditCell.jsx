@@ -31,7 +31,7 @@ const PROJECT_STATUS_TONE = {
    reached only by clicking into the cell and scrolling it. A textarea grown to
    its own content shows every line of it while staying one field: same value,
    same onChange, same Escape. */
-export default function EditCell({ value, type, onChange, wrap = false, disabled = false }) {
+export default function EditCell({ value, type, onChange, wrap = false, disabled = false, align }) {
   const [focus, setFocus] = useState(false);
   /* null means "not being typed into"; "" is a real value the user cleared */
   const [typed, setTyped] = useState(null);
@@ -128,7 +128,11 @@ export default function EditCell({ value, type, onChange, wrap = false, disabled
     width: "100%", border: `1px solid ${focus ? T.collected : "transparent"}`,
     background: focus ? T.panel : "transparent", borderRadius: 2, padding: "1px 4px",
     fontFamily: type === "text" ? BODY : MONO, fontSize: 11.5, color: T.ink,
-    textAlign: type === "qty" || type === "amount" || type === "pct" ? "right" : "left", outline: "none",
+    /* Numbers sit right by default so their digits line up down the column.
+       `align` lets a narrow column centre them instead, where the heading is
+       about as wide as the value and centring reads better than either edge. */
+    textAlign: align || (type === "qty" || type === "amount" || type === "pct" ? "right" : "left"),
+    outline: "none",
   };
   const handlers = {
     onFocus: () => setFocus(true),

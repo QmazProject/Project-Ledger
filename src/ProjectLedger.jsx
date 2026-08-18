@@ -503,43 +503,43 @@ const COLS = [
      every join; this column only decides what the eye sees. Two years of the
      same project therefore render an identical ID, which is why the cell's
      tooltip below spells the year out. */
-  { k: "displayId", label: "ID", stick: true, w: 92 },
+  { k: "displayId", label: "ID", stick: true, w: 88 },
   /* The year the ID column stops showing. Two years of the same project render
      an identical ID, so without this the only way to tell them apart was the
      cell's tooltip. Same field the Project year filter selects on, so a filtered
      view and this column can never disagree. */
-  { k: "yearStr", label: "Year", w: 66 },
-  { k: "district", label: "District" },
-  { k: "license", label: "License" },
+  { k: "yearStr", label: "Year", w: 58 },
+  { k: "district", label: "District", w: 116 },
+  { k: "license", label: "License", w: 138 },
   /* Hand-typed like Status and Contract: the workbook supplies it, but a
      correction typed here outlives every later import of it. */
-  { k: "engineer", label: "Senior engineer", edit: "text", w: 180 },
-  { k: "category", label: "Category" },
-  { k: "location", label: "Location" },
-  { k: "status", label: "Status", edit: "status", w: 160 },
-  { k: "contract", label: "Contract", edit: "amount", money: true, w: 101 },
+  { k: "engineer", label: "Senior engineer", edit: "text", w: 148 },
+  { k: "category", label: "Category", w: 116 },
+  { k: "location", label: "Location", w: 128 },
+  { k: "status", label: "Status", edit: "status", w: 126 },
+  { k: "contract", label: "Contract", edit: "amount", money: true, w: 104 },
   /* Panel-only dates, entered with a picker. No workbook column feeds either of
      them — see 20260904000000_project_manual_ntp_completion.sql for why an
      "NTP" heading in a future workbook must stay unread. */
-  { k: "ntpDate", label: "NTP date", edit: "date", w: 128 },
-  { k: "completionDate", label: "Completion date", edit: "date", w: 142 },
+  { k: "ntpDate", label: "NTP date", edit: "date", w: 126 },
+  { k: "completionDate", label: "Completion date", edit: "date", w: 126 },
   /* no `pct: true`: an editable cell formats itself, and two formatters on one
      column is how they drift apart */
-  { k: "swa", label: "SWA %", edit: "pct", w: 92 },
-  { k: "billpct", label: "Billed %", pct: true },
-  { k: "net", label: "Collected (net)", money: true, group: "collection" },
-  { k: "cg", label: "Balance works", money: true, group: "collection" },
-  { k: "cr", label: "Retention", money: true, group: "collection" },
-  { k: "bal", label: "Balance for collection", money: true, w: 119, group: "collection" },
-  { k: "netbal", label: "Net balance", money: true, group: "collection" },
+  { k: "swa", label: "SWA %", edit: "pct", center: true, w: 82 },
+  { k: "billpct", label: "Billed %", pct: true, w: 82 },
+  { k: "net", label: "Collected (net)", money: true, group: "collection", w: 106 },
+  { k: "cg", label: "Balance works", money: true, group: "collection", w: 106 },
+  { k: "cr", label: "Retention", money: true, group: "collection", w: 106 },
+  { k: "bal", label: "Balance for collection", money: true, w: 106, group: "collection" },
+  { k: "netbal", label: "Net balance", money: true, group: "collection", w: 106 },
   /* A project can hold several targets, so the six target columns are no longer
      single-valued and have moved into Manage Targets. What is left on the row
      is a summary that opens it — which makes the table one column narrower than
      it was, not wider. */
-  { k: "targetSummary", label: "Targets", targets: true, w: 178 },
+  { k: "targetSummary", label: "Targets", targets: true, w: 150 },
   /* wraps for the same reason Balance Work does: a note somebody typed is a
      sentence, and 190px of it is not the note */
-  { k: "note", label: "Remarks", edit: "text", w: 190, wrap: true },
+  { k: "note", label: "Remarks", edit: "text", w: 150, wrap: true },
 ];
 
 /* Columns that sort on a different field from the one they display. The summary
@@ -555,17 +555,17 @@ const INLINE_TARGET_COLS = [
   /* `wrap`: the value is a list of works — "Emulsified Asphalt, Wearing Course
      Hot Laid…" — not a word, so the cell has to show all of it rather than as
      much as 190px holds. */
-  { k: "scope", label: SCOPE_LABEL, edit: "text", targetField: true, w: 190, wrap: true },
-  { k: "target_qty", label: "Target qty", edit: "qty", targetField: true, w: 92 },
-  { k: "unit", label: "Unit", edit: "text", targetField: true, w: 80 },
-  { k: "start_date", label: "Start date", edit: "date", targetField: true, w: 132 },
-  { k: "target_completion", label: "Target completion", edit: "date", targetField: true, w: 132 },
-  { k: "actual_output", label: "Actual output", edit: "qty", targetField: true, w: 96 },
+  { k: "scope", label: SCOPE_LABEL, edit: "text", targetField: true, w: 168, wrap: true },
+  { k: "target_qty", label: "Target qty", edit: "qty", targetField: true, center: true, w: 84 },
+  { k: "unit", label: "Unit", edit: "text", targetField: true, w: 64 },
+  { k: "start_date", label: "Start date", edit: "date", targetField: true, w: 126 },
+  { k: "target_completion", label: "Target completion", edit: "date", targetField: true, w: 126 },
+  { k: "actual_output", label: "Actual output", edit: "qty", targetField: true, center: true, w: 88 },
   /* The target's own remark, not the project's. With only one target on the row
      there is nowhere else to reach it — Manage Targets is unavailable to this
      user — so it takes the Remarks column, and the project's final remark is
      hidden for the same reason the Targets cell is. See the `cols` memo. */
-  { k: "remarks", label: "Remarks", edit: "text", targetField: true, w: 190, wrap: true },
+  { k: "remarks", label: "Remarks", edit: "text", targetField: true, w: 138, wrap: true },
 ];
 const INLINE_TARGET_FIELD_KEYS = new Set(INLINE_TARGET_COLS.map((column) => column.k));
 
@@ -582,15 +582,15 @@ const INLINE_TARGET_FIELD_KEYS = new Set(INLINE_TARGET_COLS.map((column) => colu
  * footer carries the unit, where the individual targets are visible to qualify
  * it. */
 const MULTI_TARGET_COLS = [
-  { k: "aggTargetQty", label: "Total target qty", targetAgg: "qty", w: 112 },
-  { k: "aggStartDate", label: "Earliest Start date", targetAgg: "date", w: 150 },
+  { k: "aggTargetQty", label: "Total target qty", targetAgg: "qty", center: true, w: 88 },
+  { k: "aggStartDate", center: true, label: "Earliest Start date", targetAgg: "date", w: 112 },
   /* "Earliest" is the business's word for it. Strictly it is the earliest that
      is not yet delivered, which the header has no room to say — so the hint
      does, rather than leaving somebody to wonder why a date they can see in
      Manage Targets is not the one on the row. */
-  { k: "aggTargetCompletion", label: "Earliest target completion", targetAgg: "date", w: 176,
+  { k: "aggTargetCompletion", center: true, label: "Earliest target completion", targetAgg: "date", w: 120,
     hint: "The earliest target completion still outstanding. Targets already delivered are skipped." },
-  { k: "aggActualOutput", label: "Total output qty", targetAgg: "qty", w: 116 },
+  { k: "aggActualOutput", label: "Total output qty", targetAgg: "qty", center: true, w: 92 },
 ];
 
 
@@ -1820,7 +1820,12 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
   });
   const spanAll = cols.length + 1;
 
-  const th = { position: "sticky", top: 0, background: T.paper2, zIndex: 3, textAlign: "left", padding: "7px 9px",
+  /* A heading belongs over its values. Money, percentages and quantities all
+     render right-aligned, so a left-aligned heading left SWA % and Target qty
+     labelled from the far side of an empty column. */
+  const numericCol = (c) => Boolean(c.money || c.pct || c.targetAgg === "qty"
+    || c.edit === "amount" || c.edit === "pct" || c.edit === "qty");
+  const th = { position: "sticky", top: 0, background: T.paper2, zIndex: 3, textAlign: "left", padding: "7px 7px",
     borderBottom: `2px solid ${T.ink}`, fontFamily: DISPLAY, fontSize: 10, textTransform: "uppercase",
     letterSpacing: ".06em", cursor: "pointer", whiteSpace: "nowrap" };
   const stick = { position: "sticky", left: 0, background: T.panel, zIndex: 2, borderRight: `1px solid ${T.rule}` };
@@ -1944,11 +1949,28 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                         : undefined}
                       title={c.stick && onViewDuplicates
                         ? "Right-click for duplicate Project IDs" : c.hint}
-                      style={{ ...th, ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w,
-                                                 whiteSpace: c.stick ? "nowrap" : "normal" } : {}),
+                      style={{ ...th, textAlign: c.center ? "center" : numericCol(c) ? "right" : "left",
+                               ...(c.w ? { width: c.w, minWidth: c.w, maxWidth: c.w,
+                                           whiteSpace: c.stick ? "nowrap" : "normal" } : {}),
                                color: c.edit ? "#C28A00" : T.ink,
                                ...(c.stick ? { ...stick, background: T.paper2, zIndex: 4 } : {}) }}>
-                    {c.label}{c.edit && <span aria-hidden="true" style={{ color: T.bad, marginLeft: 3, fontWeight: 800 }}>*</span>} <span style={{ fontFamily: MONO, color: T.inkFaint }}>{sort.key === c.k ? (sort.dir > 0 ? "▲" : "▼") : "↕"}</span>
+                    {/* Laid out rather than run together. As plain text the
+                        label, its editable asterisk and the sort glyph shared
+                        one wrapping flow, so in a narrow column the arrow and
+                        the star broke onto whichever line the words left them —
+                        "Actual output*" being the worst of them. The label keeps
+                        its own star; the glyph sits outside the wrap. */}
+                    <span style={{ display: "flex", alignItems: "baseline", gap: 3,
+                                   justifyContent: c.center ? "center"
+                                     : numericCol(c) ? "flex-end" : "flex-start" }}>
+                      <span style={{ minWidth: 0 }}>
+                        {c.label}
+                        {c.edit && <span aria-hidden="true" style={{ color: T.bad, marginLeft: 2, fontWeight: 800 }}>*</span>}
+                      </span>
+                      <span style={{ fontFamily: MONO, color: T.inkFaint, flex: "none" }}>
+                        {sort.key === c.k ? (sort.dir > 0 ? "▲" : "▼") : "↕"}
+                      </span>
+                    </span>
                   </th>
                 ))}
                 <th style={{ ...th, cursor: "default", textAlign: "center", padding: "7px 4px", ...saveColWidth }}>Save</th>
@@ -1990,7 +2012,7 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                        history this would be. */
                     if (c.targetAgg) return (
                       <td key={c.k} style={{ ...base, ...wStyle, fontFamily: MONO, fontSize: 11.5,
-                                             textAlign: c.targetAgg === "qty" ? "right" : "left",
+                                             textAlign: c.center ? "center" : c.targetAgg === "qty" ? "right" : "left",
                                              whiteSpace: "nowrap", color: T.inkSoft }}
                           title={r.targetsUnavailable
                             ? "Targets could not be loaded, so this total is unknown."
@@ -2028,7 +2050,8 @@ function LedgerTable({ rows, sort, onSort, onExport, onEdit, onSaveRow, onSaveAl
                           style={{ ...base, ...wStyle, padding: "3px 5px", background: "#FBFCFA",
                                    cursor: readOnly || (targetReadOnly && c.targetField) ? "default" : c.edit === "status" ? "pointer" : "text" }}
                           title={readOnly || (targetReadOnly && c.targetField) ? readOnlyReason : undefined}>
-                        <EditCell value={v} type={c.edit} wrap={c.wrap} onChange={(nv) => onEdit(r.id, c.k, nv)}
+                        <EditCell value={v} type={c.edit} wrap={c.wrap} align={c.center ? "center" : undefined}
+                                  onChange={(nv) => onEdit(r.id, c.k, nv)}
                                   disabled={readOnly || (targetReadOnly && c.targetField)}
                         />
                       </td>
@@ -2493,17 +2516,23 @@ function PasswordChangePanel({ onDone }) {
    parity; everything below it is work delivered but not yet invoiced, which is
    collectible the moment a billing goes out. Above the line is billing that has
    run ahead of accomplishment. */
-/* The plot area is deliberately SQUARE. Both axes run 0-100, so parity is only
-   a 45-degree line when a point of accomplishment occupies the same width as a
-   point of billing. The chart used to be 500x248, which drew that line at about
-   26 degrees and made a project ten points below it look nothing like a project
-   ten points right of it — the same fact, read two different ways. */
-const SWA_PLOT = 340;
+/* The plot fills the panel's width rather than sitting as a square in the
+   middle of it, so the aspect is wide and the parity line is not at 45 degrees.
+   That costs something real: distance from the line no longer reads the same
+   vertically as horizontally, so the eye cannot judge "how far from parity" by
+   angle alone.
+   The shaded +/-5pt band is what pays for it. Membership of the three
+   categories is read from whether a bubble sits inside that band, which stays
+   exactly correct at any aspect because the band is drawn from the same data
+   coordinates the bubbles are. The angle became decoration; the band is the
+   thing to read. */
+const SWA_W = 890;
+const SWA_H = 330;
 const PAD = { l: 54, r: 18, t: 18, b: 50 };
-const W = PAD.l + SWA_PLOT + PAD.r;
-const H = PAD.t + SWA_PLOT + PAD.b;
-const swaX = (v) => PAD.l + (v / 100) * SWA_PLOT;
-const swaY = (v) => H - PAD.b - (v / 100) * SWA_PLOT;
+const W = PAD.l + SWA_W + PAD.r;
+const H = PAD.t + SWA_H + PAD.b;
+const swaX = (v) => PAD.l + (v / 100) * SWA_W;
+const swaY = (v) => H - PAD.b - (v / 100) * SWA_H;
 
 /* The tolerance band that decides the three colours, drawn rather than left to
    be inferred: everything inside it is "within 5pt of parity". Clipped to the
@@ -2523,7 +2552,7 @@ function SwaScatter({ marks, plotted, maxWidth }) {
        aria-label={`Accomplishment against billing for ${plotted} projects`}
        style={{ width: "100%", maxWidth, height: "auto", display: "block", margin: "0 auto" }}>
     {/* plot ground, so the bubbles sit on a surface rather than on the panel */}
-    <rect x={PAD.l} y={PAD.t} width={SWA_PLOT} height={SWA_PLOT}
+    <rect x={PAD.l} y={PAD.t} width={SWA_W} height={SWA_H}
           fill={T.paper2} stroke={T.ruleSoft} />
 
     {/* the +/-5pt tolerance band, drawn so the colour rule is visible */}
@@ -2578,11 +2607,11 @@ function SwaScatter({ marks, plotted, maxWidth }) {
     <line x1={PAD.l} x2={W - PAD.r} y1={H - PAD.b} y2={H - PAD.b} stroke={T.rule} />
     <line x1={PAD.l} x2={PAD.l} y1={PAD.t} y2={H - PAD.b} stroke={T.rule} />
 
-    <text x={PAD.l + SWA_PLOT / 2} y={H - 8} textAnchor="middle"
+    <text x={PAD.l + SWA_W / 2} y={H - 8} textAnchor="middle"
           style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
       SWA % — PHYSICAL ACCOMPLISHMENT
     </text>
-    <text transform={`translate(13,${PAD.t + SWA_PLOT / 2}) rotate(-90)`} textAnchor="middle"
+    <text transform={`translate(13,${PAD.t + SWA_H / 2}) rotate(-90)`} textAnchor="middle"
           style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
       BILLED %
     </text>
@@ -2629,9 +2658,11 @@ const SWA_MARK_BLEED = 14;
    plot edge flush with the frame edge, which pins an extreme project against
    the side of the window: visible, but awkward to hover and impossible to bring
    into clear space. Maps overscroll for the same reason. */
-const SWA_OVERSCROLL = SWA_PLOT * 0.25;
+const SWA_OVERSCROLL_X = SWA_W * 0.25;
+const SWA_OVERSCROLL_Y = SWA_H * 0.25;
 /* plot-space coordinate -> overview coordinate */
-const miniAt = (v) => ((v - PAD.l) / SWA_PLOT) * SWA_MINI;
+const miniX = (v) => ((v - PAD.l) / SWA_W) * SWA_MINI;
+const miniY = (v) => ((v - PAD.t) / SWA_H) * (SWA_MINI * SWA_H / SWA_W);
 const SWA_TICKS = (k) => {
   /* finer gradations as the view narrows, so the axis keeps saying something */
   const step = k >= 8 ? 2 : k >= 3 ? 5 : 10;
@@ -2649,10 +2680,10 @@ function SwaScatterMap({ marks, plotted }) {
   /* Keeps the plot covering its frame: you can never pan the chart off screen
      and be left looking at nothing. */
   const clamp = useCallback((next, scale) => {
-    const lo = { x: (PAD.l + SWA_PLOT) * (1 - scale) - SWA_OVERSCROLL,
-                 y: (PAD.t + SWA_PLOT) * (1 - scale) - SWA_OVERSCROLL };
-    const hi = { x: PAD.l * (1 - scale) + SWA_OVERSCROLL,
-                 y: PAD.t * (1 - scale) + SWA_OVERSCROLL };
+    const lo = { x: (PAD.l + SWA_W) * (1 - scale) - SWA_OVERSCROLL_X,
+                 y: (PAD.t + SWA_H) * (1 - scale) - SWA_OVERSCROLL_Y };
+    const hi = { x: PAD.l * (1 - scale) + SWA_OVERSCROLL_X,
+                 y: PAD.t * (1 - scale) + SWA_OVERSCROLL_Y };
     return { x: Math.min(hi.x, Math.max(lo.x, next.x)), y: Math.min(hi.y, Math.max(lo.y, next.y)) };
   }, []);
 
@@ -2706,7 +2737,7 @@ function SwaScatterMap({ marks, plotted }) {
   };
 
   const reset = () => { setK(1); setPan({ x: 0, y: 0 }); };
-  const centre = { x: PAD.l + SWA_PLOT / 2, y: PAD.t + SWA_PLOT / 2 };
+  const centre = { x: PAD.l + SWA_W / 2, y: PAD.t + SWA_H / 2 };
 
   /* frame position of a data value, after the current pan and zoom */
   const fx = (v) => swaX(v) * k + pan.x;
@@ -2728,18 +2759,18 @@ function SwaScatterMap({ marks, plotted }) {
      viewport rectangle over them is redrawn as you pan. Rendered only while
      zoomed, because at 1x it would only repeat the chart beside it. */
   const miniDots = useMemo(() => marks.map((m) => (
-    <circle key={m.id} cx={miniAt(m.cx)} cy={miniAt(m.cy)} r={1.1} fill={m.tone} fillOpacity={0.75} />
+    <circle key={m.id} cx={miniX(m.cx)} cy={miniY(m.cy)} r={1.1} fill={m.tone} fillOpacity={0.75} />
   )), [marks]);
 
   const seen = {
-    x: miniAt((PAD.l - pan.x) / k), y: miniAt((PAD.t - pan.y) / k),
-    w: (SWA_PLOT / k) / SWA_PLOT * SWA_MINI, h: (SWA_PLOT / k) / SWA_PLOT * SWA_MINI,
+    x: miniX((PAD.l - pan.x) / k), y: miniY((PAD.t - pan.y) / k),
+    w: SWA_MINI / k, h: (SWA_MINI * SWA_H / SWA_W) / k,
   };
   const jumpTo = (event) => {
     const box = event.currentTarget.getBoundingClientRect();
-    const bx = PAD.l + ((event.clientX - box.left) / box.width) * SWA_PLOT;
-    const by = PAD.t + ((event.clientY - box.top) / box.height) * SWA_PLOT;
-    setPan(clamp({ x: (PAD.l + SWA_PLOT / 2) - bx * k, y: (PAD.t + SWA_PLOT / 2) - by * k }, k));
+    const bx = PAD.l + ((event.clientX - box.left) / box.width) * SWA_W;
+    const by = PAD.t + ((event.clientY - box.top) / box.height) * SWA_H;
+    setPan(clamp({ x: (PAD.l + SWA_W / 2) - bx * k, y: (PAD.t + SWA_H / 2) - by * k }, k));
   };
 
   return (
@@ -2768,15 +2799,15 @@ function SwaScatterMap({ marks, plotted }) {
            style={{ width: "100%", height: "100%", display: "block", touchAction: "none" }}>
         <defs>
           <clipPath id="swa-plot-clip">
-            <rect x={PAD.l} y={PAD.t} width={SWA_PLOT} height={SWA_PLOT} />
+            <rect x={PAD.l} y={PAD.t} width={SWA_W} height={SWA_H} />
           </clipPath>
           <clipPath id="swa-mark-clip">
             <rect x={PAD.l - SWA_MARK_BLEED} y={PAD.t - SWA_MARK_BLEED}
-                  width={SWA_PLOT + SWA_MARK_BLEED * 2} height={SWA_PLOT + SWA_MARK_BLEED * 2} />
+                  width={SWA_W + SWA_MARK_BLEED * 2} height={SWA_H + SWA_MARK_BLEED * 2} />
           </clipPath>
         </defs>
 
-        <rect x={PAD.l} y={PAD.t} width={SWA_PLOT} height={SWA_PLOT} fill={T.paper2} stroke={T.ruleSoft} />
+        <rect x={PAD.l} y={PAD.t} width={SWA_W} height={SWA_H} fill={T.paper2} stroke={T.ruleSoft} />
 
         <g clipPath="url(#swa-plot-clip)">
           <g transform={`translate(${pan.x} ${pan.y}) scale(${k})`}>
@@ -2817,11 +2848,11 @@ function SwaScatterMap({ marks, plotted }) {
             only appear while their gradation is actually on screen. */}
         {ticks.map((g) => (
           <g key={g}>
-            {within(fy(g), PAD.t, PAD.t + SWA_PLOT) && (
+            {within(fy(g), PAD.t, PAD.t + SWA_H) && (
               <text x={PAD.l - 9} y={fy(g) + 3.5} textAnchor="end"
                     style={{ fontFamily: MONO, fontSize: 10.5, fontWeight: 500, fill: T.inkSoft }}>{g}%</text>
             )}
-            {within(fx(g), PAD.l, PAD.l + SWA_PLOT) && (
+            {within(fx(g), PAD.l, PAD.l + SWA_W) && (
               <text x={fx(g)} y={H - PAD.b + 17} textAnchor="middle"
                     style={{ fontFamily: MONO, fontSize: 10.5, fontWeight: 500, fill: T.inkSoft }}>{g}%</text>
             )}
@@ -2830,11 +2861,11 @@ function SwaScatterMap({ marks, plotted }) {
 
         <line x1={PAD.l} x2={W - PAD.r} y1={H - PAD.b} y2={H - PAD.b} stroke={T.rule} />
         <line x1={PAD.l} x2={PAD.l} y1={PAD.t} y2={H - PAD.b} stroke={T.rule} />
-        <text x={PAD.l + SWA_PLOT / 2} y={H - 8} textAnchor="middle"
+        <text x={PAD.l + SWA_W / 2} y={H - 8} textAnchor="middle"
               style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
           SWA % — PHYSICAL ACCOMPLISHMENT
         </text>
-        <text transform={`translate(13,${PAD.t + SWA_PLOT / 2}) rotate(-90)`} textAnchor="middle"
+        <text transform={`translate(13,${PAD.t + SWA_H / 2}) rotate(-90)`} textAnchor="middle"
               style={{ fontFamily: DISPLAY, fontSize: 10, fontWeight: 700, fill: T.ink, letterSpacing: ".08em" }}>
           BILLED %
         </text>
@@ -2953,7 +2984,7 @@ const SwaMonitor = memo(function SwaMonitor({ rows }) {
 
           {mode === "scatter" ? (
             <>
-              <SwaScatter marks={marks} plotted={plotted} maxWidth={560} />
+              <SwaScatter marks={marks} plotted={plotted} maxWidth="100%" />
               <SwaScatterLegend />
 
               {zoomed && (
