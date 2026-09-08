@@ -34,7 +34,12 @@ const dtrPdfOverflows = (rows, paperSize) => {
   return bodyH > paper.height - 259;
 };
 const SCHED_DEF = { amStart: "08:00", amEnd: "12:00", pmStart: "13:00", pmEnd: "17:00" };
-const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF };
+const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF, logbookDept: "POD Office" };
+const LOGBOOK_TITLE = "STAFF DAILY TIME RECORD'S LOGBOOK";
+/* The logbook runs Monday to Sunday, as the printed form does. The inclusive
+   date it prints covers Monday to Saturday — the working week — while the
+   Sunday column stays on the sheet for the days someone did work one. */
+const LOGBOOK_DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
 
 /* ============================ helpers ============================ */
 const p2 = (n) => String(n).padStart(2, "0");
@@ -684,6 +689,19 @@ function periodOf(d) {
 const prevPeriod = (p) => { const d = new Date(p.s); d.setDate(d.getDate() - 1); return periodOf(d); };
 const periodLabel = (p) => `${MON[p.s.getMonth()]} ${p.s.getDate()} - ${MON[p.e.getMonth()]} ${p.e.getDate()}, ${p.e.getFullYear()}`;
 function periodDays(p) { const out = []; const d = new Date(p.s); while (d <= p.e) { out.push(new Date(d)); d.setDate(d.getDate() + 1); } return out; }
+const mondayOf = (d) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const wd = (x.getDay() + 6) % 7; x.setDate(x.getDate() - wd); return x; };
+const addDays = (d, n) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate() + n); return x; };
+const weekDates = (monday) => Array.from({ length: 7 }, (_, i) => addDays(monday, i));
+/* Monday to Saturday: the span the form's INCLUSIVE DATE line describes */
+const shortDate = (d) => `${d.getMonth() + 1}/${d.getDate()}/${String(d.getFullYear()).slice(-2)}`;
+const inclusiveLabel = (monday) => {
+  const a = monday, b = addDays(monday, 5);
+  const same = a.getMonth() === b.getMonth();
+  return same
+    ? `${MON[a.getMonth()]} ${a.getDate()}\u2013${b.getDate()}, ${b.getFullYear()}`
+    : `${MON[a.getMonth()]} ${a.getDate()} \u2013 ${MON[b.getMonth()]} ${b.getDate()}, ${b.getFullYear()}`;
+};
+
 const logKey = (id, y) => `dtr:log:${id}:${y}`;
 
 /* storage — DTR data stays in its own table and never shares Project Ledger rows */
@@ -732,8 +750,17 @@ async function sGet(key, fb) {
   if (pendingKeys().includes(key)) return lsGet(key, fb);
   if (cloudReady()) {
     try {
-      const { data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload").eq("storage_key", key).maybeSingle();
-      if (!error && data) { lsSet(key, data.payload); return data.payload; }
+      let { data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload, revision").eq("storage_key", key).maybeSingle();
+      /* before the safety migration there is no revision column */
+      if (error && /revision/i.test(error.message || "")) {
+        ({ data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload").eq("storage_key", key).maybeSingle());
+      }
+      if (!error && data) {
+        logRevisions.set(key, Number(data.revision ?? 0));
+        lsSet(key, data.payload);
+        return data.payload;
+      }
+      if (!error) logRevisions.set(key, 0); /* row absent: a first write creates it */
       if (!error) {
         /* nothing stored yet: seed the cloud from whatever this device already has */
         const local = lsGet(key, fb);
@@ -745,12 +772,48 @@ async function sGet(key, fb) {
   return lsGet(key, fb);
 }
 
+/* Revisions of the year rows this device has read, so a save can say which copy it
+   was built from. A row that has moved on since rejects the write instead of taking
+   it — see docs/data-safety.md. Missing simply means "not read yet". */
+const logRevisions = new Map();
+
+/* True when the safety migration has not been applied to this project yet. The app
+   must keep working in that case, so the caller falls back to the plain upsert. */
+const rpcMissing = (error) =>
+  !!error && (error.code === "PGRST202" || error.code === "42883" ||
+              /function .*dtr_save_year.* does not exist/i.test(error.message || ""));
+
+/* Writes a year only if nobody has changed it since this copy was read. Returns
+   "synced" | "local" | "fail" | "conflict". */
+async function cloudPutLog(key, val) {
+  const expected = logRevisions.has(key) ? logRevisions.get(key) : null;
+  if (expected === null) return "fail"; /* never write a year this device has not read */
+  const { data, error } = await supabase.rpc("dtr_save_year", {
+    p_key: key, p_payload: val, p_expected_revision: expected,
+  });
+  if (error) {
+    if (rpcMissing(error)) return (await cloudPut(key, val)) ? "synced" : "fail";
+    lastCloudError = error.message || "";
+    console.error("DTR cloud sync failed", { key, message: error.message, code: error.code });
+    return "fail";
+  }
+  if (data && data.ok) { logRevisions.set(key, Number(data.revision)); return "synced"; }
+  if (data && data.conflict) { logRevisions.set(key, Number(data.revision)); return "conflict"; }
+  return "fail";
+}
+
 /* "synced" = in the cloud, "local" = safe on this device but not sent yet, "fail" = nowhere */
-async function sSet(key, val) {
+async function sSet(key, val, opts) {
   const savedLocally = lsSet(key, val);
   if (cloudReady()) {
     try {
-      if (await cloudPut(key, val)) { markPending(key, false); return "synced"; }
+      if (opts && opts.revisionChecked) {
+        const state = await cloudPutLog(key, val);
+        if (state === "synced") { markPending(key, false); return "synced"; }
+        /* A conflict is not an outage: the row moved on, so the caller must re-read
+           and re-apply rather than queue this copy for a later blind retry. */
+        if (state === "conflict") return "conflict";
+      } else if (await cloudPut(key, val)) { markPending(key, false); return "synced"; }
     } catch { /* keep the device copy and retry later */ }
   }
   if (!savedLocally) return "fail";
@@ -865,7 +928,7 @@ function mergeDtrProfiles(roster, profiles) {
   profiles.forEach((profile) => {
     const id = String(profile?.employee_id || "").trim();
     if (!id || seen.has(id)) return;
-    merged.push({ id, name: profile.name || "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: profile.role === "admin" ? "admin" : "viewer" });
+    merged.push({ id, name: profile.name || "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, signatureOnLogbook: false, sundayPeriods: [], role: profile.role === "admin" ? "admin" : "viewer" });
   });
   return merged;
 }
@@ -1109,6 +1172,7 @@ const CSS = `
 .qm .logoPrev img{max-width:100%;max-height:100%;object-fit:contain}
 .qm .logoPrev .none{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--zinc-dk);text-align:center;padding:6px}
 .qm .signatureList{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:12px}
+.qm .signatureToggleWrap{margin-top:18px;border-top:1px solid var(--rule-soft);padding-top:14px}
 .qm .signatureCard{border:1.5px solid var(--zinc-dk);padding:12px;background:#fff}
 .qm .signatureCard h4{font-family:var(--disp);font-size:18px;text-transform:uppercase;margin:0 0 2px}
 .qm .signatureCard p{font-size:11px;color:var(--ink-soft);margin:0 0 9px}
@@ -1185,7 +1249,6 @@ const CSS = `
 .qm .dtrAttachmentTrigger{position:absolute;right:2px;top:2px;width:18px;height:18px;display:grid;place-items:center;border:1px solid var(--rule);background:#fff;color:var(--ink);font-family:var(--mono);font-size:15px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s ease}
 .qm .dtrDateCell:hover .dtrAttachmentTrigger,.qm .dtrAttachmentTrigger:focus{opacity:1}
 .qm .dtrAttachmentTrigger.has{opacity:1;color:var(--rust);border-color:var(--rust);font-size:9px;font-weight:bold}
-.qm .dtrAttachmentPrint{display:none}
 .qm .wheelPicker{outline:none}
 /* the field gets the full width of the box so the whole value, AM/PM included, stays visible */
 .qm .manualTimeLabel{display:grid;grid-template-columns:1fr;gap:6px;font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft)}
@@ -1302,7 +1365,6 @@ const SHEET_CSS = `
 .sheet .dtr input,.sheet .dtr .cell{width:100%;height:100%;min-height:6.4mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7.2pt;text-align:center;padding:0;color:#000}
 .sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none;white-space:pre-wrap;overflow-wrap:normal;word-break:normal}
 .sheet .dtr input:focus,.sheet .dtr .cell:focus{background:#FFF3D0;outline:none}
-.sheet .dtrAttachmentPrint{display:none}
 .sheet .sig{margin-top:13mm}
 .sheet .sig td{font-size:8pt;text-align:center;font-weight:bold;letter-spacing:0.3pt;padding-top:1.2mm}
 .sheet .sig td.ln{border-top:0.9pt solid #000;position:relative;overflow:visible;isolation:isolate}
@@ -1310,20 +1372,87 @@ const SHEET_CSS = `
 .sheet .sig td.ln .siglabel{position:relative;z-index:1}
 .sheet .sig td.ln .sigimg{position:absolute;left:calc(50% + var(--sig-x, 0mm));bottom:calc(1mm + var(--sig-y, 0mm));z-index:10;transform:translateX(-50%) scale(var(--sig-scale, 1));transform-origin:center bottom;max-width:42mm;max-height:13mm;object-fit:contain;pointer-events:none}
 .sheet .sig td.sp{border:none;width:7mm}
+/* ---- the staff logbook: same paper, laid out landscape ----
+   Column widths follow the scan: identity block on the left, seven day pairs
+   across, then the two totals and the signature box. */
+.sheet.logbook{width:var(--paper-width);min-height:var(--paper-height);padding:9mm}
+.sheet.logbook .flds .fk{width:34mm;white-space:nowrap}
+.sheet.logbook .hdr .co{font-size:13pt}
+.sheet .lg{border-collapse:collapse;table-layout:fixed;width:100%;margin-top:1mm}
+.sheet .lg th,.sheet .lg td{border:0.9pt solid #000;text-align:center;vertical-align:middle;padding:0}
+.sheet .lg th{font-size:6.4pt;font-weight:bold;letter-spacing:0.2pt;line-height:1.15;padding:1mm 0.4mm;white-space:nowrap}
+.sheet .lg th .dsub{display:block;font-weight:normal;font-size:5.8pt;letter-spacing:0;padding-top:0.4mm;white-space:nowrap}
+.sheet .lg td{height:6.4mm;font-size:7pt;white-space:nowrap}
+/* 279mm of printable A4 landscape, spent so no column has to wrap */
+.sheet .lg .cno{width:7mm}
+.sheet .lg .cid{width:16mm;font-size:7.2pt}
+.sheet .lg .cnm{width:42mm;text-align:left;padding:0 1.4mm;font-size:7.2pt;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sheet .lg .cpd{width:7mm;font-size:6.2pt;font-weight:bold}
+.sheet .lg .ctot{width:15mm;font-weight:bold;white-space:normal}
+.sheet .lg .csig{width:30mm;position:relative;white-space:normal}
+.sheet .lg .csig .lgsig{max-width:24mm;max-height:12mm;object-fit:contain;display:block;margin:0 auto}
+.sheet .lg tr.bandtop td{border-top:1.4pt solid #000}
+/* alternate employee blocks are banded, as on the printed form. Chromium drops
+   background colour when printing unless told otherwise, so the band would appear
+   on screen and vanish on paper without print-color-adjust. */
+.sheet .lg tr.shade td{background:#e3e2ea}
+.sheet.logbook{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.sheet .lg tr.shade td input{background:transparent}
+.sheet .lg .lgempty{height:12mm;font-size:8pt;letter-spacing:0.4pt}
+.sheet .lg input{width:100%;height:100%;min-height:5.6mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7pt;text-align:center;padding:0;color:#000}
+.sheet .lg input:focus{background:#FFF3D0;outline:none}
+/* how the time got there: stamped by the clock, typed in, or changed later */
+.sheet .lg td.manual input{font-style:italic}
+.sheet .lg td.edited input{font-style:italic}
+.sheet .lg td.edited::after{content:"";position:absolute;right:0.6mm;top:0.6mm;width:1mm;height:1mm;border-radius:50%;background:#12233A}
+.sheet .lg td.edited{position:relative}
+
+/* pinned to the bottom of the sheet box; the printed rules reserve a strip below
+   the signatures so a sheet that runs past one page cannot collide with it */
 .sheet .controlNo{position:absolute;right:5mm;bottom:4.2mm;font-size:7pt;line-height:1;font-weight:normal;white-space:nowrap}
+`;
+
+/* What a printed sheet is, as opposed to the editable one on screen. Applied to
+   two scopes so they cannot disagree: the sanitised clone doPrint()/doDownload()
+   emit, and the live page under @media print. Attachments never appear on the
+   sheet — they are their own export, printed only when the user asks.
+
+   The popup gets no .qm ancestor, so it misses the app's border-box reset and
+   would otherwise lay out from different metrics than the sheet on screen.
+   padding-bottom keeps flow content clear of the absolutely positioned control
+   number: without it a sheet spilling onto a second page ends with the signature
+   table exactly where the control number is pinned, and they print on top of
+   each other. The 9mm page margin lives here rather than on @page because the
+   browser draws its own header and footer — date, document title, page URL —
+   inside the @page margin strip, and a zero margin leaves it nowhere to put
+   them; the sheet's padding reproduces the margin on paper. buildDtrPdf draws that number at a fixed page coordinate and never
+   collides, which is the alignment this restores for browser print. */
+const printedSheetRules = (scope) => `
+${scope} *{box-sizing:border-box}
+${scope}{width:var(--paper-width);min-height:var(--paper-height)!important;padding:9mm;margin:0 auto}
+${scope} .controlNo{bottom:4.2mm}
+${scope} .dtrAttachmentTrigger{display:none!important}
+${scope} .dtr td.actc{padding:0 4pt}
+${scope} .dtr td.actc,${scope} .dtr td.actc .cell{font-size:7.2pt;line-height:1}
+${scope} .dtr input:focus,${scope} .dtr .cell:focus{background:transparent}
+${scope} .sig{break-inside:avoid}
 `;
 
 const PRINT_CSS = `
 @media print{
-  @page{size:Legal portrait;margin:9mm}
+  @page{size:Legal portrait;margin:0}
   .qm{background:#fff;padding:0}
   .noprint{display:none!important}
   .sheetwrap{background:none;padding:0;overflow:visible}
   .shadow{box-shadow:none}
-  .sheet{width:auto;padding:0;min-height:calc(var(--paper-height) - 18mm)!important}
-  .sheet .dtrAttachmentPrint{display:block;font-size:6.5pt;line-height:1.2;margin-top:1mm;color:#263746}
+${printedSheetRules("  .sheet")}
 }
 `;
+
+/* The same contract for the sanitised clone that doPrint() shows and doDownload()
+   saves. Deliberately not inside @media print: the popup preview has to show the
+   very page the printer emits, and the one buildDtrPdf() draws. */
+const PRINT_DOC_CSS = printedSheetRules(".sheet.printdoc");
 
 const htmlEscape = (value) => String(value == null ? "" : value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -1498,6 +1627,7 @@ export default function DTRSystem({ onBack }) {
   const [lockMsg, setLockMsg] = useState("");
   const [note, setNote] = useState("");
   const [punchDate, setPunchDate] = useState(iso(new Date()));
+  const [weekStart, setWeekStart] = useState(() => iso(mondayOf(new Date())));
   const [printHref, setPrintHref] = useState("");
   const [pdfWarning, setPdfWarning] = useState("");
   const [paperSize, setPaperSize] = useState(() => {
@@ -1536,6 +1666,15 @@ export default function DTRSystem({ onBack }) {
 
   const logsRef = useRef({});
   const sheetRef = useRef(null);
+  const logbookRef = useRef(null);
+  /* The logbook is the department's shared sheet: anyone signed in may enter
+     times in it, a view-only visitor included, while its header stays admin-only.
+     writeRec still refuses every other write for those visitors. */
+  const allowViewOnlyWrite = useRef(false);
+  /* Which year logs have actually been read back from storage. Kept apart from
+     logsRef because "we have a cache entry" and "we have read what is stored"
+     are different claims, and treating them as one cost a year of records. */
+  const loadedYears = useRef(new Set());
   const pinRef = useRef(null);
   const timers = useRef({});
   const firstRun = useRef(true);
@@ -1604,8 +1743,8 @@ export default function DTRSystem({ onBack }) {
         try { return window.sessionStorage.getItem(DTR_SESSION_EMPLOYEE) || ""; } catch { return ""; }
       })();
       const savedEmployee = bootRoster.find((e) => e.id && e.id === savedEmployeeId);
-      const validSavedView = ["punch", "dtr", "settings"].includes(savedView);
-      setRoster(bootRoster.length ? bootRoster : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: "admin" }]);
+      const validSavedView = ["punch", "dtr", "logbook", "settings"].includes(savedView);
+      setRoster(bootRoster.length ? bootRoster : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, signatureOnLogbook: false, sundayPeriods: [], role: "admin" }]);
       setCfg(Object.assign({}, DEF, c || {}));
       if (savedEmployee && validSavedView) {
         setMe(savedEmployee);
@@ -1649,10 +1788,12 @@ export default function DTRSystem({ onBack }) {
     clearTimeout(timers.current.roster);
     timers.current.roster = setTimeout(async () => {
         const keep = roster
-        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", signature: e.signature || "", signatureEnabled: e.signatureEnabled === true, signatureX: Number(e.signatureX) || 0, signatureY: Number(e.signatureY) || 0, signatureScale: Number(e.signatureScale) || 1, role: e.role === "admin" ? "admin" : "viewer",
+        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", signature: e.signature || "", signatureEnabled: e.signatureEnabled === true, signatureOnLogbook: e.signatureOnLogbook === true, signatureX: Number(e.signatureX) || 0, signatureY: Number(e.signatureY) || 0, signatureScale: Number(e.signatureScale) || 1, role: e.role === "admin" ? "admin" : "viewer",
            /* carried through explicitly: dropping these on an unrelated roster edit would
               silently unlock every account that had a passcode */
-           pinHash: e.pinHash || "", pinSalt: e.pinSalt || "", pinIter: Number(e.pinIter) || 0 }))
+           pinHash: e.pinHash || "", pinSalt: e.pinSalt || "", pinIter: Number(e.pinIter) || 0,
+           /* same hazard: losing this would quietly hide Sundays somebody had already filled in */
+           sundayPeriods: Array.isArray(e.sundayPeriods) ? e.sundayPeriods.map(String) : [] }))
         .filter((e) => e.id || e.name);
       const ids = keep.map((e) => e.id).filter(Boolean);
       if (new Set(ids).size !== ids.length) { say("Two employees share the same ID"); return; }
@@ -1681,13 +1822,14 @@ export default function DTRSystem({ onBack }) {
      effects that depend on it do not re-run every time the header config changes */
   const ensureLog = useCallback(async (id, y, workSched) => {
     const k = logKey(id, y);
-    if (!logsRef.current[k]) {
+    if (!loadedYears.current.has(k)) {
       const log = await sGet(k, {});
       /* re-stamp the whole year on load: this is what quietly brings stored totals back in
          line after an admin edits the work schedule, with no bulk migration */
       let changed = false;
       Object.keys(log).forEach((ds) => { if (stampTotals(log[ds], workSched || SCHED_DEF)) changed = true; });
       logsRef.current[k] = log;
+      loadedYears.current.add(k);
       bump();
       /* no banner for this one: it is a recalculation, not something the user typed. If it
          cannot reach the cloud it waits in the device copy and the reconnect flush sends it. */
@@ -1699,17 +1841,52 @@ export default function DTRSystem({ onBack }) {
     const k = logKey(id, +dateStr.slice(0, 4));
     return (logsRef.current[k] || {})[dateStr] || {};
   };
-  const writeRec = async (id, dateStr, mut) => {
+  const writeRec = async (id, dateStr, mut, source = "manual") => {
     /* every punch, edit, note and leave mark funnels through here, so read-only is
        enforced once rather than at each of the dozen places that can start a write */
-    if (viewOnly) return false;
+    if (viewOnly && !allowViewOnlyWrite.current) return false;
     const y = +dateStr.slice(0, 4), k = logKey(id, y);
+    /* Read the year back before touching it. A write that ran first used to
+       create the year as {}, which both satisfied the load check and got upserted
+       over the stored year — that is how a logbook edit wiped somebody's year.
+       sSet writes the whole year at once, so writing an unread one destroys it. */
+    if (!loadedYears.current.has(k)) await ensureLog(id, y, sched);
     logsRef.current[k] = logsRef.current[k] || {};
     logsRef.current[k][dateStr] = logsRef.current[k][dateStr] || {};
-    mut(logsRef.current[k][dateStr]);
+    const day = logsRef.current[k][dateStr];
+    /* how a time got there is worth keeping: the logbook has to say whether a
+       punch was stamped by the clock or typed in afterwards. Diffing here beats
+       asking all eight callers to remember to say so. */
+    const before = SLOTS.map((sl) => day[sl.k] || "");
+    mut(day);
+    SLOTS.forEach((sl, i) => {
+      const now = day[sl.k] || "";
+      if (now === before[i]) return;
+      if (!now) { if (day.src) delete day.src[sl.k]; return; }
+      day.src = day.src || {};
+      day.src[sl.k] = before[i] ? "edited" : source;
+    });
     stampTotals(logsRef.current[k][dateStr], sched);
     bump();
-    const state = await sSet(k, logsRef.current[k]);
+
+    let state = await sSet(k, logsRef.current[k], { revisionChecked: true });
+    /* Somebody else advanced the row while this edit was being made. Take their
+       copy, replay this edit onto it, and try again — never overwrite. */
+    for (let attempt = 0; state === "conflict" && attempt < 3; attempt++) {
+      loadedYears.current.delete(k);
+      delete logsRef.current[k];
+      await ensureLog(id, y, sched);
+      logsRef.current[k][dateStr] = logsRef.current[k][dateStr] || {};
+      mut(logsRef.current[k][dateStr]);
+      stampTotals(logsRef.current[k][dateStr], sched);
+      bump();
+      state = await sSet(k, logsRef.current[k], { revisionChecked: true });
+    }
+    if (state === "conflict") {
+      say("Someone else changed this record — reopen it and try again");
+      setSaveState("fail");
+      return false;
+    }
     setSaveState(state);
     setSyncError(state === "local" ? lastCloudError : "");
     return state !== "fail";
@@ -1797,7 +1974,7 @@ export default function DTRSystem({ onBack }) {
     const stamp = nowHM();
     const issue = orderIssue(rec, slot.k, stamp);
     if (issue) { say(issue); return; }
-    await writeRec(me.id, viewDate, (r) => { r[slot.k] = stamp; r.note = note; });
+    await writeRec(me.id, viewDate, (r) => { r[slot.k] = stamp; r.note = note; }, "punch");
     say(`${slot.label} recorded — ${disp(stamp, true)}`);
   }
   useEffect(() => {
@@ -1821,6 +1998,22 @@ export default function DTRSystem({ onBack }) {
 
   /* Settings is no longer admin-only: everyone reaches it to manage their own passcode,
      and the admin-only sections render or not on their own. */
+  /* Which payroll cut-offs this employee has opened Sunday on. Membership is the
+     whole mechanism: a cut-off is in the list or it is not, so ticking one says
+     nothing about the next. Empty by default — no Sundays. */
+  const sundayIncluded = (emp, periodStart) =>
+    Array.isArray(emp && emp.sundayPeriods) && emp.sundayPeriods.includes(periodStart);
+  const toggleSundayForPeriod = (on) => {
+    if (!me || viewOnly) return;
+    const apply = (e) => {
+      const held = Array.isArray(e.sundayPeriods) ? e.sundayPeriods.filter((x) => x !== perStart) : [];
+      return { ...e, sundayPeriods: on ? [...held, perStart] : held };
+    };
+    setRoster((p) => p.map((e) => (e.id === me.id ? apply(e) : e)));
+    setMe((m) => (m && m.id === me.id ? apply(m) : m));
+    setActor((a) => (a && a.id === me.id ? apply(a) : a));
+  };
+
   const savePinFor = (id, fields) => {
     setRoster((p) => p.map((e) => (e.id === id ? { ...e, ...fields } : e)));
     setMe((m) => (m && m.id === id ? { ...m, ...fields } : m));
@@ -1911,7 +2104,11 @@ export default function DTRSystem({ onBack }) {
     const r = recFor(me.id, iso(d));
     return !!r.leave || SLOTS.some((s) => r[s.k]) || !!(r.note && r.note.trim());
   };
-  const days = periodDays(period).filter((d) => d.getDay() !== 0 || workedOn(d));
+  /* A Sunday that was actually worked has always shown, and still does after the
+     toggle is switched off. The toggle only adds the empty ones, so they exist to
+     be typed into. */
+  const sundayOn = sundayIncluded(liveMe, perStart);
+  const days = periodDays(period).filter((d) => d.getDay() !== 0 || sundayOn || workedOn(d));
 
   useEffect(() => {
     if (!me || view !== "dtr") { setAttachments([]); return undefined; }
@@ -1935,12 +2132,78 @@ export default function DTRSystem({ onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, view, perStart]);
 
+  /* ---- staff logbook ----
+     The department's shared weekly sheet. Monday to Sunday because the printed
+     form has seven day columns, even though the inclusive date it carries
+     describes the Monday-to-Saturday working week. */
+  const logbookMonday = (() => { const a = weekStart.split("-").map(Number); return new Date(a[0], a[1] - 1, a[2]); })();
+  const logbookDays = weekDates(logbookMonday);
+  /* Everyone's week, not just the signed-in employee's: ensureLog is otherwise
+     only ever called for me.id, so every other row would read back empty. */
+  useEffect(() => {
+    if (view !== "logbook") return;
+    const years = [...new Set(logbookDays.map((d) => d.getFullYear()))];
+    roster.forEach((r) => { if (r.id) years.forEach((y) => ensureLog(r.id, y, sched)); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, weekStart, roster, sched]);
+
+  /* Order of the sheet: whoever stamped first that week is NO 1. Scan the week in
+     day order and take the earliest time on the first day that has one; nobody
+     with a stamp ever sorts below somebody without. */
+  const firstStampAt = (empId) => {
+    for (let i = 0; i < logbookDays.length; i++) {
+      const r = recFor(empId, iso(logbookDays[i]));
+      let best = null;
+      SLOTS.forEach((sl) => {
+        const v = r[sl.k];
+        if (!v) return;
+        const m = toMin(v);
+        if (best === null || m < best) best = m;
+      });
+      if (best !== null) return i * 1440 + best;
+    }
+    return Infinity;
+  };
+  const logbookStaff = roster
+    .filter((r) => r.id)
+    .map((emp, i) => ({ emp, i, at: firstStampAt(emp.id) }))
+    .sort((a, b) => (a.at - b.at) || (a.i - b.i))
+    .map((x) => x.emp);
+  /* the paper form holds six employees; past that it carries on to another page */
+  const LOGBOOK_PER_PAGE = 6;
+  const logbookPages = logbookStaff.length
+    ? Array.from({ length: Math.ceil(logbookStaff.length / LOGBOOK_PER_PAGE) },
+        (_, i) => logbookStaff.slice(i * LOGBOOK_PER_PAGE, (i + 1) * LOGBOOK_PER_PAGE))
+    : [[]];
+  const setLogTime = async (empId, dateStr, slotKey, raw, mer) => {
+    const t = raw.trim() ? parseTime(raw, mer, slotKey) : "";
+    if (t === null) { say("Could not read that time"); return false; }
+    await ensureLog(empId, +dateStr.slice(0, 4), sched);
+    /* Nothing typed, nothing to write. Blurring a cell that only looked empty
+       because its record had not loaded must never delete the stored time. */
+    if ((recFor(empId, dateStr)[slotKey] || "") === (t || "")) return true;
+    /* the logbook is the one sheet a view-only visitor may write to */
+    allowViewOnlyWrite.current = true;
+    try {
+      await writeRec(empId, dateStr, (r) => { if (t) r[slotKey] = t; else delete r[slotKey]; });
+    } finally { allowViewOnlyWrite.current = false; }
+    return true;
+  };
+
   /* ---- printing ---- */
-  function buildPrintable() {
-    const node = sheetRef.current;
+  /* The sheet on screen is an editable form; the sheet that prints is a document.
+     Cloning one into the other used to carry the screen's controls along — the
+     attachment "+" badge printed as a bare button, which the PDF never shows.
+     Everything interactive is stripped here so both outputs read the same. */
+  function buildPrintable(node = sheetRef.current) {
     if (!node) return null;
     const clone = node.cloneNode(true);
     clone.classList.remove("shadow");
+    clone.classList.add("printdoc");
+    /* the logbook prints as several sheets inside one wrapper */
+    clone.querySelectorAll(".sheet").forEach((sh) => { sh.classList.remove("shadow"); sh.classList.add("printdoc"); });
+    /* the "+" badge opens the attachment dialog — on paper it means nothing */
+    clone.querySelectorAll(".dtrAttachmentTrigger, .noprint, button").forEach((el) => el.remove());
     clone.querySelectorAll("input").forEach((i) => {
       const s = document.createElement("span");
       s.textContent = i.value;
@@ -1948,13 +2211,45 @@ export default function DTRSystem({ onBack }) {
       i.replaceWith(s);
     });
     clone.querySelectorAll(".cell").forEach((d) => d.removeAttribute("contenteditable"));
+    /* nothing on a printed page is clickable, focusable, or announced */
+    clone.querySelectorAll("[role], [tabindex], [aria-label], [title]").forEach((el) => {
+      el.removeAttribute("role");
+      el.removeAttribute("tabindex");
+      el.removeAttribute("aria-label");
+      el.removeAttribute("title");
+    });
     return clone;
   }
   const dtrFileName = () =>
     `DTR_${(me && me.name ? me.name : "employee").replace(/\s+/g, "_")}_${periodLabel(period).replace(/[^\w]+/g, "-")}.pdf`;
 
   const printPageStyles = () =>
-    SHEET_CSS + PRINT_CSS + `@page{size:${paper.css} portrait;margin:9mm} html,body{margin:0;padding:0;background:#fff} .sheet{box-sizing:border-box;width:190mm;margin:0 auto;padding:0;box-shadow:none}`;
+    SHEET_CSS + PRINT_CSS + PRINT_DOC_CSS + `@page{size:${paper.css} portrait;margin:0} html,body{margin:0;padding:0;background:#fff} .sheet{box-sizing:border-box;box-shadow:none}`;
+
+  /* The logbook is the same paper turned on its side. Its sheet already carries
+     --paper-width/--paper-height swapped, so the shared printed rules size it. */
+  const logbookPageStyles = () =>
+    SHEET_CSS + PRINT_CSS + PRINT_DOC_CSS + `@page{size:A4 landscape;margin:0} html,body{margin:0;padding:0;background:#fff} .sheet{box-sizing:border-box;box-shadow:none} .sheet + .sheet{break-before:page}`;
+
+  function printInPopup(node, styles, title) {
+    const clone = buildPrintable(node);
+    if (!clone) return;
+    let w = null;
+    try { w = window.open("", "_blank"); } catch (e) { w = null; }
+    if (w && w.document) {
+      const st = w.document.createElement("style");
+      st.textContent = styles;
+      w.document.head.appendChild(st);
+      w.document.title = title;
+      w.document.body.style.margin = "0";
+      w.document.body.appendChild(clone);
+      setTimeout(() => { try { w.focus(); w.print(); } catch (e) {} }, 400);
+      return;
+    }
+    try { window.print(); } catch (e) { say("Printing is blocked here — use Download copy"); }
+  }
+
+  const doPrintLogbook = () => printInPopup(logbookRef.current, logbookPageStyles(), LOGBOOK_TITLE);
 
   /* a real anchor with a prepared blob URL survives sandboxes that block scripted popups */
   useEffect(() => {
@@ -1968,10 +2263,6 @@ export default function DTRSystem({ onBack }) {
       let dSum = 0, oSum = 0;
       const rows = days.map((d) => {
         const r = recFor(me.id, iso(d));
-        const dateAttachments = attachmentsForDate(iso(d));
-        const attachmentNote = dateAttachments.length
-          ? `Attachments: ${dateAttachments.map((item) => `${item.attachment_type} — ${item.file_name}`).join(", ")}`
-          : "";
         const dm = dayMinutes(r, sched), om = otMinutes(r);
         dSum += dm; oSum += om;
         return {
@@ -1981,7 +2272,7 @@ export default function DTRSystem({ onBack }) {
           times: SLOTS.map((s) => (r[s.k] ? disp(r[s.k], true) : "")),
           day: dm ? fmtDay(dm, cap) : "",
           ot: om ? fmtDur(om) : "",
-          note: [r.note || "", attachmentNote].filter(Boolean).join("\n"),
+          note: r.note || "",
         };
       });
       if (dtrPdfOverflows(rows, paperSize)) {
@@ -2022,21 +2313,7 @@ export default function DTRSystem({ onBack }) {
   }
 
   function doPrint() {
-    const clone = buildPrintable();
-    if (!clone) return;
-    let w = null;
-    try { w = window.open("", "_blank"); } catch (e) { w = null; }
-    if (w && w.document) {
-      const st = w.document.createElement("style");
-      st.textContent = printPageStyles();
-      w.document.head.appendChild(st);
-      w.document.title = "Daily Time Record";
-      w.document.body.style.margin = "0";
-      w.document.body.appendChild(clone);
-      setTimeout(() => { try { w.focus(); w.print(); } catch (e) {} }, 400);
-      return;
-    }
-    try { window.print(); } catch (e) { say("Printing is blocked here — use Download copy"); }
+    printInPopup(sheetRef.current, printPageStyles(), "Daily Time Record");
   }
   function doDownload() {
     const html = printableDoc();
@@ -2115,7 +2392,7 @@ export default function DTRSystem({ onBack }) {
   /* ---- roster editing ---- */
   const setEmp = (i, field, val) =>
     setRoster((p) => p.map((e, j) => (j === i ? { ...e, [field]: field === "id" ? val.replace(/\s/g, "") : val } : e)));
-  const addEmp = () => setRoster((p) => [...p, { id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: "viewer" }]);
+  const addEmp = () => setRoster((p) => [...p, { id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, signatureOnLogbook: false, sundayPeriods: [], role: "viewer" }]);
   const adminsBesides = (i) => roster.filter((e, j) => j !== i && e.role === "admin" && (e.id || e.name)).length;
   const setRole = (i, val) => {
     if (val !== "admin" && adminsBesides(i) === 0) { say("Keep at least one admin, or nobody can open Settings"); return; }
@@ -2125,7 +2402,7 @@ export default function DTRSystem({ onBack }) {
     if (roster[i] && roster[i].role === "admin" && adminsBesides(i) === 0 && roster.length > 1) {
       say("Make someone else an admin before removing this one"); return;
     }
-    setRoster((p) => (p.length > 1 ? p.filter((_, j) => j !== i) : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, role: "admin" }]));
+    setRoster((p) => (p.length > 1 ? p.filter((_, j) => j !== i) : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, signatureOnLogbook: false, sundayPeriods: [], role: "admin" }]));
   };
 
   /* ============================ render ============================ */
@@ -2145,6 +2422,7 @@ export default function DTRSystem({ onBack }) {
             {onBack && <button className="out" onClick={onBack}>Back to Project Ledger</button>}
             {!viewOnly && <button className={view === "punch" || view === "lock" ? "on" : ""} onClick={() => setView(me ? "punch" : "lock")}>Punch</button>}
             {me && <button className={key("dtr")} onClick={() => setView("dtr")}>{viewOnly ? "Their DTR" : "My DTR"}</button>}
+            {me && <button className={key("logbook")} onClick={() => setView("logbook")}>Staff logbook</button>}
             {(isAdmin || (me && !viewOnly)) && <button className={key("settings")} onClick={() => setView("settings")}>Settings</button>}
             {viewOnly && actor && <button className="out" onClick={() => openEmp(actor, false)}>Close {me && me.name ? me.name.split(" ")[0] : "record"}</button>}
             {me && <button className="out" onClick={signOut}>Sign out</button>}
@@ -2396,7 +2674,7 @@ export default function DTRSystem({ onBack }) {
             </div>
 
             <div className="sheetwrap">
-              <div className="sheet shadow" ref={sheetRef} style={{ "--paper-height": `${(paper.height / 72) * 25.4}mm`, minHeight: `${(paper.height / 72) * 25.4}mm` }}>
+              <div className="sheet shadow" ref={sheetRef} style={{ "--paper-width": `${(paper.width / 72) * 25.4}mm`, "--paper-height": `${(paper.height / 72) * 25.4}mm`, minHeight: `${(paper.height / 72) * 25.4}mm` }}>
                 <table className="hdr">
                   <tbody>
                     <tr>
@@ -2509,7 +2787,6 @@ export default function DTRSystem({ onBack }) {
                                 writeRec(me.id, ds, (rr) => { rr.note = v; });
                               }}
                             >{r.note || ""}</div>
-                            {dateAttachments.length > 0 && <div className="dtrAttachmentPrint">Attachments: {dateAttachments.map((item) => `${item.attachment_type} — ${item.file_name}`).join(" · ")}</div>}
                           </td>
                         </tr>
                       );
@@ -2542,6 +2819,144 @@ export default function DTRSystem({ onBack }) {
           </>
         )}
 
+        {/* ---------- STAFF LOGBOOK ---------- */}
+        {view === "logbook" && me && (
+            <>
+              <div className="card noprint" style={{ marginBottom: 16 }}>
+                <div className="row">
+                  <div>
+                    <span className="lbl">Week</span>
+                    <input type="date" value={weekStart} disabled={!isAdmin}
+                      onChange={(e) => { if (e.target.value) setWeekStart(iso(mondayOf(new Date(e.target.value + "T00:00:00")))); }} />
+                  </div>
+                  <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(addDays(logbookMonday, -7)))}>Previous week</button>
+                  <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(addDays(logbookMonday, 7)))}>Next week</button>
+                  <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(mondayOf(new Date())))}>This week</button>
+                  <button className="btn ghost" onClick={doPrintLogbook}>Print logbook</button>
+                </div>
+                <p className="hint">
+                  Every signed-in employee can enter times here; the department, logo and week are admin-only.
+                  A time the clock stamped prints plain, one typed in prints italic, one changed afterwards prints italic
+                  with a dot. Entries recorded before this was added carry no mark.
+                </p>
+              </div>
+
+              <div className="sheetwrap" ref={logbookRef}>
+                {logbookPages.map((page, pi) => (
+                <div className="sheet logbook shadow" key={"pg" + pi}
+                  style={{ "--paper-width": "297mm", "--paper-height": "210mm" }}>
+                  <table className="hdr">
+                    <tbody>
+                      <tr>
+                        <td className="logoc" rowSpan={3}>
+                          {cfg.logo ? <img src={cfg.logo} alt="" /> : <span className="ph">{(cfg.co || "QM").slice(0, 2).toUpperCase()}</span>}
+                        </td>
+                        <td className="co" colSpan={2}>{cfg.co || DEF.co}</td>
+                      </tr>
+                      <tr><td className="lab" colSpan={2}><span className="k">Department:</span>{cfg.dept || DEF.dept}</td></tr>
+                      <tr><td className="lab" colSpan={2}><span className="k">Form Title:</span>{LOGBOOK_TITLE}</td></tr>
+                    </tbody>
+                  </table>
+
+                  <table className="flds">
+                    <tbody>
+                      <tr>
+                        <td className="fk">DEPARTMENT</td><td className="fv"><span className="ul">{cfg.logbookDept || DEF.logbookDept}</span></td>
+                        <td className="gap" />
+                        <td className="fk" style={{ width: "26mm" }}>PAGE NO</td><td className="fv"><span className="ul">{pi + 1} of {logbookPages.length}</span></td>
+                      </tr>
+                      <tr>
+                        <td className="fk">INCLUSIVE DATE</td><td className="fv"><span className="ul">{inclusiveLabel(logbookMonday)}</span></td>
+                        <td className="gap" /><td /><td />
+                      </tr>
+                    </tbody>
+                  </table>
+
+                  <table className="lg">
+                    <thead>
+                      <tr>
+                        <th rowSpan={2} className="cno">NO</th>
+                        <th rowSpan={2} className="cid">ID NO</th>
+                        <th rowSpan={2} className="cnm">EMPLOYEE NAME</th>
+                        <th rowSpan={2} className="cpd" />
+                        {logbookDays.map((d, i) => (
+                          <th key={i} colSpan={2}>{LOGBOOK_DAYS[i]}<span className="dsub">{shortDate(d)}</span></th>
+                        ))}
+                        <th rowSpan={2} className="ctot">TOTAL<br />DAYS<br />WORKED</th>
+                        <th rowSpan={2} className="ctot">TOTAL<br />OVERTIME<br />WORKED</th>
+                        <th rowSpan={2} className="csig">EMPLOYEES SIGNATURE</th>
+                      </tr>
+                      <tr>{logbookDays.map((_, i) => <Fragment key={i}><th>IN</th><th>OUT</th></Fragment>)}</tr>
+                    </thead>
+                    <tbody>
+                      {[...page, ...Array(Math.max(0, LOGBOOK_PER_PAGE - page.length)).fill(null)].map((emp, n) => {
+                        if (!emp) return (
+                          <Fragment key={"vacant" + n}>
+                            {["AM", "PM", "OT"].map((label, bi) => (
+                              <tr key={"vacant" + n + label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}`}>
+                                {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
+                                  <td rowSpan={3} className="cid" /><td rowSpan={3} className="cnm" /></>}
+                                <td className="cpd">{label}</td>
+                                {logbookDays.map((_, di) => <Fragment key={di}><td className="lgc" /><td className="lgc" /></Fragment>)}
+                                {bi === 0 && <><td rowSpan={3} className="ctot" /><td rowSpan={3} className="ctot" /><td rowSpan={3} className="csig" /></>}
+                              </tr>
+                            ))}
+                          </Fragment>
+                        );
+                        const recs = logbookDays.map((d) => recFor(emp.id, iso(d)));
+                        const daysWorked = recs.filter((r) => r.leave || SLOTS.some((sl) => r[sl.k])).length;
+                        const otTotal = recs.reduce((sum, r) => sum + otMinutes(r), 0);
+                        const bands = [
+                          { label: "AM", into: "amIn", out: "amOut", mer: "AM" },
+                          { label: "PM", into: "pmIn", out: "pmOut", mer: "PM" },
+                          { label: "OT", into: "otIn", out: "otOut", mer: "PM" },
+                        ];
+                        return bands.map((b, bi) => (
+                          <tr key={emp.id + b.label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}`}>
+                            {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
+                              <td rowSpan={3} className="cid">{emp.id}</td>
+                              <td rowSpan={3} className="cnm">{emp.name || ""}</td></>}
+                            <td className="cpd">{b.label}</td>
+                            {logbookDays.map((d, di) => {
+                              const ds = iso(d), r = recs[di];
+                              return [b.into, b.out].map((slotKey) => (
+                                <td key={ds + slotKey} className={"lgc " + (r.src && r.src[slotKey] ? r.src[slotKey] : "")}>
+                                  <input
+                                    key={ds + slotKey + (r[slotKey] || "")}
+                                    defaultValue={r[slotKey] ? disp(r[slotKey], false) : ""}
+                                    aria-label={`${emp.name || emp.id} ${LOGBOOK_DAYS[di]} ${b.label} ${slotKey.endsWith("In") ? "in" : "out"}`}
+                                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); } }}
+                                    onBlur={async (e) => {
+                                      /* untouched box: never let a not-yet-loaded blank
+                                         be mistaken for the user clearing the field */
+                                      if (e.target.value === e.target.defaultValue) return;
+                                      const ok = await setLogTime(emp.id, ds, slotKey, e.target.value, b.mer);
+                                      if (!ok) e.target.value = r[slotKey] ? disp(r[slotKey], false) : "";
+                                    }}
+                                  />
+                                </td>
+                              ));
+                            })}
+                            {bi === 0 && <>
+                              <td rowSpan={3} className="ctot">{daysWorked || ""}</td>
+                              <td rowSpan={3} className="ctot">{otTotal ? fmtDur(otTotal) : ""}</td>
+                              <td rowSpan={3} className="csig">
+                                {emp.signature && emp.signatureOnLogbook === true
+                                  ? <img className="lgsig" src={emp.signature} alt="" /> : ""}
+                              </td>
+                            </>}
+                          </tr>
+                        ));
+                      })}
+                    </tbody>
+                  </table>
+
+                </div>
+                ))}
+              </div>
+            </>
+        )}
+
         {/* ---------- SETTINGS ---------- */}
         {view === "settings" && !isAdmin && (
           <div className="card">
@@ -2563,6 +2978,25 @@ export default function DTRSystem({ onBack }) {
                   Digits only, at least {PIN_MIN}. It is stored scrambled — nobody, including an admin, can read it back.
                   If you forget it, an admin resets it for you.
                 </p>
+                <div className="signatureToggleWrap">
+                  <h3 className="s2">My payroll</h3>
+                  <label className="signatureToggle">
+                    <input
+                      type="checkbox"
+                      checked={sundayIncluded(liveMe, perStart)}
+                      disabled={viewOnly}
+                      onChange={(ev) => toggleSundayForPeriod(ev.target.checked)}
+                    />
+                    <span>
+                      <strong>Include Sunday in this payroll cut-off</strong>
+                      <small>
+                        {periodLabel(period)} only — the next cut-off starts unticked. Adds the empty Sunday
+                        rows to your DTR so you can fill them in. A Sunday you have already filled stays on
+                        your DTR even after you untick this.
+                      </small>
+                    </span>
+                  </label>
+                </div>
               </>
             ) : (
               <button className="btn" onClick={() => { setMe(null); setView("lock"); }}>Go to sign in</button>
@@ -2588,6 +3022,27 @@ export default function DTRSystem({ onBack }) {
                   </div>
                 )}
                 <PasscodeForm emp={actorEmp} mode="self" say={say} onSave={(fields) => savePinFor(actorEmp.id, fields)} />
+                {me && (
+                <div className="signatureToggleWrap">
+                    <h3 className="s2">My payroll</h3>
+                    <label className="signatureToggle">
+                      <input
+                        type="checkbox"
+                        checked={sundayIncluded(liveMe, perStart)}
+                        disabled={viewOnly}
+                        onChange={(ev) => toggleSundayForPeriod(ev.target.checked)}
+                      />
+                      <span>
+                        <strong>Include Sunday in this payroll cut-off</strong>
+                        <small>
+                          {periodLabel(period)} only — the next cut-off starts unticked. Adds the empty Sunday
+                          rows to your DTR so you can fill them in. A Sunday you have already filled stays on
+                          your DTR even after you untick this.
+                        </small>
+                      </span>
+                    </label>
+                  </div>
+                )}
               </>
             )}
 
@@ -2613,6 +3068,8 @@ export default function DTRSystem({ onBack }) {
                     <input value={cfg.co} placeholder={DEF.co} onChange={(e) => setCfg((p) => ({ ...p, co: e.target.value }))} /></div>
                   <div><span className="lbl">Department</span>
                     <input value={cfg.dept} placeholder={DEF.dept} onChange={(e) => setCfg((p) => ({ ...p, dept: e.target.value }))} /></div>
+                  <div><span className="lbl">Logbook department</span>
+                    <input value={cfg.logbookDept ?? ""} placeholder={DEF.logbookDept} onChange={(e) => setCfg((p) => ({ ...p, logbookDept: e.target.value }))} /></div>
                   <div style={{ gridColumn: "1/-1" }}><span className="lbl">Form title</span>
                     <input value={cfg.title} placeholder={DEF.title} onChange={(e) => setCfg((p) => ({ ...p, title: e.target.value }))} /></div>
                 </div>
@@ -2754,6 +3211,15 @@ export default function DTRSystem({ onBack }) {
                       onChange={(ev) => setEmp(i, "signatureEnabled", ev.target.checked)}
                     />
                     <span><strong>Include signature on DTR</strong><small>Shows under Employee Signature in PDF and browser print.</small></span>
+                  </label>
+                  <label className="signatureToggle">
+                    <input
+                      type="checkbox"
+                      checked={e.signatureOnLogbook === true}
+                      disabled={!e.signature}
+                      onChange={(ev) => setEmp(i, "signatureOnLogbook", ev.target.checked)}
+                    />
+                    <span><strong>Include signature on Staff logbook</strong><small>Shows in the Employees Signature column of the weekly logbook.</small></span>
                   </label>
                   {e.signature ? (
                     <SignaturePlacementEditor
