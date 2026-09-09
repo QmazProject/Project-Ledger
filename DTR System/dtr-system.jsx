@@ -20,7 +20,7 @@ const PAPER_SIZES = {
   LETTER: { label: "Letter — 8.5 × 11 in", css: "Letter", width: 612, height: 792 },
   A4: { label: "A4 — 8.27 × 11.69 in", css: "A4", width: 595.28, height: 841.89 },
 };
-const dtrPdfOverflows = (rows, paperSize) => {
+const dtrPdfOverflows = (rows, paperSize, clearedRows) => {
   const paper = PAPER_SIZES[paperSize] || PAPER_SIZES.LEGAL;
   const pageWidth = paper.width - 51;
   const noteW = pageWidth * 0.30 - 8;
@@ -29,7 +29,9 @@ const dtrPdfOverflows = (rows, paperSize) => {
     const lines = note ? wrapPdfText(note, noteW, 7.2, false) : [];
     return Math.max(19.84, lines.length * 7.2 + 5);
   });
-  const bodyH = rowHeights.reduce((sum, height) => sum + height, 0);
+  const gone = new Set(Array.isArray(clearedRows) ? clearedRows : []);
+  const bodyH = rowHeights.reduce(
+    (sum, height, i) => sum + (i >= rows.length && gone.has(i - rows.length) ? 0 : height), 0);
   /* Keep enough space below the table for signatures and the control number. */
   return bodyH > paper.height - 259;
 };
@@ -197,7 +199,11 @@ function buildDtrPdf(o) {
     const lines = o.rows[i] && o.rows[i].note ? wrapPdfText(o.rows[i].note, noteW, 7.2, false) : [];
     return Math.max(rh, lines.length * 7.2 + 5);
   });
-  const bodyH = rowHeights.reduce((sum, height) => sum + height, 0);
+  /* a deleted padding row contributes no height, so the table shortens and every
+     thing below it — TOTAL, the signatures — rises with it, mirroring the sheet */
+  const clearedSet = new Set(Array.isArray(o.clearedRows) ? o.clearedRows : []);
+  const rowGone = (i) => i >= o.rows.length && clearedSet.has(i - o.rows.length);
+  const bodyH = rowHeights.reduce((sum, height, i) => sum + (rowGone(i) ? 0 : height), 0);
   const tBot = tTop - theadH - bodyH - totalH;
   rect(X0, tBot, W, tTop - tBot);
 
@@ -228,19 +234,24 @@ function buildDtrPdf(o) {
 
   /* ---- rows ---- */
   const totalTop = r3b - bodyH;
-  [1, 5, 6, 7, 8, 9].forEach((i) => line(bx[i], r3b, bx[i], totalTop));
+  /* Body verticals are drawn per row, not as one line down the table, so a cleared
+     row can omit them. Contiguous segments render the same continuous rules.
+     The TOTAL row keeps its own, below. */
   [6, 7, 8, 9].forEach((i) => line(bx[i], totalTop, bx[i], tBot));
   let y = r3b;
   for (let i = 0; i < bodyRows; i++) {
+    if (rowGone(i)) continue;
     const r = o.rows[i];
     const rowH = rowHeights[i];
-    if (!r || !r.leave) [2, 3, 4].forEach((j) => line(bx[j], y, bx[j], y - rowH));
+    /* a leave row merges its AM/PM cells, so it omits 2-4 */
+    (!r || (!r.leave && !r.holiday) ? [1, 2, 3, 4, 5, 6, 7, 8, 9] : [1, 5, 6, 7, 8, 9])
+      .forEach((j) => line(bx[j], y, bx[j], y - rowH));
     if (r) {
       const base = mid(y, rowH, 8);
       ctext(cmid(0, 1), base, r.date, 8, false);
       if (r.sun) ctext(cmid(0, 1), base - 6, "SUN", 5.6, true);
-      if (r.leave) {
-        ctext(cmid(1, 5), base, "ON LEAVE", 8, true);
+      if (r.leave || r.holiday) {
+        ctext(cmid(1, 5), base, r.holiday ? "HOLIDAY" : "ON LEAVE", 8, true);
       } else {
         r.times.forEach((t, j) => { if (t) ctext(cmid(j + 1, j + 2), base, t, 7.2, false); });
       }
@@ -1245,6 +1256,15 @@ const CSS = `
 .qm .attachmentItemActions .btn,.qm .attachmentItemActions a{flex:0 0 auto;white-space:nowrap}
 .qm .attachmentItemActions a{display:inline-flex;align-items:center;text-decoration:none}
 .qm .attachmentItemActions .danger{color:var(--rust);border-color:var(--rust)}
+/* screen only: the print clone has no .qm ancestor, and the control is a button,
+   which buildPrintable strips in any case */
+.qm .sheet .dtr tr.padrow td{position:relative}
+.qm .sheet .dtr tr.padrow:hover td{background:#EEF0F6}
+.qm .sheet .dtr tr.padrow .padx{position:absolute;right:1.2mm;top:50%;transform:translateY(-50%);
+  width:4.2mm;height:4.2mm;display:grid;place-items:center;border:1px solid var(--rule);background:#fff;
+  color:var(--ink);font-family:var(--mono);font-size:10px;line-height:1;cursor:pointer;padding:0;
+  opacity:0;transition:opacity .15s ease}
+.qm .sheet .dtr tr.padrow:hover .padx,.qm .sheet .dtr tr.padrow .padx:focus{opacity:1}
 .qm .dtrDateCell{position:relative}
 .qm .dtrAttachmentTrigger{position:absolute;right:2px;top:2px;width:18px;height:18px;display:grid;place-items:center;border:1px solid var(--rule);background:#fff;color:var(--ink);font-family:var(--mono);font-size:15px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s ease}
 .qm .dtrDateCell:hover .dtrAttachmentTrigger,.qm .dtrAttachmentTrigger:focus{opacity:1}
@@ -1362,6 +1382,10 @@ const SHEET_CSS = `
 .sheet .dtr td.num{font-size:8pt;font-weight:bold}
 .sheet .dtr td.actc{text-align:left;padding:0 1.6mm;font-size:7.8pt;line-height:1.25}
 .sheet .dtr tr.tot td{font-weight:bold;height:7.4mm;font-size:8.5pt;letter-spacing:0.3pt}
+/* A deleted padding row leaves the layout entirely, so the table shortens and TOTAL
+   and the signature block rise to meet the last row that remains. The sheet keeps
+   its min-height, so the paper and the control number do not move. */
+.sheet .dtr tr.padgone{display:none}
 .sheet .dtr input,.sheet .dtr .cell{width:100%;height:100%;min-height:6.4mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7.2pt;text-align:center;padding:0;color:#000}
 .sheet .dtr td.actc .cell{text-align:left;font-size:7.8pt;line-height:1.25;padding-top:1mm;outline:none;white-space:pre-wrap;overflow-wrap:normal;word-break:normal}
 .sheet .dtr input:focus,.sheet .dtr .cell:focus{background:#FFF3D0;outline:none}
@@ -1398,6 +1422,22 @@ const SHEET_CSS = `
 .sheet .lg tr.shade td{background:#e3e2ea}
 .sheet.logbook{-webkit-print-color-adjust:exact;print-color-adjust:exact}
 .sheet .lg tr.shade td input{background:transparent}
+/* a foreign cell reads and copies but never edits */
+.sheet .lg td.lgc .lgro{display:block;width:100%;min-height:5.6mm;line-height:5.6mm;font-size:7pt;text-align:center;color:#000}
+/* screen only — the printed clone has no .qm ancestor, so paper is unaffected */
+.qm .sheet .lg td.lgc .lgro{cursor:copy}
+.qm .sheet .lg td.lgc .lgro:hover,.qm .sheet .lg td.lgc .lgro:focus{background:#FFF3D0;outline:none}
+.qm .sheet .lg tr.mine .cnm{font-weight:bold}
+/* Signatories for the logbook. "VERIFIED BY" sits above the rule that is signed by
+   hand, the role beneath it — the arrangement on the printed form. */
+.sheet .lgsigrow{margin-top:13mm;table-layout:fixed;width:100%}
+.sheet .lgsigrow td.ln{border:none;font-size:6.5pt;position:relative;vertical-align:top}
+.sheet .lgsigrow td.ln .line{display:block;width:56mm;border-top:0.9pt solid #000;padding-top:0.6mm}
+/* the label is lifted into the margin above the rule, so the gap it leaves is the
+   space signed across. Keep the lift inside margin-top or it rides up into the grid. */
+.sheet .lgsigrow td.ln .who{display:block;font-weight:normal;font-size:6pt;letter-spacing:0.2pt;
+  position:absolute;top:-4.2mm;left:0;text-align:left;white-space:nowrap}
+.sheet .lgsigrow td.sp{border:none}
 .sheet .lg .lgempty{height:12mm;font-size:8pt;letter-spacing:0.4pt}
 .sheet .lg input{width:100%;height:100%;min-height:5.6mm;border:none;background:transparent;font-family:Arial,Helvetica,sans-serif;font-size:7pt;text-align:center;padding:0;color:#000}
 .sheet .lg input:focus{background:#FFF3D0;outline:none}
@@ -1436,6 +1476,10 @@ ${scope} .dtr td.actc{padding:0 4pt}
 ${scope} .dtr td.actc,${scope} .dtr td.actc .cell{font-size:7.2pt;line-height:1}
 ${scope} .dtr input:focus,${scope} .dtr .cell:focus{background:transparent}
 ${scope} .sig{break-inside:avoid}
+/* the edited-marker dot is an on-screen cue for whoever is filling the logbook in;
+   the printed sheet is the record and carries no such annotation. Italic still
+   distinguishes a typed time from a clock-stamped one on paper. */
+${scope} .lg td.edited::after{content:none}
 `;
 
 const PRINT_CSS = `
@@ -1628,6 +1672,11 @@ export default function DTRSystem({ onBack }) {
   const [note, setNote] = useState("");
   const [punchDate, setPunchDate] = useState(iso(new Date()));
   const [weekStart, setWeekStart] = useState(() => iso(mondayOf(new Date())));
+  /* Padding rows the user has chosen to clear, keyed by employee and cut-off so
+     switching either shows the right set without an effect to reset it. Held in
+     component state only: this is a presentation choice for one printout, not a
+     record, and it is reversible from the same control. */
+  const [clearedPads, setClearedPads] = useState({});
   const [printHref, setPrintHref] = useState("");
   const [pdfWarning, setPdfWarning] = useState("");
   const [paperSize, setPaperSize] = useState(() => {
@@ -1667,10 +1716,6 @@ export default function DTRSystem({ onBack }) {
   const logsRef = useRef({});
   const sheetRef = useRef(null);
   const logbookRef = useRef(null);
-  /* The logbook is the department's shared sheet: anyone signed in may enter
-     times in it, a view-only visitor included, while its header stays admin-only.
-     writeRec still refuses every other write for those visitors. */
-  const allowViewOnlyWrite = useRef(false);
   /* Which year logs have actually been read back from storage. Kept apart from
      logsRef because "we have a cache entry" and "we have read what is stored"
      are different claims, and treating them as one cost a year of records. */
@@ -1844,7 +1889,7 @@ export default function DTRSystem({ onBack }) {
   const writeRec = async (id, dateStr, mut, source = "manual") => {
     /* every punch, edit, note and leave mark funnels through here, so read-only is
        enforced once rather than at each of the dozen places that can start a write */
-    if (viewOnly && !allowViewOnlyWrite.current) return false;
+    if (viewOnly) return false;
     const y = +dateStr.slice(0, 4), k = logKey(id, y);
     /* Read the year back before touching it. A write that ran first used to
        create the year as {}, which both satisfied the load check and got upserted
@@ -1988,7 +2033,7 @@ export default function DTRSystem({ onBack }) {
   const hasRecord = (ds) => {
     if (!me) return false;
     const r = recFor(me.id, ds);
-    return !!r.leave || SLOTS.some((s) => r[s.k]) || !!(r.note && r.note.trim());
+    return !!r.leave || !!r.holiday || SLOTS.some((s) => r[s.k]) || !!(r.note && r.note.trim());
   };
   useEffect(() => {
     if (!me || !calOpen) return;
@@ -2032,7 +2077,7 @@ export default function DTRSystem({ onBack }) {
 
   async function markLeave() {
     const go = async () => {
-      await writeRec(me.id, viewDate, (r) => { SLOTS.forEach((s) => delete r[s.k]); r.leave = true; });
+      await writeRec(me.id, viewDate, (r) => { SLOTS.forEach((s) => delete r[s.k]); delete r.holiday; r.leave = true; });
       say("Marked as leave");
       setConfirm(null);
     };
@@ -2046,6 +2091,26 @@ export default function DTRSystem({ onBack }) {
     } else go();
   }
   const clearLeave = () => writeRec(me.id, viewDate, (r) => { delete r.leave; });
+
+  /* Holiday is the same shape as leave: the time columns merge into one word, so the
+     date carries no punches. The two are mutually exclusive — a row that claimed both
+     would have nothing sensible to print. */
+  async function markHoliday() {
+    const go = async () => {
+      await writeRec(me.id, viewDate, (r) => { SLOTS.forEach((sl) => delete r[sl.k]); delete r.leave; r.holiday = true; });
+      say("Marked as holiday");
+      setConfirm(null);
+    };
+    if (SLOTS.some((sl) => rec[sl.k])) {
+      setConfirm({
+        title: "Mark as holiday?",
+        body: "This date already has punches recorded. Marking it as a holiday clears them.",
+        yes: "Clear and mark holiday",
+        onYes: go,
+      });
+    } else go();
+  }
+  const clearHoliday = () => writeRec(me.id, viewDate, (r) => { delete r.holiday; });
 
   async function applyEdit(val, cleared) {
     const { slot, dateStr } = editing;
@@ -2102,7 +2167,7 @@ export default function DTRSystem({ onBack }) {
   const workedOn = (d) => {
     if (!me) return false;
     const r = recFor(me.id, iso(d));
-    return !!r.leave || SLOTS.some((s) => r[s.k]) || !!(r.note && r.note.trim());
+    return !!r.leave || !!r.holiday || SLOTS.some((s) => r[s.k]) || !!(r.note && r.note.trim());
   };
   /* A Sunday that was actually worked has always shown, and still does after the
      toggle is switched off. The toggle only adds the empty ones, so they exist to
@@ -2131,6 +2196,17 @@ export default function DTRSystem({ onBack }) {
     yrs.forEach((y) => ensureLog(me.id, y, sched));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, view, perStart]);
+
+  /* The DTR always rules 21 body rows, so a short cut-off is padded out with blank
+     ones. Clearing a padding row blanks its rules but keeps its height — anything
+     that actually removed the row would pull the signature block up. */
+  const padKey = `${me ? me.id : ""}:${perStart}`;
+  const clearedPadList = clearedPads[padKey] || [];
+  const padCleared = (i) => clearedPadList.includes(i);
+  const togglePad = (i) => setClearedPads((p) => {
+    const held = p[padKey] || [];
+    return { ...p, [padKey]: held.includes(i) ? held.filter((x) => x !== i) : [...held, i] };
+  });
 
   /* ---- staff logbook ----
      The department's shared weekly sheet. Monday to Sunday because the printed
@@ -2175,19 +2251,39 @@ export default function DTRSystem({ onBack }) {
     ? Array.from({ length: Math.ceil(logbookStaff.length / LOGBOOK_PER_PAGE) },
         (_, i) => logbookStaff.slice(i * LOGBOOK_PER_PAGE, (i + 1) * LOGBOOK_PER_PAGE))
     : [[]];
+  /* The logbook is a shared sheet, but every row belongs to one person. Ownership is
+     checked here rather than only in the markup, so it holds even if a cell were ever
+     rendered editable by mistake. */
+  const ownsLogRow = (empId) => !!me && !viewOnly && empId === me.id;
   const setLogTime = async (empId, dateStr, slotKey, raw, mer) => {
+    if (!ownsLogRow(empId)) { say("You can only edit your own row"); return false; }
     const t = raw.trim() ? parseTime(raw, mer, slotKey) : "";
     if (t === null) { say("Could not read that time"); return false; }
     await ensureLog(empId, +dateStr.slice(0, 4), sched);
+    const rec0 = recFor(empId, dateStr);
     /* Nothing typed, nothing to write. Blurring a cell that only looked empty
        because its record had not loaded must never delete the stored time. */
-    if ((recFor(empId, dateStr)[slotKey] || "") === (t || "")) return true;
-    /* the logbook is the one sheet a view-only visitor may write to */
-    allowViewOnlyWrite.current = true;
-    try {
-      await writeRec(empId, dateStr, (r) => { if (t) r[slotKey] = t; else delete r[slotKey]; });
-    } finally { allowViewOnlyWrite.current = false; }
+    if ((rec0[slotKey] || "") === (t || "")) return true;
+    /* the same ordering rails the DTR grid applies: a punch cannot fall before the
+       one before it or after the one after it */
+    if (t) {
+      const issue = orderIssue(rec0, slotKey, t);
+      if (issue) { say(issue); return false; }
+    }
+    await writeRec(empId, dateStr, (r) => { if (t) r[slotKey] = t; else delete r[slotKey]; });
     return true;
+  };
+
+  /* Somebody else's time: readable and copyable, never editable. */
+  const copyLogTime = async (emp, dayIndex, band, slotKey, shown) => {
+    const who = emp.name || `ID ${emp.id}`;
+    const when = `${LOGBOOK_DAYS[dayIndex].toLowerCase()} ${band} ${slotKey.endsWith("In") ? "in" : "out"}`;
+    if (!shown) { say(`${who} has nothing recorded for ${when}. You can only edit your own row.`); return; }
+    let copied = false;
+    try { await navigator.clipboard.writeText(shown); copied = true; } catch (e) { copied = false; }
+    say(copied
+      ? `Copied ${shown} — ${who}, ${when}. You can only edit your own row.`
+      : `${who}, ${when}: ${shown}. You can only edit your own row.`);
   };
 
   /* ---- printing ---- */
@@ -2269,13 +2365,14 @@ export default function DTRSystem({ onBack }) {
           date: `${MON[d.getMonth()].slice(0, 3)} ${d.getDate()}`,
           sun: d.getDay() === 0,
           leave: !!r.leave,
+          holiday: !!r.holiday,
           times: SLOTS.map((s) => (r[s.k] ? disp(r[s.k], true) : "")),
           day: dm ? fmtDay(dm, cap) : "",
           ot: om ? fmtDur(om) : "",
           note: r.note || "",
         };
       });
-      if (dtrPdfOverflows(rows, paperSize)) {
+      if (dtrPdfOverflows(rows, paperSize, clearedPadList)) {
         setPrintHref((old) => { if (old) URL.revokeObjectURL(old); return ""; });
         setPdfWarning(`The activities are too long for one ${paper.label} page. Use “Print from browser” to save a multi-page PDF so all text, signatures, and the control number remain visible.`);
         return;
@@ -2290,6 +2387,7 @@ export default function DTRSystem({ onBack }) {
           name: liveMe.name || "", position: liveMe.position || "", site, period: periodLabel(period),
           paperSize,
           rows, dayTotal: fmtDay(dSum, cap), otTotal: fmtDur(oSum),
+          clearedRows: clearedPadList,
         });
         const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
         if (dead) { URL.revokeObjectURL(url); return; }
@@ -2298,7 +2396,7 @@ export default function DTRSystem({ onBack }) {
     }, 200);
     return () => { dead = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, me, liveMe, perStart, site, cfg, paperSize, tickN]);
+  }, [view, me, liveMe, perStart, site, cfg, paperSize, tickN, clearedPadList]);
 
   function printableDoc() {
     const clone = buildPrintable();
@@ -2545,13 +2643,13 @@ export default function DTRSystem({ onBack }) {
                 )}
               </div>
             </div>
-            {rec.leave ? (
+            {rec.leave || rec.holiday ? (
               <div className="leavecard">
                 <div>
-                  <strong>On leave</strong>
-                  <span>No punches are recorded for this date. It prints as ON LEAVE across the time columns of your DTR.</span>
+                  <strong>{rec.holiday ? "Holiday" : "On leave"}</strong>
+                  <span>No punches are recorded for this date. It prints as {rec.holiday ? "HOLIDAY" : "ON LEAVE"} across the time columns of your DTR.</span>
                 </div>
-                <button onClick={clearLeave}>Cancel leave</button>
+                <button onClick={rec.holiday ? clearHoliday : clearLeave}>{rec.holiday ? "Cancel holiday" : "Cancel leave"}</button>
               </div>
             ) : (
             <div className="strip">
@@ -2569,32 +2667,35 @@ export default function DTRSystem({ onBack }) {
             )}
             <div className="act">
               <div>
-                {!isToday && !rec.leave && (
+                {!isToday && !rec.leave && !rec.holiday && (
                   <div className="pastnote">
                     <strong>Back-filling {new Date(viewDate + "T00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</strong>
                     The live punch button is off for past dates. Use <em>set</em> or <em>edit</em> on each slot above, or the button below, and type the time you actually worked.
                   </div>
                 )}
-                {!rec.leave && isToday && (nextSlot ? (
+                {!rec.leave && !rec.holiday && isToday && (nextSlot ? (
                   <button className={"big" + (nextSlot.k === "pmOut" || nextSlot.k === "otOut" ? " warn" : "")} onClick={() => punch(nextSlot)}>
                     {nextSlot.btn}<small>{nextSlot.sub}</small>
                   </button>
                 ) : (
                   <button className="big" disabled>All punched for today<small>Nothing left to record. Come back tomorrow.</small></button>
                 ))}
-                {!rec.leave && nextSlot && (
+                {!rec.leave && !rec.holiday && nextSlot && (
                   <button className="ot" onClick={() => setEditing({ slot: nextSlot, dateStr: viewDate, value: rec[nextSlot.k] || editDefaultTime(nextSlot) })}>
                     Enter {nextSlot.label} manually
                   </button>
                 )}
-                {!rec.leave && !nextSlot && !isToday && (
+                {!rec.leave && !rec.holiday && !nextSlot && !isToday && (
                   <div className="hint" style={{ marginBottom: 10 }}>All six punches are filled for this date.</div>
                 )}
-                {!rec.leave && isToday && nextSlot && nextSlot.k === "otIn" && (
+                {!rec.leave && !rec.holiday && isToday && nextSlot && nextSlot.k === "otIn" && (
                   <button className="ot" onClick={signOut}>No overtime today</button>
                 )}
-                {!rec.leave && (
+                {!rec.leave && !rec.holiday && (
                   <button className="ot leavebtn" onClick={markLeave}>Mark this date as leave</button>
+                )}
+                {!rec.leave && !rec.holiday && (
+                  <button className="ot leavebtn" onClick={markHoliday}>Mark this date as holiday</button>
                 )}
                 <div className="tally">
                   <div>
@@ -2663,6 +2764,11 @@ export default function DTRSystem({ onBack }) {
                   ? <a className="btn" href={printHref} download={dtrFileName()}>Print / Save PDF</a>
                   : <button className="btn" disabled style={{ opacity: 0.5 }}>Preparing PDF…</button>}
                 <button className="btn ghost" onClick={doPrint}>Print from browser</button>
+                {clearedPadList.length > 0 && (
+                  <button className="btn ghost" onClick={() => setClearedPads((p) => ({ ...p, [padKey]: [] }))}>
+                    Restore {clearedPadList.length} removed row{clearedPadList.length > 1 ? "s" : ""}
+                  </button>
+                )}
                 {attachments.length > 0 && <button className="btn ghost" onClick={() => printDtrAttachments(attachments, `DTR attachments — ${periodLabel(period)}`, attachmentPaperSize)}>Print attachments ({attachments.length})</button>}
               </div>
               {pdfWarning && <div role="alert" className="pastnote" style={{ marginTop: 10, marginBottom: 0 }}>{pdfWarning}</div>}
@@ -2742,9 +2848,9 @@ export default function DTRSystem({ onBack }) {
                               {dateAttachments.length ? dateAttachments.length : "+"}
                             </button>
                           </td>
-                          {r.leave ? (
+                          {r.leave || r.holiday ? (
                             <>
-                              <td className="leave" colSpan={4}>ON LEAVE</td>
+                              <td className="leave" colSpan={4}>{r.holiday ? "HOLIDAY" : "ON LEAVE"}</td>
                               <td /><td />
                             </>
                           ) : SLOTS.map((s) => (
@@ -2792,7 +2898,21 @@ export default function DTRSystem({ onBack }) {
                       );
                     })}
                     {Array.from({ length: Math.max(0, 21 - days.length) }).map((_, i) => (
-                      <tr key={"pad" + i}>{Array.from({ length: 10 }).map((__, j) => <td key={j} />)}</tr>
+                      <tr key={"pad" + i} className={"padrow" + (padCleared(i) ? " padgone" : "")}>
+                        {Array.from({ length: 10 }).map((__, j) => (
+                          <td key={j}>
+                            {j === 9 && canEdit && (
+                              <button
+                                type="button"
+                                className="padx noprint"
+                                title="Remove this unused row"
+                                aria-label={"Remove unused row " + (i + 1)}
+                                onClick={() => togglePad(i)}
+                              >{"\u00D7"}</button>
+                            )}
+                          </td>
+                        ))}
+                      </tr>
                     ))}
                     <tr className="tot">
                       <td colSpan={6} />
@@ -2904,38 +3024,63 @@ export default function DTRSystem({ onBack }) {
                           </Fragment>
                         );
                         const recs = logbookDays.map((d) => recFor(emp.id, iso(d)));
-                        const daysWorked = recs.filter((r) => r.leave || SLOTS.some((sl) => r[sl.k])).length;
+                        const daysWorked = recs.filter((r) => r.leave || r.holiday || SLOTS.some((sl) => r[sl.k])).length;
                         const otTotal = recs.reduce((sum, r) => sum + otMinutes(r), 0);
                         const bands = [
                           { label: "AM", into: "amIn", out: "amOut", mer: "AM" },
                           { label: "PM", into: "pmIn", out: "pmOut", mer: "PM" },
                           { label: "OT", into: "otIn", out: "otOut", mer: "PM" },
                         ];
+                        const mineRow = ownsLogRow(emp.id);
                         return bands.map((b, bi) => (
-                          <tr key={emp.id + b.label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}`}>
+                          <tr key={emp.id + b.label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}${mineRow ? " mine" : ""}`}>
                             {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
                               <td rowSpan={3} className="cid">{emp.id}</td>
                               <td rowSpan={3} className="cnm">{emp.name || ""}</td></>}
                             <td className="cpd">{b.label}</td>
                             {logbookDays.map((d, di) => {
                               const ds = iso(d), r = recs[di];
-                              return [b.into, b.out].map((slotKey) => (
+                              return [b.into, b.out].map((slotKey) => {
+                                const shown = r[slotKey] ? disp(r[slotKey], false) : "";
+                                const label = `${emp.name || emp.id} ${LOGBOOK_DAYS[di]} ${b.label} ${slotKey.endsWith("In") ? "in" : "out"}`;
+                                return (
                                 <td key={ds + slotKey} className={"lgc " + (r.src && r.src[slotKey] ? r.src[slotKey] : "")}>
+                                  {mineRow ? (
                                   <input
                                     key={ds + slotKey + (r[slotKey] || "")}
-                                    defaultValue={r[slotKey] ? disp(r[slotKey], false) : ""}
-                                    aria-label={`${emp.name || emp.id} ${LOGBOOK_DAYS[di]} ${b.label} ${slotKey.endsWith("In") ? "in" : "out"}`}
+                                    defaultValue={shown}
+                                    aria-label={label}
                                     onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); } }}
                                     onBlur={async (e) => {
                                       /* untouched box: never let a not-yet-loaded blank
                                          be mistaken for the user clearing the field */
                                       if (e.target.value === e.target.defaultValue) return;
                                       const ok = await setLogTime(emp.id, ds, slotKey, e.target.value, b.mer);
-                                      if (!ok) e.target.value = r[slotKey] ? disp(r[slotKey], false) : "";
+                                      if (!ok) e.target.value = shown;
                                     }}
                                   />
+                                  ) : (
+                                  /* Somebody else's time. A span rather than a button: the print
+                                     sanitiser drops buttons and strips role/tabindex/title, so this
+                                     keeps its text on paper while losing its interactivity there. */
+                                  <span
+                                    className="lgro"
+                                    role="button"
+                                    tabIndex={0}
+                                    title={`${emp.name || emp.id} — click to copy. Only they can edit this row.`}
+                                    aria-label={label}
+                                    onClick={() => copyLogTime(emp, di, b.label, slotKey, shown)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" || e.key === " ") {
+                                        e.preventDefault();
+                                        copyLogTime(emp, di, b.label, slotKey, shown);
+                                      }
+                                    }}
+                                  >{shown}</span>
+                                  )}
                                 </td>
-                              ));
+                                );
+                              });
                             })}
                             {bi === 0 && <>
                               <td rowSpan={3} className="ctot">{daysWorked || ""}</td>
@@ -2951,6 +3096,17 @@ export default function DTRSystem({ onBack }) {
                     </tbody>
                   </table>
 
+                  {/* The logbook's own signatories, separate from the DTR's. Blank rules,
+                      signed by hand once the sheet is printed. */}
+                  <table className="sig lgsigrow">
+                    <tbody>
+                      <tr>
+                        <td className="ln"><span className="who">VERIFIED BY:</span><span className="line">DEPARTMENT MANAGER</span></td><td className="sp" />
+                        <td className="ln"><span className="who">REVIEWED BY:</span><span className="line">HR MANAGER</span></td><td className="sp" />
+                        <td className="ln"><span className="who">NOTED BY:</span><span className="line">TOP MANAGEMENT</span></td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
                 ))}
               </div>
