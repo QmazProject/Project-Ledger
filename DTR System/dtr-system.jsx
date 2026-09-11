@@ -65,15 +65,18 @@ function parseTime(txt, merHint, slotKey) {
   let h = +m[1];
   const mi = m[2] ? +m[2] : 0;
   if (h > 23 || mi > 59) return null;
-  /* The time input returns 24-hour values such as 12:19. A bare 12 in the
-     AM-out field means noon in normal timesheet shorthand; explicit AM/PM
-     suffixes still always win, and other bare AM fields remain unchanged. */
+  /* Explicit AM/PM suffixes always win. A bare 12 in the AM-out field means
+     noon in normal timesheet shorthand. Otherwise the row's meridian hint
+     covers hours 1-11 whether or not a colon was typed, so "5:06" in a PM row
+     is 17:06 and not five in the morning; 0, 12 and 13-23 are already
+     unambiguous and are read as written. The wheel picker and the type=time
+     input send 24-hour values and pass no hint, so they come through unchanged. */
   const mer = m[3]
     ? (m[3][0] === "A" ? "AM" : "PM")
     : slotKey === "amOut" && h === 12 && !t.includes(":")
       ? "PM"
     : t.includes(":")
-      ? null
+      ? (h >= 1 && h <= 11 ? merHint : null)
       : h <= 12 ? merHint : null;
   if (mer === "PM" && h < 12) h += 12;
   if (mer === "AM" && h === 12) h = 0;
@@ -1269,6 +1272,15 @@ const CSS = `
 .qm .dtrAttachmentTrigger{position:absolute;right:2px;top:2px;width:18px;height:18px;display:grid;place-items:center;border:1px solid var(--rule);background:#fff;color:var(--ink);font-family:var(--mono);font-size:15px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s ease}
 .qm .dtrDateCell:hover .dtrAttachmentTrigger,.qm .dtrAttachmentTrigger:focus{opacity:1}
 .qm .dtrAttachmentTrigger.has{opacity:1;color:var(--rust);border-color:var(--rust);font-size:9px;font-weight:bold}
+.qm .attachmentScanRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.qm .attachmentScanChip{font-family:var(--mono);font-size:11px;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule);background:#fff;padding:4px 8px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qm .attachmentScanChip button{border:0;background:none;color:var(--rust);font-size:16px;line-height:1;cursor:pointer;padding:0}
+.qm .attachmentScanner{display:grid;gap:8px;border:1px solid var(--rule);background:#fff;padding:8px}
+.qm .attachmentScannerVideo,.qm .attachmentScannerPreview{display:block;width:100%;max-height:55vh;object-fit:contain;background:#000}
+.qm .attachmentScannerModes{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px}
+.qm .attachmentScannerModes label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.qm .attachmentScannerModes input{accent-color:var(--ink)}
+.qm .attachmentScannerActions{display:flex;gap:6px;flex-wrap:wrap}
 .qm .wheelPicker{outline:none}
 /* the field gets the full width of the box so the whole value, AM/PM included, stays visible */
 .qm .manualTimeLabel{display:grid;grid-template-columns:1fr;gap:6px;font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft)}
@@ -1345,6 +1357,8 @@ const CSS = `
   .qm .attachmentItem{grid-template-columns:auto minmax(0,1fr)}
   .qm .attachmentItemActions{grid-column:2;justify-content:flex-start}
   .qm .attachmentItemActions .btn{min-height:40px}
+  .qm .attachmentScanRow .btn,.qm .attachmentScannerActions .btn{flex:1 1 auto;min-height:44px}
+  .qm .attachmentScannerVideo,.qm .attachmentScannerPreview{max-height:60vh}
   .qm .dtrDateCell{cursor:pointer;touch-action:manipulation}
   .qm .dtrAttachmentTrigger{display:none!important}
   .qm .wheelColumns{grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) minmax(0,.9fr);gap:3px}
@@ -1357,7 +1371,10 @@ const CSS = `
 
 /* the printed A4 form — kept separate so the print window can reuse it verbatim */
 const SHEET_CSS = `
-.sheet{position:relative;width:190mm;margin:0 auto;background:#fff;padding:5mm 5mm 6mm;font-family:Arial,Helvetica,sans-serif;color:#000;font-size:8.5pt;line-height:1.2}
+/* 9mm at the bottom is the same strip the printed rules reserve: the control number is
+   pinned 4.2mm up and stands about 2.5mm tall, so anything less lets the signature row
+   touch it on screen whenever a month's notes push the sheet to the page bottom. */
+.sheet{position:relative;width:190mm;margin:0 auto;background:#fff;padding:5mm 5mm 9mm;font-family:Arial,Helvetica,sans-serif;color:#000;font-size:8.5pt;line-height:1.2}
 .sheet table{border-collapse:collapse;table-layout:fixed;width:100%}
 .sheet .hdr td{border:0.9pt solid #000;padding:1mm 2mm;vertical-align:middle}
 .sheet .hdr .logoc{width:19mm;text-align:center;padding:1.2mm}
@@ -1447,8 +1464,9 @@ const SHEET_CSS = `
 .sheet .lg td.edited::after{content:"";position:absolute;right:0.6mm;top:0.6mm;width:1mm;height:1mm;border-radius:50%;background:#12233A}
 .sheet .lg td.edited{position:relative}
 
-/* pinned to the bottom of the sheet box; the printed rules reserve a strip below
-   the signatures so a sheet that runs past one page cannot collide with it */
+/* pinned to the bottom of the sheet box; the sheet's bottom padding, on screen and in
+   the printed rules alike, reserves a strip below the signatures so a sheet that runs
+   past one page cannot collide with it */
 .sheet .controlNo{position:absolute;right:5mm;bottom:4.2mm;font-size:7pt;line-height:1;font-weight:normal;white-space:nowrap}
 `;
 
@@ -1534,10 +1552,172 @@ function printDtrAttachments(items, title = "DTR supporting documents", paperSiz
   setTimeout(() => { try { win.focus(); win.print(); } catch {} }, 900);
 }
 
+/* ---- camera scanning for supporting documents ----
+   A phone camera is the scanner most employees actually have. The frame is drawn to a
+   canvas, optionally cleaned up to read like a photocopy, and handed to the same upload
+   path a picked file takes, so storage and the attachment list never learn the difference. */
+const SCAN_MAX_EDGE = 2000;
+/* draw a video frame or a loaded image onto a canvas, capped on its long edge so a
+   12-megapixel phone shot does not become a 10 MB upload */
+function frameToCanvas(source, max = SCAN_MAX_EDGE) {
+  const w = source.videoWidth || source.naturalWidth || source.width;
+  const h = source.videoHeight || source.naturalHeight || source.height;
+  const sc = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w * sc));
+  c.height = Math.max(1, Math.round(h * sc));
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(source, 0, 0, c.width, c.height);
+  return c;
+}
+/* The "scan" look: grayscale, then stretch the levels so the paper reads as white and
+   the ink as black. The 5th and 90th percentiles anchor the stretch rather than the true
+   darkest and brightest pixels, so one shadow or a dark desk corner cannot flatten the
+   rest of the page. */
+function scanLook(src) {
+  const c = document.createElement("canvas");
+  c.width = src.width; c.height = src.height;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(src, 0, 0);
+  const image = ctx.getImageData(0, 0, c.width, c.height);
+  const { data } = image;
+  const n = data.length / 4;
+  const gray = new Uint8ClampedArray(n);
+  const hist = new Uint32Array(256);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+    hist[gray[p]]++;
+  }
+  const percentile = (q) => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * q) return v; } return 255; };
+  const lo = percentile(0.05);
+  const hi = Math.max(lo + 1, percentile(0.90));
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const v = Math.max(0, Math.min(255, Math.round(((gray[p] - lo) * 255) / (hi - lo))));
+    data[i] = v; data[i + 1] = v; data[i + 2] = v;
+  }
+  ctx.putImageData(image, 0, 0);
+  return c;
+}
+const canvasToJpegFile = (canvas, name) => new Promise((resolve, reject) => {
+  canvas.toBlob((blob) => (blob ? resolve(new File([blob], name, { type: "image/jpeg" })) : reject(new Error("Could not save the scan."))), "image/jpeg", 0.88);
+});
+const fileToImage = (file) => new Promise((resolve, reject) => {
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+  img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not read that photo.")); };
+  img.src = url;
+});
+
+function CameraScanner({ date, onUse, onCancel, onError }) {
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const fallbackRef = useRef(null);
+  const [facing, setFacing] = useState("environment");
+  const [live, setLive] = useState(false);
+  /* no in-page camera (older browser, permission refused, or a plain http page): the
+     device's own camera app still works through a capture-enabled file input */
+  const [fallback, setFallback] = useState(false);
+  const [shot, setShot] = useState(null);
+  const [mode, setMode] = useState("scan");
+  const [preview, setPreview] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const stop = useCallback(() => {
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+    setLive(false);
+  }, []);
+
+  useEffect(() => {
+    if (shot) return undefined;
+    if (!navigator.mediaDevices?.getUserMedia) { setFallback(true); return undefined; }
+    let cancelled = false;
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        streamRef.current = stream;
+        const v = videoRef.current;
+        if (v) { v.srcObject = stream; v.play().catch(() => {}); }
+        setFallback(false); setLive(true);
+      })
+      .catch(() => { if (!cancelled) setFallback(true); });
+    return () => { cancelled = true; stop(); };
+  }, [facing, shot, stop]);
+
+  /* the review image is rebuilt when the look changes; the raw shot is kept untouched
+     so switching back to colour costs nothing */
+  useEffect(() => {
+    if (!shot) { setPreview(""); return; }
+    const c = mode === "scan" ? scanLook(shot) : shot;
+    setPreview(c.toDataURL("image/jpeg", 0.8));
+  }, [shot, mode]);
+
+  const capture = () => {
+    const v = videoRef.current;
+    if (!v || !v.videoWidth) { onError("The camera has not started yet."); return; }
+    setShot(frameToCanvas(v));
+  };
+  const onFallbackFile = async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    try { setShot(frameToCanvas(await fileToImage(f))); }
+    catch (error) { onError(error?.message || "Could not read that photo."); }
+  };
+  const use = async () => {
+    if (!shot || busy) return;
+    setBusy(true);
+    try {
+      const now = new Date();
+      const name = `scan-${date}-${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}.jpg`;
+      onUse(await canvasToJpegFile(mode === "scan" ? scanLook(shot) : shot, name));
+    } catch (error) {
+      onError(error?.message || "Could not save the scan.");
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="attachmentScanner">
+      {!shot ? (
+        <>
+          {!fallback && <video ref={videoRef} className="attachmentScannerVideo" autoPlay playsInline muted />}
+          {!fallback && !live && <p className="hint">Opening the camera… allow access if the browser asks.</p>}
+          {fallback && <p className="hint">The camera can't open inside this page. Take the photo with your device's camera instead.</p>}
+          <input ref={fallbackRef} type="file" accept="image/*" capture="environment" hidden onChange={onFallbackFile} />
+          <div className="attachmentScannerActions">
+            {fallback
+              ? <button type="button" className="btn sm" onClick={() => fallbackRef.current?.click()}>Take a photo</button>
+              : <button type="button" className="btn sm" disabled={!live} onClick={capture}>Capture</button>}
+            {live && <button type="button" className="btn ghost sm" onClick={() => setFacing((f) => (f === "environment" ? "user" : "environment"))}>Switch camera</button>}
+            <button type="button" className="btn ghost sm" onClick={onCancel}>Cancel</button>
+          </div>
+        </>
+      ) : (
+        <>
+          {preview && <img className="attachmentScannerPreview" src={preview} alt="Captured document" />}
+          <div className="attachmentScannerModes">
+            <label><input type="radio" name="dtr-scan-mode" checked={mode === "scan"} onChange={() => setMode("scan")} />Scan (black & white)</label>
+            <label><input type="radio" name="dtr-scan-mode" checked={mode === "color"} onChange={() => setMode("color")} />Original colour</label>
+          </div>
+          <div className="attachmentScannerActions">
+            <button type="button" className="btn sm" disabled={busy} onClick={use}>{busy ? "Saving…" : "Use this scan"}</button>
+            <button type="button" className="btn ghost sm" disabled={busy} onClick={() => setShot(null)}>Retake</button>
+            <button type="button" className="btn ghost sm" disabled={busy} onClick={onCancel}>Cancel</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function AttachmentModal({ employee, actor, period, date, items, canEdit, paperSize, onPaperSizeChange, onClose, onAdded, onRemoved }) {
   const [type, setType] = useState("Gate Pass");
   const [note, setNote] = useState("");
   const [file, setFile] = useState(null);
+  /* a scanned file has no picker to show its name, so the modal shows it itself */
+  const [fileFromScan, setFileFromScan] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState(() => new Set((items || []).map((item) => item.id)));
   const dateLabel = new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
@@ -1550,7 +1730,7 @@ function AttachmentModal({ employee, actor, period, date, items, canEdit, paperS
     try {
       const item = await uploadDtrAttachment({ employee, actor, period, workDate: date, type, note, file });
       onAdded(item);
-      setFile(null); setNote("");
+      setFile(null); setFileFromScan(false); setNote("");
       const input = document.getElementById("dtr-attachment-file");
       if (input) input.value = "";
     } catch (error) {
@@ -1572,8 +1752,25 @@ function AttachmentModal({ employee, actor, period, date, items, canEdit, paperS
         {canEdit && <div className="attachmentUpload">
           <div className="attachmentUploadGrid">
             <label><span className="lbl">Document type</span><select value={type} onChange={(e) => setType(e.target.value)}>{ATTACHMENT_TYPES.map((item) => <option key={item}>{item}</option>)}</select></label>
-            <label><span className="lbl">File</span><input id="dtr-attachment-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={(e) => setFile(e.target.files?.[0] || null)} /></label>
+            <label><span className="lbl">File</span><input id="dtr-attachment-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={(e) => { setFile(e.target.files?.[0] || null); setFileFromScan(false); }} /></label>
           </div>
+          {scanning ? (
+            <CameraScanner
+              date={date}
+              onUse={(scanned) => {
+                setFile(scanned); setFileFromScan(true); setScanning(false);
+                const input = document.getElementById("dtr-attachment-file");
+                if (input) input.value = "";
+              }}
+              onCancel={() => setScanning(false)}
+              onError={(message) => onAdded(null, message)}
+            />
+          ) : (
+            <div className="attachmentScanRow">
+              <button type="button" className="btn ghost sm" disabled={busy} onClick={() => setScanning(true)}>Scan with camera</button>
+              {fileFromScan && file && <span className="attachmentScanChip">{file.name} · {formatFileSize(file.size)}<button type="button" aria-label="Discard scan" title="Discard scan" onClick={() => { setFile(null); setFileFromScan(false); }}>×</button></span>}
+            </div>
+          )}
           <label><span className="lbl">Note (optional)</span><input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Short description" /></label>
           <div className="attachmentUploadFooter"><span className="hint">PDF, JPG, PNG, or WEBP · max 10 MB</span><button type="button" className="btn sm" disabled={!file || busy} onClick={upload}>{busy ? "Uploading…" : "Upload attachment"}</button></div>
         </div>}
@@ -2115,7 +2312,9 @@ export default function DTRSystem({ onBack }) {
   async function applyEdit(val, cleared) {
     const { slot, dateStr } = editing;
     if (cleared) { await writeRec(me.id, dateStr, (r) => { delete r[slot.k]; }); setEditing(null); return; }
-    const t = parseTime(val, slot.mer, slot.k);
+    /* the wheel picker always hands over a complete 24-hour HH:MM, so no
+       meridian hint: "09:15" chosen for a PM slot must stay 09:15 */
+    const t = parseTime(val, null, slot.k);
     if (t === null) { say("Could not read that time"); return; }
     const candidate = { ...recFor(me.id, dateStr), [slot.k]: t };
     const issue = recordOrderIssue(candidate);
