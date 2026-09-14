@@ -1155,6 +1155,10 @@ const CSS = `
 .qm a.btn{text-decoration:none;display:inline-block;line-height:1.15}
 .qm .btn.ghost{background:#fff;color:var(--ink)}
 .qm .btn.sm{padding:7px 12px;font-size:14px}
+.qm .blankrange{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-top:16px;padding-top:16px;border-top:1.5px solid var(--zinc-dk)}
+.qm .blankrange input{width:86px;border:1.5px solid var(--zinc-dk);padding:8px 9px;font-size:14px;font-family:var(--mono);color:var(--ink);background:#fff}
+.qm .blankrange input:focus{border-color:var(--ink)}
+.qm .blankrange .note{flex:1 1 240px;font-size:12.5px;color:var(--ink-soft);line-height:1.5}
 
 .qm table.roster{width:100%;border-collapse:collapse;margin-bottom:10px}
 .qm table.roster th{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft);text-align:left;padding:0 8px 7px;font-weight:600}
@@ -1913,6 +1917,11 @@ export default function DTRSystem({ onBack }) {
   const logsRef = useRef({});
   const sheetRef = useRef(null);
   const logbookRef = useRef(null);
+  const blankLogbookRef = useRef(null);
+  /* the blank-sheet page range, held as text so a field can be emptied mid-edit */
+  const [blankOpen, setBlankOpen] = useState(false);
+  const [blankFrom, setBlankFrom] = useState("1");
+  const [blankTo, setBlankTo] = useState("1");
   /* Which year logs have actually been read back from storage. Kept apart from
      logsRef because "we have a cache entry" and "we have read what is stored"
      are different claims, and treating them as one cost a year of records. */
@@ -2450,6 +2459,25 @@ export default function DTRSystem({ onBack }) {
     ? Array.from({ length: Math.ceil(logbookStaff.length / LOGBOOK_PER_PAGE) },
         (_, i) => logbookStaff.slice(i * LOGBOOK_PER_PAGE, (i + 1) * LOGBOOK_PER_PAGE))
     : [[]];
+  /* ---- the blank sheet's page range ----
+     Both ends are editable, so the batch can read 1 to 5 or start part way down
+     the pad at 2 to 5. From falls back to 1 and To never sits below From, so a
+     half-typed or empty field still describes a printable range rather than
+     nothing. The cap is what stops a mistyped 999 from opening a popup holding
+     999 landscape sheets. */
+  const BLANK_MAX_SHEETS = 30;
+  const blankRange = (() => {
+    const asPage = (raw, fallback) => {
+      const n = Math.floor(Number(raw));
+      return Number.isFinite(n) && n >= 1 ? Math.min(n, 999) : fallback;
+    };
+    const from = asPage(blankFrom, 1);
+    const to = Math.max(from, asPage(blankTo, from));
+    return { from, to: Math.min(to, from + BLANK_MAX_SHEETS - 1), asked: to };
+  })();
+  const blankPageNos = Array.from(
+    { length: blankRange.to - blankRange.from + 1 }, (_, i) => blankRange.from + i);
+
   /* The logbook is a shared sheet, but every row belongs to one person. Ownership is
      checked here rather than only in the markup, so it holds even if a cell were ever
      rendered editable by mistake. */
@@ -2484,6 +2512,160 @@ export default function DTRSystem({ onBack }) {
       ? `Copied ${shown} — ${who}, ${when}. You can only edit your own row.`
       : `${who}, ${when}: ${shown}. You can only edit your own row.`);
   };
+
+  /* One page of the logbook. The sheet on screen and the blank sheet that prints
+     are the same markup, so the blank one can never drift from the real form:
+     hand it an empty page and all six rows fall through to the vacant row the
+     last filled page already prints — numbered, but with no ID, no name, no
+     times and no totals. The header, department, INCLUSIVE DATE and the
+     Monday-to-Sunday column dates come from the chosen week either way. */
+  const renderLogbookSheet = (page, pi, pageCount) => (
+    <div className="sheet logbook shadow" key={"pg" + pi}
+      style={{ "--paper-width": "297mm", "--paper-height": "210mm" }}>
+      <table className="hdr">
+        <tbody>
+          <tr>
+            <td className="logoc" rowSpan={3}>
+              {cfg.logo ? <img src={cfg.logo} alt="" /> : <span className="ph">{(cfg.co || "QM").slice(0, 2).toUpperCase()}</span>}
+            </td>
+            <td className="co" colSpan={2}>{cfg.co || DEF.co}</td>
+          </tr>
+          <tr><td className="lab" colSpan={2}><span className="k">Department:</span>{cfg.dept || DEF.dept}</td></tr>
+          <tr><td className="lab" colSpan={2}><span className="k">Form Title:</span>{LOGBOOK_TITLE}</td></tr>
+        </tbody>
+      </table>
+
+      <table className="flds">
+        <tbody>
+          <tr>
+            <td className="fk">DEPARTMENT</td><td className="fv"><span className="ul">{cfg.logbookDept || DEF.logbookDept}</span></td>
+            <td className="gap" />
+            <td className="fk" style={{ width: "26mm" }}>PAGE NO</td><td className="fv"><span className="ul">{pi + 1} of {pageCount}</span></td>
+          </tr>
+          <tr>
+            <td className="fk">INCLUSIVE DATE</td><td className="fv"><span className="ul">{inclusiveLabel(logbookMonday)}</span></td>
+            <td className="gap" /><td /><td />
+          </tr>
+        </tbody>
+      </table>
+
+      <table className="lg">
+        <thead>
+          <tr>
+            <th rowSpan={2} className="cno">NO</th>
+            <th rowSpan={2} className="cid">ID NO</th>
+            <th rowSpan={2} className="cnm">EMPLOYEE NAME</th>
+            <th rowSpan={2} className="cpd" />
+            {logbookDays.map((d, i) => (
+              <th key={i} colSpan={2}>{LOGBOOK_DAYS[i]}<span className="dsub">{shortDate(d)}</span></th>
+            ))}
+            <th rowSpan={2} className="ctot">TOTAL<br />DAYS<br />WORKED</th>
+            <th rowSpan={2} className="ctot">TOTAL<br />OVERTIME<br />WORKED</th>
+            <th rowSpan={2} className="csig">EMPLOYEES SIGNATURE</th>
+          </tr>
+          <tr>{logbookDays.map((_, i) => <Fragment key={i}><th>IN</th><th>OUT</th></Fragment>)}</tr>
+        </thead>
+        <tbody>
+          {[...page, ...Array(Math.max(0, LOGBOOK_PER_PAGE - page.length)).fill(null)].map((emp, n) => {
+            if (!emp) return (
+              <Fragment key={"vacant" + n}>
+                {["AM", "PM", "OT"].map((label, bi) => (
+                  <tr key={"vacant" + n + label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}`}>
+                    {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
+                      <td rowSpan={3} className="cid" /><td rowSpan={3} className="cnm" /></>}
+                    <td className="cpd">{label}</td>
+                    {logbookDays.map((_, di) => <Fragment key={di}><td className="lgc" /><td className="lgc" /></Fragment>)}
+                    {bi === 0 && <><td rowSpan={3} className="ctot" /><td rowSpan={3} className="ctot" /><td rowSpan={3} className="csig" /></>}
+                  </tr>
+                ))}
+              </Fragment>
+            );
+            const recs = logbookDays.map((d) => recFor(emp.id, iso(d)));
+            const daysWorked = recs.filter((r) => r.leave || r.holiday || SLOTS.some((sl) => r[sl.k])).length;
+            const otTotal = recs.reduce((sum, r) => sum + otMinutes(r), 0);
+            const bands = [
+              { label: "AM", into: "amIn", out: "amOut", mer: "AM" },
+              { label: "PM", into: "pmIn", out: "pmOut", mer: "PM" },
+              { label: "OT", into: "otIn", out: "otOut", mer: "PM" },
+            ];
+            const mineRow = ownsLogRow(emp.id);
+            return bands.map((b, bi) => (
+              <tr key={emp.id + b.label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}${mineRow ? " mine" : ""}`}>
+                {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
+                  <td rowSpan={3} className="cid">{emp.id}</td>
+                  <td rowSpan={3} className="cnm">{emp.name || ""}</td></>}
+                <td className="cpd">{b.label}</td>
+                {logbookDays.map((d, di) => {
+                  const ds = iso(d), r = recs[di];
+                  return [b.into, b.out].map((slotKey) => {
+                    const shown = r[slotKey] ? disp(r[slotKey], false) : "";
+                    const label = `${emp.name || emp.id} ${LOGBOOK_DAYS[di]} ${b.label} ${slotKey.endsWith("In") ? "in" : "out"}`;
+                    return (
+                    <td key={ds + slotKey} className={"lgc " + (r.src && r.src[slotKey] ? r.src[slotKey] : "")}>
+                      {mineRow ? (
+                      <input
+                        key={ds + slotKey + (r[slotKey] || "")}
+                        defaultValue={shown}
+                        aria-label={label}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); } }}
+                        onBlur={async (e) => {
+                          /* untouched box: never let a not-yet-loaded blank
+                             be mistaken for the user clearing the field */
+                          if (e.target.value === e.target.defaultValue) return;
+                          const ok = await setLogTime(emp.id, ds, slotKey, e.target.value, b.mer);
+                          if (!ok) e.target.value = shown;
+                        }}
+                      />
+                      ) : (
+                      /* Somebody else's time. A span rather than a button: the print
+                         sanitiser drops buttons and strips role/tabindex/title, so this
+                         keeps its text on paper while losing its interactivity there. */
+                      <span
+                        className="lgro"
+                        role="button"
+                        tabIndex={0}
+                        title={`${emp.name || emp.id} — click to copy. Only they can edit this row.`}
+                        aria-label={label}
+                        onClick={() => copyLogTime(emp, di, b.label, slotKey, shown)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            copyLogTime(emp, di, b.label, slotKey, shown);
+                          }
+                        }}
+                      >{shown}</span>
+                      )}
+                    </td>
+                    );
+                  });
+                })}
+                {bi === 0 && <>
+                  <td rowSpan={3} className="ctot">{daysWorked || ""}</td>
+                  <td rowSpan={3} className="ctot">{otTotal ? fmtDur(otTotal) : ""}</td>
+                  <td rowSpan={3} className="csig">
+                    {emp.signature && emp.signatureOnLogbook === true
+                      ? <img className="lgsig" src={emp.signature} alt="" /> : ""}
+                  </td>
+                </>}
+              </tr>
+            ));
+          })}
+        </tbody>
+      </table>
+
+      {/* The logbook's own signatories, separate from the DTR's. Blank rules,
+          signed by hand once the sheet is printed. */}
+      <table className="sig lgsigrow">
+        <tbody>
+          <tr>
+            <td className="ln"><span className="who">VERIFIED BY:</span><span className="line">DEPARTMENT MANAGER</span></td><td className="sp" />
+            <td className="ln"><span className="who">REVIEWED BY:</span><span className="line">HR MANAGER</span></td><td className="sp" />
+            <td className="ln"><span className="who">NOTED BY:</span><span className="line">TOP MANAGEMENT</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
 
   /* ---- printing ---- */
   /* The sheet on screen is an editable form; the sheet that prints is a document.
@@ -2545,6 +2727,14 @@ export default function DTRSystem({ onBack }) {
   }
 
   const doPrintLogbook = () => printInPopup(logbookRef.current, logbookPageStyles(), LOGBOOK_TITLE);
+  /* The same week on sheets nobody is on yet — for filling in by hand. The hidden
+     container already holds exactly the pages in the chosen range, because that
+     range is derived during render, so there is nothing to prepare here. */
+  /* The title is built here rather than inside the callback: a callback that reads
+     the derived range makes the React Compiler give up on this whole component, and
+     a bailed-out component loses both its memoisation and its compiler lint. */
+  const blankLogbookTitle = `${LOGBOOK_TITLE} (BLANK ${blankRange.from}-${blankRange.to})`;
+  const doPrintBlankLogbook = () => printInPopup(blankLogbookRef.current, logbookPageStyles(), blankLogbookTitle);
 
   /* a real anchor with a prepared blob URL survives sandboxes that block scripted popups */
   useEffect(() => {
@@ -3152,162 +3342,66 @@ export default function DTRSystem({ onBack }) {
                   <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(addDays(logbookMonday, 7)))}>Next week</button>
                   <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(mondayOf(new Date())))}>This week</button>
                   <button className="btn ghost" onClick={doPrintLogbook}>Print logbook</button>
+                  <button className="btn ghost" aria-expanded={blankOpen}
+                    onClick={() => setBlankOpen((v) => !v)}>Print blank sheet</button>
                 </div>
                 <p className="hint">
                   Every signed-in employee can enter times here; the department, logo and week are admin-only.
                   A time the clock stamped prints plain, one typed in prints italic, one changed afterwards prints italic
                   with a dot. Entries recorded before this was added carry no mark.
+                  <br />
+                  <strong>Print blank sheet</strong> gives empty sheets for the week shown — same inclusive date
+                  and Monday-to-Sunday dates, six numbered rows each, but no names, times or totals — to fill in by
+                  hand. Set the page range to print a batch, starting wherever the pad already reaches.
                 </p>
+
+                {blankOpen && (
+                  <div className="blankrange">
+                    <div>
+                      <span className="lbl">Blank sheets from page</span>
+                      <input type="number" min="1" max="999" inputMode="numeric" value={blankFrom}
+                        aria-label="Blank sheets from page"
+                        onChange={(e) => setBlankFrom(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); doPrintBlankLogbook(); } }} />
+                    </div>
+                    <div>
+                      <span className="lbl">To page</span>
+                      <input type="number" min="1" max="999" inputMode="numeric" value={blankTo}
+                        aria-label="Blank sheets to page"
+                        onChange={(e) => setBlankTo(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); doPrintBlankLogbook(); } }} />
+                    </div>
+                    <button className="btn sm" onClick={doPrintBlankLogbook}>
+                      Print {blankPageNos.length} sheet{blankPageNos.length === 1 ? "" : "s"}
+                    </button>
+                    <button className="btn ghost sm" onClick={() => setBlankOpen(false)}>Cancel</button>
+                    <span className="note">
+                      Pages {blankRange.from}&ndash;{blankRange.to}, numbered{" "}
+                      <strong>{blankRange.from} of {blankRange.to}</strong>
+                      {blankPageNos.length > 1 && <> through <strong>{blankRange.to} of {blankRange.to}</strong></>}.
+                      {blankRange.asked > blankRange.to
+                        && ` Capped at ${BLANK_MAX_SHEETS} sheets a batch — print the rest in a second run.`}
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div className="sheetwrap" ref={logbookRef}>
-                {logbookPages.map((page, pi) => (
-                <div className="sheet logbook shadow" key={"pg" + pi}
-                  style={{ "--paper-width": "297mm", "--paper-height": "210mm" }}>
-                  <table className="hdr">
-                    <tbody>
-                      <tr>
-                        <td className="logoc" rowSpan={3}>
-                          {cfg.logo ? <img src={cfg.logo} alt="" /> : <span className="ph">{(cfg.co || "QM").slice(0, 2).toUpperCase()}</span>}
-                        </td>
-                        <td className="co" colSpan={2}>{cfg.co || DEF.co}</td>
-                      </tr>
-                      <tr><td className="lab" colSpan={2}><span className="k">Department:</span>{cfg.dept || DEF.dept}</td></tr>
-                      <tr><td className="lab" colSpan={2}><span className="k">Form Title:</span>{LOGBOOK_TITLE}</td></tr>
-                    </tbody>
-                  </table>
+                {logbookPages.map((page, pi) => renderLogbookSheet(page, pi, logbookPages.length))}
+              </div>
 
-                  <table className="flds">
-                    <tbody>
-                      <tr>
-                        <td className="fk">DEPARTMENT</td><td className="fv"><span className="ul">{cfg.logbookDept || DEF.logbookDept}</span></td>
-                        <td className="gap" />
-                        <td className="fk" style={{ width: "26mm" }}>PAGE NO</td><td className="fv"><span className="ul">{pi + 1} of {logbookPages.length}</span></td>
-                      </tr>
-                      <tr>
-                        <td className="fk">INCLUSIVE DATE</td><td className="fv"><span className="ul">{inclusiveLabel(logbookMonday)}</span></td>
-                        <td className="gap" /><td /><td />
-                      </tr>
-                    </tbody>
-                  </table>
-
-                  <table className="lg">
-                    <thead>
-                      <tr>
-                        <th rowSpan={2} className="cno">NO</th>
-                        <th rowSpan={2} className="cid">ID NO</th>
-                        <th rowSpan={2} className="cnm">EMPLOYEE NAME</th>
-                        <th rowSpan={2} className="cpd" />
-                        {logbookDays.map((d, i) => (
-                          <th key={i} colSpan={2}>{LOGBOOK_DAYS[i]}<span className="dsub">{shortDate(d)}</span></th>
-                        ))}
-                        <th rowSpan={2} className="ctot">TOTAL<br />DAYS<br />WORKED</th>
-                        <th rowSpan={2} className="ctot">TOTAL<br />OVERTIME<br />WORKED</th>
-                        <th rowSpan={2} className="csig">EMPLOYEES SIGNATURE</th>
-                      </tr>
-                      <tr>{logbookDays.map((_, i) => <Fragment key={i}><th>IN</th><th>OUT</th></Fragment>)}</tr>
-                    </thead>
-                    <tbody>
-                      {[...page, ...Array(Math.max(0, LOGBOOK_PER_PAGE - page.length)).fill(null)].map((emp, n) => {
-                        if (!emp) return (
-                          <Fragment key={"vacant" + n}>
-                            {["AM", "PM", "OT"].map((label, bi) => (
-                              <tr key={"vacant" + n + label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}`}>
-                                {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
-                                  <td rowSpan={3} className="cid" /><td rowSpan={3} className="cnm" /></>}
-                                <td className="cpd">{label}</td>
-                                {logbookDays.map((_, di) => <Fragment key={di}><td className="lgc" /><td className="lgc" /></Fragment>)}
-                                {bi === 0 && <><td rowSpan={3} className="ctot" /><td rowSpan={3} className="ctot" /><td rowSpan={3} className="csig" /></>}
-                              </tr>
-                            ))}
-                          </Fragment>
-                        );
-                        const recs = logbookDays.map((d) => recFor(emp.id, iso(d)));
-                        const daysWorked = recs.filter((r) => r.leave || r.holiday || SLOTS.some((sl) => r[sl.k])).length;
-                        const otTotal = recs.reduce((sum, r) => sum + otMinutes(r), 0);
-                        const bands = [
-                          { label: "AM", into: "amIn", out: "amOut", mer: "AM" },
-                          { label: "PM", into: "pmIn", out: "pmOut", mer: "PM" },
-                          { label: "OT", into: "otIn", out: "otOut", mer: "PM" },
-                        ];
-                        const mineRow = ownsLogRow(emp.id);
-                        return bands.map((b, bi) => (
-                          <tr key={emp.id + b.label} className={`${bi === 0 ? "bandtop" : ""}${n % 2 === 0 ? " shade" : ""}${mineRow ? " mine" : ""}`}>
-                            {bi === 0 && <><td rowSpan={3} className="cno">{pi * LOGBOOK_PER_PAGE + n + 1}</td>
-                              <td rowSpan={3} className="cid">{emp.id}</td>
-                              <td rowSpan={3} className="cnm">{emp.name || ""}</td></>}
-                            <td className="cpd">{b.label}</td>
-                            {logbookDays.map((d, di) => {
-                              const ds = iso(d), r = recs[di];
-                              return [b.into, b.out].map((slotKey) => {
-                                const shown = r[slotKey] ? disp(r[slotKey], false) : "";
-                                const label = `${emp.name || emp.id} ${LOGBOOK_DAYS[di]} ${b.label} ${slotKey.endsWith("In") ? "in" : "out"}`;
-                                return (
-                                <td key={ds + slotKey} className={"lgc " + (r.src && r.src[slotKey] ? r.src[slotKey] : "")}>
-                                  {mineRow ? (
-                                  <input
-                                    key={ds + slotKey + (r[slotKey] || "")}
-                                    defaultValue={shown}
-                                    aria-label={label}
-                                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); } }}
-                                    onBlur={async (e) => {
-                                      /* untouched box: never let a not-yet-loaded blank
-                                         be mistaken for the user clearing the field */
-                                      if (e.target.value === e.target.defaultValue) return;
-                                      const ok = await setLogTime(emp.id, ds, slotKey, e.target.value, b.mer);
-                                      if (!ok) e.target.value = shown;
-                                    }}
-                                  />
-                                  ) : (
-                                  /* Somebody else's time. A span rather than a button: the print
-                                     sanitiser drops buttons and strips role/tabindex/title, so this
-                                     keeps its text on paper while losing its interactivity there. */
-                                  <span
-                                    className="lgro"
-                                    role="button"
-                                    tabIndex={0}
-                                    title={`${emp.name || emp.id} — click to copy. Only they can edit this row.`}
-                                    aria-label={label}
-                                    onClick={() => copyLogTime(emp, di, b.label, slotKey, shown)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter" || e.key === " ") {
-                                        e.preventDefault();
-                                        copyLogTime(emp, di, b.label, slotKey, shown);
-                                      }
-                                    }}
-                                  >{shown}</span>
-                                  )}
-                                </td>
-                                );
-                              });
-                            })}
-                            {bi === 0 && <>
-                              <td rowSpan={3} className="ctot">{daysWorked || ""}</td>
-                              <td rowSpan={3} className="ctot">{otTotal ? fmtDur(otTotal) : ""}</td>
-                              <td rowSpan={3} className="csig">
-                                {emp.signature && emp.signatureOnLogbook === true
-                                  ? <img className="lgsig" src={emp.signature} alt="" /> : ""}
-                              </td>
-                            </>}
-                          </tr>
-                        ));
-                      })}
-                    </tbody>
-                  </table>
-
-                  {/* The logbook's own signatories, separate from the DTR's. Blank rules,
-                      signed by hand once the sheet is printed. */}
-                  <table className="sig lgsigrow">
-                    <tbody>
-                      <tr>
-                        <td className="ln"><span className="who">VERIFIED BY:</span><span className="line">DEPARTMENT MANAGER</span></td><td className="sp" />
-                        <td className="ln"><span className="who">REVIEWED BY:</span><span className="line">HR MANAGER</span></td><td className="sp" />
-                        <td className="ln"><span className="who">NOTED BY:</span><span className="line">TOP MANAGEMENT</span></td>
-                      </tr>
-                    </tbody>
-                  </table>
+              {/* The blank sheet stays mounted but off the page: it exists only to be
+                  cloned by the printer, so display:none sits on this wrapper and never
+                  on the node that gets cloned. */}
+              <div style={{ display: "none" }} aria-hidden="true">
+                <div className="sheetwrap" ref={blankLogbookRef}>
+                  {/* An empty page means every row takes the vacant branch, which never
+                      calls recFor — so no record ref is read here, whatever the static
+                      rule sees in the shared renderer. Passing each page's own number
+                      gives every sheet its PAGE NO and its continuing NO column. */}
+                  {/* eslint-disable-next-line react-hooks/refs */}
+                  {blankPageNos.map((no) => renderLogbookSheet([], no - 1, blankRange.to))}
                 </div>
-                ))}
               </div>
             </>
         )}
