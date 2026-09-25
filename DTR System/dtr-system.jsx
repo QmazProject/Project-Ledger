@@ -2752,7 +2752,7 @@ export default function DTRSystem({ onBack }) {
         dSum += dm; oSum += om;
         return {
           date: `${MON[d.getMonth()].slice(0, 3)} ${d.getDate()}`,
-          sun: d.getDay() === 0,
+          sun: d.getDay() === 0 && !sundayOn,
           leave: !!r.leave,
           holiday: !!r.holiday,
           times: SLOTS.map((s) => (r[s.k] ? disp(r[s.k], true) : "")),
@@ -3232,7 +3232,7 @@ export default function DTRSystem({ onBack }) {
                         <tr key={ds}>
                           <td className="dt dtrDateCell" onClick={() => setAttachmentOpenDate(ds)} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setAttachmentOpenDate(ds); } }} aria-label={`Supporting documents for ${ds}`}>
                             {MON[d.getMonth()].slice(0, 3)} {d.getDate()}
-                            {d.getDay() === 0 && <span className="sund"> SUN</span>}
+                            {d.getDay() === 0 && !sundayOn && <span className="sund"> SUN</span>}
                             <button type="button" className={`dtrAttachmentTrigger${dateAttachments.length ? " has" : ""}`} onClick={() => setAttachmentOpenDate(ds)} aria-label={`Supporting documents for ${ds}`} title="Add or manage supporting documents">
                               {dateAttachments.length ? dateAttachments.length : "+"}
                             </button>
