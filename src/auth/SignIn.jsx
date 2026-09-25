@@ -31,14 +31,17 @@ export default function SignIn() {
   const [notice, setNotice] = useState("");
   const [forgot, setForgot] = useState(false);
   const [captchaToken, setCaptchaToken] = useState("");
-  const [captchaEnabled, setCaptchaEnabled] = useState(true);
+  // null until security_settings answers. Starting at true rendered hCaptcha on
+  // every load and then removed it when an admin had it disabled.
+  const [captchaEnabled, setCaptchaEnabled] = useState(null);
   const captchaRef = useRef(null);
   const captchaSiteKey = import.meta.env.VITE_HCAPTCHA_SITE_KEY || import.meta.env.VITE_CAPTCHA_SITE_KEY;
 
   useEffect(() => {
     let alive = true;
     supabase?.from("security_settings").select("captcha_enabled").eq("id", 1).maybeSingle()
-      .then(({ data }) => { if (alive && data) setCaptchaEnabled(data.captcha_enabled !== false); });
+      .then(({ data }) => { if (alive) setCaptchaEnabled(data?.captcha_enabled !== false); },
+            () => { if (alive) setCaptchaEnabled(true); });
     return () => { alive = false; };
   }, []);
 
@@ -204,9 +207,7 @@ export default function SignIn() {
                         onExpire={() => setCaptchaToken("")} onError={() => setCaptchaToken("")} />
             </div> : captchaEnabled ? <div role="alert" style={{ marginBottom: 14, color: T.bad, fontSize: 12 }}>
               CAPTCHA site key is not configured.
-            </div> : <div role="status" style={{ marginBottom: 14, color: T.inkSoft, fontSize: 12 }}>
-              CAPTCHA is disabled by an administrator.
-            </div>}
+            </div> : null}
 
             <button type="submit" disabled={busy}
                     style={{

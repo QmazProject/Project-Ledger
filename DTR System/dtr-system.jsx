@@ -252,7 +252,6 @@ function buildDtrPdf(o) {
     if (r) {
       const base = mid(y, rowH, 8);
       ctext(cmid(0, 1), base, r.date, 8, false);
-      if (r.sun) ctext(cmid(0, 1), base - 6, "SUN", 5.6, true);
       if (r.leave || r.holiday) {
         ctext(cmid(1, 5), base, r.holiday ? "HOLIDAY" : "ON LEAVE", 8, true);
       } else {
@@ -1398,7 +1397,6 @@ const SHEET_CSS = `
 .sheet .dtr th{font-size:7.2pt;font-weight:bold;letter-spacing:0.25pt;padding:1.1mm 0.4mm;line-height:1.15}
 .sheet .dtr tbody td{height:7mm;font-size:8pt}
 .sheet .dtr td.dt{font-size:8pt}
-.sheet .dtr .sund{font-size:6pt;font-weight:bold;letter-spacing:0.3pt}
 .sheet .dtr td.leave{font-weight:bold;font-size:8pt;letter-spacing:1.2pt}
 .sheet .dtr td.num{font-size:8pt;font-weight:bold}
 .sheet .dtr td.actc{text-align:left;padding:0 1.6mm;font-size:7.8pt;line-height:1.25}
@@ -2752,7 +2750,6 @@ export default function DTRSystem({ onBack }) {
         dSum += dm; oSum += om;
         return {
           date: `${MON[d.getMonth()].slice(0, 3)} ${d.getDate()}`,
-          sun: d.getDay() === 0 && !sundayOn,
           leave: !!r.leave,
           holiday: !!r.holiday,
           times: SLOTS.map((s) => (r[s.k] ? disp(r[s.k], true) : "")),
@@ -3232,7 +3229,6 @@ export default function DTRSystem({ onBack }) {
                         <tr key={ds}>
                           <td className="dt dtrDateCell" onClick={() => setAttachmentOpenDate(ds)} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setAttachmentOpenDate(ds); } }} aria-label={`Supporting documents for ${ds}`}>
                             {MON[d.getMonth()].slice(0, 3)} {d.getDate()}
-                            {d.getDay() === 0 && !sundayOn && <span className="sund"> SUN</span>}
                             <button type="button" className={`dtrAttachmentTrigger${dateAttachments.length ? " has" : ""}`} onClick={() => setAttachmentOpenDate(ds)} aria-label={`Supporting documents for ${ds}`} title="Add or manage supporting documents">
                               {dateAttachments.length ? dateAttachments.length : "+"}
                             </button>
