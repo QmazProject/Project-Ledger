@@ -1,17 +1,19 @@
 import React, { useState, useEffect, useRef, useCallback, Fragment } from "react";
+import { flushSync } from "react-dom";
 import { supabase, isConfigured } from "../src/lib/supabase";
 import { WheelPicker, WheelPickerWrapper } from "@ncdai/react-wheel-picker";
 import "@ncdai/react-wheel-picker/style.css";
+import {
+  SLOTS, toMin, disp, parseTime, orderIssue, recordOrderIssue, otMinutes,
+  openOvernightOtDate, nextPunchSlot, landingPunchDate, periodOf, periodStartsWithEntries,
+} from "../src/lib/dtrTime";
+import { NO_SITE_KEY, siteKey, groupStaffBySite, pagesOf, canonicalSite } from "../src/lib/logbookGroups";
+import { normalizeRoster, saveRosterChanges, rebaseRoster, profileChanges } from "../src/lib/rosterSync";
+import { mergeQueuedYear, dayContent, describeYearConflicts } from "../src/lib/dtrYearSync";
+import { queuedBase } from "../src/lib/mergeSave";
+import { normalizeSettings, saveSettingsChanges, rebaseSettings, describeSettingsConflicts } from "../src/lib/settingsSync";
 
 /* ============================ constants ============================ */
-const SLOTS = [
-  { k: "amIn",  label: "AM in",  btn: "Time in",              sub: "Start of the morning",  mer: "AM" },
-  { k: "amOut", label: "AM out", btn: "Time out for lunch",   sub: "Break at noon",         mer: "AM" },
-  { k: "pmIn",  label: "PM in",  btn: "Time in from lunch",   sub: "Back before 1:00 PM",   mer: "PM" },
-  { k: "pmOut", label: "PM out", btn: "Time out for the day", sub: "End of regular hours",  mer: "PM" },
-  { k: "otIn",  label: "OT in",  btn: "Start overtime",       sub: "Overtime, regular day", mer: "PM" },
-  { k: "otOut", label: "OT out", btn: "End overtime",         sub: "Close out overtime",    mer: "PM" },
-];
 const MON = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const ADMIN_ID = "005582";
 const DTR_CONTROL_NO = "HRD.FL60.00 (06/24)";
@@ -36,52 +38,19 @@ const dtrPdfOverflows = (rows, paperSize, clearedRows) => {
   return bodyH > paper.height - 259;
 };
 const SCHED_DEF = { amStart: "08:00", amEnd: "12:00", pmStart: "13:00", pmEnd: "17:00" };
-const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF, logbookDept: "POD Office" };
+const DEF = { co: "QM BUILDERS", dept: "HUMAN RESOURCE", title: "DAILY TIME RECORD (STAFF)", logo: "", sched: SCHED_DEF };
 const LOGBOOK_TITLE = "STAFF DAILY TIME RECORD'S LOGBOOK";
-/* The logbook runs Monday to Sunday, as the printed form does. The inclusive
-   date it prints covers Monday to Saturday — the working week — while the
-   Sunday column stays on the sheet for the days someone did work one. */
+/* The logbook runs Monday to Sunday, as the printed form does, and its inclusive
+   date covers the same seven days. Sunday is always on the sheet — whether or not
+   anyone has turned Sunday on for their DTR — so a Sunday duty can be logged there. */
 const LOGBOOK_DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
 
 /* ============================ helpers ============================ */
 const p2 = (n) => String(n).padStart(2, "0");
 const iso = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
 const nowHM = () => { const d = new Date(); return `${p2(d.getHours())}:${p2(d.getMinutes())}`; };
-const toMin = (hm) => { if (!hm) return null; const a = hm.split(":").map(Number); return a[0] * 60 + a[1]; };
 const fmtDur = (m) => (!m || m <= 0 ? "0:00" : `${Math.floor(m / 60)}:${p2(m % 60)}`);
 
-function disp(hm, withMer) {
-  if (!hm) return "";
-  const a = hm.split(":").map(Number);
-  const mer = a[0] >= 12 ? "PM" : "AM";
-  let hh = a[0] % 12; if (hh === 0) hh = 12;
-  return `${hh}:${p2(a[1])}${withMer ? " " + mer : ""}`;
-}
-function parseTime(txt, merHint, slotKey) {
-  if (!txt) return "";
-  const t = txt.trim().toUpperCase();
-  const m = t.match(/^(\d{1,2})[:.\s]?(\d{2})?\s*(AM|PM|A|P)?$/);
-  if (!m) return null;
-  let h = +m[1];
-  const mi = m[2] ? +m[2] : 0;
-  if (h > 23 || mi > 59) return null;
-  /* Explicit AM/PM suffixes always win. A bare 12 in the AM-out field means
-     noon in normal timesheet shorthand. Otherwise the row's meridian hint
-     covers hours 1-11 whether or not a colon was typed, so "5:06" in a PM row
-     is 17:06 and not five in the morning; 0, 12 and 13-23 are already
-     unambiguous and are read as written. The wheel picker and the type=time
-     input send 24-hour values and pass no hint, so they come through unchanged. */
-  const mer = m[3]
-    ? (m[3][0] === "A" ? "AM" : "PM")
-    : slotKey === "amOut" && h === 12 && !t.includes(":")
-      ? "PM"
-    : t.includes(":")
-      ? (h >= 1 && h <= 11 ? merHint : null)
-      : h <= 12 ? merHint : null;
-  if (mer === "PM" && h < 12) h += 12;
-  if (mer === "AM" && h === 12) h = 0;
-  return `${p2(h)}:${p2(mi)}`;
-}
 /* ============================ PDF export ============================
    No PDF library is available here, so the file is written by hand.
    Helvetica is one of the 14 fonts every PDF reader has built in, so
@@ -633,38 +602,6 @@ function TimeWheelPicker({ value, onConfirm, onCancel }) {
   );
 }
 
-/* a punch can't fall before the last one recorded or after the next one */
-function orderIssue(r, key, t) {
-  const i = SLOTS.findIndex((s) => s.k === key);
-  if (i < 0 || !t) return null;
-  for (let j = i - 1; j >= 0; j--) {
-    if (r[SLOTS[j].k]) {
-      if (toMin(t) < toMin(r[SLOTS[j].k]))
-        return `${SLOTS[i].label} can't be earlier than ${SLOTS[j].label} (${disp(r[SLOTS[j].k], true)})`;
-      break;
-    }
-  }
-  for (let j = i + 1; j < SLOTS.length; j++) {
-    if (r[SLOTS[j].k]) {
-      if (toMin(t) > toMin(r[SLOTS[j].k]))
-        return `${SLOTS[i].label} can't be later than ${SLOTS[j].label} (${disp(r[SLOTS[j].k], true)})`;
-      break;
-    }
-  }
-  return null;
-}
-
-/* Validate every filled punch after a proposed edit. Checking only the edited
-   value against the current neighbors can trap a user in an already-invalid
-   day: correcting AM in is blocked because the old AM out is still earlier. */
-function recordOrderIssue(r) {
-  for (const slot of SLOTS) {
-    const issue = orderIssue(r, slot.k, r[slot.k]);
-    if (issue) return issue;
-  }
-  return null;
-}
-
 /* regular hours are counted only inside the scheduled window, and capped at its length */
 const overlap = (a, b, lo, hi) => (!a || !b ? 0 : Math.max(0, Math.min(toMin(b), hi) - Math.max(toMin(a), lo)));
 const schedCap = (s) => Math.max(0, toMin(s.amEnd) - toMin(s.amStart)) + Math.max(0, toMin(s.pmEnd) - toMin(s.pmStart));
@@ -677,7 +614,6 @@ function dayMinutes(r, sched) {
     overlap(r.pmIn, r.pmOut, toMin(s.pmStart), toMin(s.pmEnd));
   return Math.min(t, schedCap(s));
 }
-const otMinutes = (r) => (r.otIn && r.otOut ? Math.max(0, toMin(r.otOut) - toMin(r.otIn)) : 0);
 
 /* The screen always works these out live, so what you see is never a stale number. They are
    also written onto the stored day so the totals sit in Supabase next to the punches that
@@ -692,23 +628,16 @@ function stampTotals(rec, sched) {
   return true;
 }
 
-/* payroll periods run 28 -> 12 and 13 -> 27 */
-function periodOf(d) {
-  const y = d.getFullYear(), m = d.getMonth(), day = d.getDate();
-  if (day >= 28) return { s: new Date(y, m, 28), e: new Date(y, m + 1, 12) };
-  if (day <= 12) return { s: new Date(y, m - 1, 28), e: new Date(y, m, 12) };
-  return { s: new Date(y, m, 13), e: new Date(y, m, 27) };
-}
 const prevPeriod = (p) => { const d = new Date(p.s); d.setDate(d.getDate() - 1); return periodOf(d); };
 const periodLabel = (p) => `${MON[p.s.getMonth()]} ${p.s.getDate()} - ${MON[p.e.getMonth()]} ${p.e.getDate()}, ${p.e.getFullYear()}`;
 function periodDays(p) { const out = []; const d = new Date(p.s); while (d <= p.e) { out.push(new Date(d)); d.setDate(d.getDate() + 1); } return out; }
 const mondayOf = (d) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const wd = (x.getDay() + 6) % 7; x.setDate(x.getDate() - wd); return x; };
 const addDays = (d, n) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate() + n); return x; };
 const weekDates = (monday) => Array.from({ length: 7 }, (_, i) => addDays(monday, i));
-/* Monday to Saturday: the span the form's INCLUSIVE DATE line describes */
+/* Monday to Sunday: the span the form's INCLUSIVE DATE line describes */
 const shortDate = (d) => `${d.getMonth() + 1}/${d.getDate()}/${String(d.getFullYear()).slice(-2)}`;
 const inclusiveLabel = (monday) => {
-  const a = monday, b = addDays(monday, 5);
+  const a = monday, b = addDays(monday, 6);
   const same = a.getMonth() === b.getMonth();
   return same
     ? `${MON[a.getMonth()]} ${a.getDate()}\u2013${b.getDate()}, ${b.getFullYear()}`
@@ -741,6 +670,7 @@ const lsSet = (key, val) => {
   try { window.localStorage.setItem(LOCAL_PREFIX + key, JSON.stringify(val)); return true; }
   catch { return false; }
 };
+const lsRemove = (key) => { try { window.localStorage.removeItem(LOCAL_PREFIX + key); } catch { /* unavailable */ } };
 const pendingKeys = () => { const v = lsGet(PENDING_KEY, []); return Array.isArray(v) ? v : []; };
 const markPending = (key, yes) => {
   const next = pendingKeys().filter((k) => k !== key);
@@ -770,19 +700,55 @@ async function sGet(key, fb) {
       }
       if (!error && data) {
         logRevisions.set(key, Number(data.revision ?? 0));
+        syncedCopies.set(key, { value: cloneValue(data.payload), revision: Number(data.revision ?? 0) });
         lsSet(key, data.payload);
         return data.payload;
       }
-      if (!error) logRevisions.set(key, 0); /* row absent: a first write creates it */
       if (!error) {
-        /* nothing stored yet: seed the cloud from whatever this device already has */
+        logRevisions.set(key, 0); /* row absent: a first write creates it */
+        syncedCopies.set(key, { value: cloneValue(fb), revision: 0 });
+        /* Nothing stored yet. Whatever this device already has is queued, to be added by
+           the merging reconnect save — never pushed from here, since a read must not write. */
         const local = lsGet(key, fb);
-        await cloudPut(key, local);
+        if (hasContent(local)) queueOffline(key, local);
         return local;
       }
     } catch { /* fall through to the device copy */ }
   }
-  return lsGet(key, fb);
+  /* Unreachable. The device copy is a copy the cloud once held, so it is a true merge
+     base; its revision is unknown, and -1 makes the first write fetch the current row. */
+  const local = lsGet(key, fb);
+  if (!syncedCopies.has(key)) syncedCopies.set(key, { value: cloneValue(local), revision: -1 });
+  return local;
+}
+
+const cloneValue = (v) => JSON.parse(JSON.stringify(v === undefined ? null : v));
+const hasContent = (v) => !!v && typeof v === "object" && Object.keys(v).length > 0;
+
+/* The copy of each row this device last read from, or wrote to, the cloud — the base an
+   offline edit is merged against. Kept in memory; written to the device only when a
+   row goes offline, next to the edited copy (`<key>:base`). */
+const syncedCopies = new Map();
+const baseKeyOf = (key) => `${key}:base`;
+const backupKeyOf = (key) => `${key}:unsynced-backup`;
+
+/* Keep an edit that could not reach the cloud, together with the copy it was made
+   against, so the reconnect can merge it instead of sending a stale whole row. */
+function queueOffline(key, val) {
+  if (!pendingKeys().includes(key) && syncedCopies.has(key)) lsSet(baseKeyOf(key), syncedCopies.get(key));
+  if (!lsSet(key, val)) return "fail";
+  markPending(key, true);
+  return "local";
+}
+
+/* One save at a time per stored row, so a reconnect merge and a live edit of the same
+   year cannot interleave — the edit would otherwise go out on top of a copy the merge
+   had just replaced. */
+const rowLocks = new Map();
+function withRowLock(key, fn) {
+  const run = (rowLocks.get(key) || Promise.resolve()).then(fn, fn);
+  rowLocks.set(key, run.catch(() => {}));
+  return run;
 }
 
 /* Revisions of the year rows this device has read, so a save can say which copy it
@@ -810,28 +776,50 @@ async function cloudPutLog(key, val) {
     console.error("DTR cloud sync failed", { key, message: error.message, code: error.code });
     return "fail";
   }
-  if (data && data.ok) { logRevisions.set(key, Number(data.revision)); return "synced"; }
+  if (data && data.ok) {
+    logRevisions.set(key, Number(data.revision));
+    syncedCopies.set(key, { value: cloneValue(val), revision: Number(data.revision) });
+    return "synced";
+  }
   if (data && data.conflict) { logRevisions.set(key, Number(data.revision)); return "conflict"; }
   return "fail";
 }
 
-/* "synced" = in the cloud, "local" = safe on this device but not sent yet, "fail" = nowhere */
-async function sSet(key, val, opts) {
-  const savedLocally = lsSet(key, val);
-  if (cloudReady()) {
-    try {
-      if (opts && opts.revisionChecked) {
-        const state = await cloudPutLog(key, val);
-        if (state === "synced") { markPending(key, false); return "synced"; }
-        /* A conflict is not an outage: the row moved on, so the caller must re-read
-           and re-apply rather than queue this copy for a later blind retry. */
-        if (state === "conflict") return "conflict";
-      } else if (await cloudPut(key, val)) { markPending(key, false); return "synced"; }
-    } catch { /* keep the device copy and retry later */ }
+/* A merged write for the reconnect: resolves {ok, revision} or {conflict, payload,
+   revision}; throws when it cannot be made. No plain-upsert fallback — a queued offline
+   row is only ever written under the revision check. */
+async function revisionWrite(key, payload, expectedRevision, emptyValue) {
+  const { data, error } = await supabase.rpc("dtr_save_year", {
+    p_key: key, p_payload: payload, p_expected_revision: expectedRevision,
+  });
+  if (error) {
+    lastCloudError = error.message || lastCloudError;
+    console.error("DTR merged save failed", { key, message: error.message, code: error.code });
+    throw new Error(lastCloudError || "save failed");
   }
-  if (!savedLocally) return "fail";
-  markPending(key, true);
-  return "local";
+  if (data && data.ok) return { ok: true, revision: Number(data.revision) };
+  if (data && data.conflict) {
+    const stored = data.payload && typeof data.payload === "object" && !Array.isArray(data.payload) ? data.payload : emptyValue;
+    return { conflict: true, payload: stored, revision: Number(data.revision) };
+  }
+  throw new Error("save returned no result");
+}
+
+/* A year row. "synced" = in the cloud, "local" = safe on this device but not sent yet,
+   "conflict" = the row moved on (the caller re-reads and re-applies), "fail" = nowhere.
+   A row already waiting on this device is never written directly: its queued changes
+   and this one go up together through the merging reconnect save. The device copy is
+   only replaced once the outcome is known, so it stays a true copy of the cloud or of
+   the queued edit — never of a write that was refused. */
+async function sSet(key, val) {
+  if (cloudReady() && !pendingKeys().includes(key)) {
+    try {
+      const state = await cloudPutLog(key, val);
+      if (state === "synced") { lsSet(key, val); return "synced"; }
+      if (state === "conflict") return "conflict";
+    } catch { /* keep it on the device */ }
+  }
+  return queueOffline(key, val);
 }
 
 /* Identity fields also have a normalized Supabase record so a developer can correct an
@@ -849,26 +837,133 @@ async function getDtrProfiles() {
   } catch { return null; }
 }
 
-async function saveDtrProfiles(roster) {
+/* Only the employees a roster save actually added, renamed, re-roled or removed. It used
+   to upsert this device's whole copy and delete every profile missing from it, which let
+   a stale copy delete employees another device had just added. */
+async function syncDtrProfiles({ upsert, remove }) {
   if (!cloudReady()) return false;
-  const rows = roster
-    .map((e) => ({ employee_id: String(e.id || "").trim(), name: String(e.name || "").trim(), role: e.role === "admin" ? "admin" : "viewer" }))
-    .filter((e) => e.employee_id);
   try {
-    if (rows.length) {
-      const { error } = await supabase.from(DTR_PROFILE_TABLE).upsert(rows, { onConflict: "employee_id" });
+    if (upsert.length) {
+      const { error } = await supabase.from(DTR_PROFILE_TABLE).upsert(upsert, { onConflict: "employee_id" });
       if (error) return false;
     }
-    const { data: existing, error: readError } = await supabase.from(DTR_PROFILE_TABLE).select("employee_id");
-    if (readError) return false;
-    const keep = new Set(rows.map((e) => e.employee_id));
-    const removed = (existing || []).map((e) => e.employee_id).filter((id) => id && !keep.has(id));
-    if (removed.length) {
-      const { error } = await supabase.from(DTR_PROFILE_TABLE).delete().in("employee_id", removed);
+    if (remove.length) {
+      const { error } = await supabase.from(DTR_PROFILE_TABLE).delete().in("employee_id", remove);
       if (error) return false;
     }
     return true;
   } catch { return false; }
+}
+
+/* ---- the employee roster ----
+   One list shared by every device, saved through src/lib/rosterSync.js: only this
+   device's changes, applied to the latest stored copy under the same revision check
+   the year rows use (dtr_save_year). The base — the copy this device last synced, with
+   its revision — is kept on the device too, so edits saved while offline can still be
+   diffed and merged after a reload instead of being sent as a stale whole list. */
+const ROSTER_KEY = "dtr:roster";
+const ROSTER_BASE_KEY = "dtr:roster:base";
+const ROSTER_BACKUP_KEY = "dtr:roster:unsynced-backup";
+
+/* Resolves {ok, revision} or {conflict, payload, revision}; throws when the write could
+   not be made, so the caller keeps the change queued on the device. */
+async function rosterWrite(payload, expectedRevision) {
+  const { data, error } = await supabase.rpc("dtr_save_year", {
+    p_key: ROSTER_KEY, p_payload: payload, p_expected_revision: expectedRevision,
+  });
+  if (error) {
+    /* a project without the safety migration has no revision to check, as for the year rows */
+    if (rpcMissing(error) && await cloudPut(ROSTER_KEY, payload)) return { ok: true, revision: expectedRevision };
+    lastCloudError = error.message || lastCloudError;
+    console.error("DTR roster sync failed", { message: error.message, code: error.code });
+    throw new Error(lastCloudError || "roster save failed");
+  }
+  if (data && data.ok) return { ok: true, revision: Number(data.revision) };
+  if (data && data.conflict) return { conflict: true, payload: Array.isArray(data.payload) ? data.payload : [], revision: Number(data.revision) };
+  throw new Error("roster save returned no result");
+}
+
+/* ---- shared settings (`dtr:cfg`) ----
+   Saved like the roster: only this device's changes, merged into the latest stored
+   settings under the revision check (src/lib/settingsSync.js). Offline edits wait on
+   the device with the copy they were made against. */
+const CFG_KEY = "dtr:cfg";
+
+/* The settings to start from (defaults filled in, as the screen has always read them)
+   and the base the next save is diffed against. Loading never writes. */
+async function loadCfgForBoot(defaults) {
+  const kept = queuedBase(lsGet(baseKeyOf(CFG_KEY), null));
+  const storedBase = kept ? { value: normalizeSettings(kept.value, defaults), revision: kept.revision } : null;
+  if (pendingKeys().includes(CFG_KEY)) {
+    /* changes saved here while offline: kept, and merged on the next save */
+    if (storedBase) return { value: normalizeSettings(lsGet(CFG_KEY, null), defaults), base: storedBase };
+    /* queued by the old whole-object save, with nothing to merge against: set aside */
+    lsSet(backupKeyOf(CFG_KEY), lsGet(CFG_KEY, null));
+    markPending(CFG_KEY, false);
+  }
+  if (!cloudReady()) {
+    const value = normalizeSettings(lsGet(CFG_KEY, null), defaults);
+    return { value, base: { value, revision: 0 } };
+  }
+  try {
+    let { data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload, revision").eq("storage_key", CFG_KEY).maybeSingle();
+    if (error && /revision/i.test(error.message || "")) {
+      ({ data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload").eq("storage_key", CFG_KEY).maybeSingle());
+    }
+    if (!error) {
+      if (!data) {
+        /* nothing stored yet: whatever this device has is added by the first real save */
+        return { value: normalizeSettings(lsGet(CFG_KEY, null), defaults), base: { value: normalizeSettings(null, defaults), revision: 0 } };
+      }
+      const value = normalizeSettings(data.payload, defaults);
+      lsSet(CFG_KEY, data.payload);
+      return { value, base: { value, revision: Number(data.revision ?? 0) } };
+    }
+  } catch { /* offline: the device copy stands in */ }
+  const value = storedBase ? storedBase.value : normalizeSettings(lsGet(CFG_KEY, null), defaults);
+  return { value, base: storedBase || { value, revision: -1 } };
+}
+
+/* The roster to start from, and the base its next save is diffed against. */
+async function loadRosterForBoot() {
+  const kept = lsGet(ROSTER_BASE_KEY, null);
+  const storedBase = kept && Array.isArray(kept.roster)
+    ? { roster: normalizeRoster(kept.roster), revision: Number(kept.revision) || 0 } : null;
+  if (pendingKeys().includes(ROSTER_KEY)) {
+    /* changes saved here while offline: kept, and merged on the next save */
+    if (storedBase) return { list: lsGet(ROSTER_KEY, storedBase.roster), base: storedBase };
+    /* queued by the old whole-list save, with nothing to diff it against: set aside,
+       never written over whatever the cloud holds now */
+    lsSet(ROSTER_BACKUP_KEY, lsGet(ROSTER_KEY, []));
+    markPending(ROSTER_KEY, false);
+  }
+  if (!cloudReady()) {
+    /* no cloud configured: this device holds the only copy */
+    const list = lsGet(ROSTER_KEY, []);
+    return { list, base: { roster: normalizeRoster(list), revision: 0 } };
+  }
+  try {
+    let { data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload, revision").eq("storage_key", ROSTER_KEY).maybeSingle();
+    /* before the safety migration there is no revision column */
+    if (error && /revision/i.test(error.message || "")) {
+      ({ data, error } = await supabase.from(DTR_STORAGE_TABLE).select("payload").eq("storage_key", ROSTER_KEY).maybeSingle());
+    }
+    if (!error) {
+      if (!data) {
+        /* nothing stored yet: whatever this device has is added by the first save */
+        return { list: lsGet(ROSTER_KEY, []), base: { roster: [], revision: 0 } };
+      }
+      const list = Array.isArray(data.payload) ? data.payload : [];
+      const base = { roster: normalizeRoster(list), revision: Number(data.revision ?? 0) };
+      lsSet(ROSTER_KEY, list);
+      lsSet(ROSTER_BASE_KEY, base);
+      return { list, base };
+    }
+  } catch { /* offline: the device copy stands in */ }
+  /* Offline. The device copy is a list the cloud once held, so it is a true base; its
+     revision is unknown, and -1 makes the first write fetch the current copy first. */
+  const list = lsGet(ROSTER_KEY, storedBase ? storedBase.roster : []);
+  return { list, base: storedBase || { roster: normalizeRoster(list), revision: -1 } };
 }
 
 const attachmentDate = (value) => String(value || "").slice(0, 10);
@@ -947,14 +1042,50 @@ function mergeDtrProfiles(roster, profiles) {
 }
 
 /* push anything that was written while the cloud was unreachable */
-async function flushPending() {
+/* Reconnect: every queued row is merged into the latest cloud copy, never re-sent whole.
+   The roster and settings have their own merging saves (saveRosterNow, saveCfgNow),
+   which the same sync loop runs. `hooks.onMerged` runs inside the row's lock so the open
+   screen moves onto the merged year before any further edit to it is saved. */
+async function flushPending(hooks) {
   if (!cloudReady()) return;
   for (const key of pendingKeys()) {
-    const val = lsGet(key, null);
-    if (val === null) { markPending(key, false); continue; }
-    try { if (await cloudPut(key, val)) markPending(key, false); else break; }
-    catch { break; }
+    if (key === ROSTER_KEY || key === CFG_KEY) continue;
+    if (!key.startsWith("dtr:log:")) {
+      /* nothing else is queued by this version; an unknown row is kept aside, not sent blind */
+      lsSet(backupKeyOf(key), lsGet(key, null));
+      markPending(key, false);
+      continue;
+    }
+    const outcome = await withRowLock(key, () => flushYear(key, hooks));
+    if (outcome === "offline") break;
   }
+}
+
+async function flushYear(key, hooks) {
+  const local = lsGet(key, null);
+  if (local === null) { markPending(key, false); lsRemove(baseKeyOf(key)); return "done"; }
+  const res = await mergeQueuedYear(local, lsGet(baseKeyOf(key), null), (payload, rev) => revisionWrite(key, payload, rev, {}), hooks);
+  if (res.state === "set-aside") {
+    /* queued by an older version, with no copy to merge against: kept on the device for
+       review and never uploaded, and the screen goes back to the cloud copy */
+    lsSet(backupKeyOf(key), local);
+    markPending(key, false);
+    hooks.onMerged({ key, state: "set-aside" });
+    return "done";
+  }
+  if (res.state === "saved") {
+    lsSet(key, res.value);
+    syncedCopies.set(key, { value: cloneValue(res.value), revision: res.base.revision });
+    logRevisions.set(key, res.base.revision);
+  }
+  if (res.state === "saved" || res.state === "no-change") {
+    markPending(key, false);
+    lsRemove(baseKeyOf(key));
+    hooks.onMerged({ key, state: res.state, value: res.value, conflicts: res.conflicts || [] });
+    return "done";
+  }
+  /* offline, refused or still colliding: stays queued with its base, retried later */
+  return res.state === "offline" ? "offline" : "kept";
 }
 
 /* ---- passcodes ----
@@ -1035,6 +1166,34 @@ async function storedLogYears(id) {
     } catch { /* offline: the device copies stand in */ }
   }
   return [...years].sort((a, b) => a - b);
+}
+
+/* This employee's stored years, for display only. Unlike sGet it never seeds a missing
+   row, never records a revision and never rewrites the device copy, so looking cannot
+   write. A key still waiting to sync is newer on this device, so the device copy stands
+   in for it, as it does for any year the cloud could not return. */
+async function storedLogPayloads(id, years) {
+  const out = {};
+  if (!years.length) return out;
+  if (cloudReady()) {
+    try {
+      const { data, error } = await supabase
+        .from(DTR_STORAGE_TABLE).select("storage_key, payload").in("storage_key", years.map((y) => logKey(id, y)));
+      if (!error && data) {
+        data.forEach((row) => {
+          const y = years.find((yy) => logKey(id, yy) === row.storage_key);
+          if (y && row.payload && typeof row.payload === "object") out[y] = row.payload;
+        });
+      }
+    } catch { /* offline: the device copies stand in */ }
+  }
+  const pending = pendingKeys();
+  years.forEach((y) => {
+    if (out[y] && !pending.includes(logKey(id, y))) return;
+    const local = lsGet(logKey(id, y), null);
+    if (local && typeof local === "object") out[y] = local;
+  });
+  return out;
 }
 
 /* ============================ styles ============================ */
@@ -1871,6 +2030,13 @@ export default function DTRSystem({ onBack }) {
   const [note, setNote] = useState("");
   const [punchDate, setPunchDate] = useState(iso(new Date()));
   const [weekStart, setWeekStart] = useState(() => iso(mondayOf(new Date())));
+  /* which department's logbook is shown: a site key, LOGBOOK_ALL, or null for "my own site" */
+  const [logbookDeptKey, setLogbookDeptKey] = useState(null);
+  /* Printing the filled logbook asks which of the three right-hand columns to print.
+     A column answered "no" prints empty, to be filled in by hand; nothing stored changes. */
+  const [logbookPrintAsk, setLogbookPrintAsk] = useState(false);
+  const [logbookPrintCols, setLogbookPrintCols] = useState({ days: true, ot: true, sig: true });
+  const [logbookOmit, setLogbookOmit] = useState({ days: false, ot: false, sig: false });
   /* Padding rows the user has chosen to clear, keyed by employee and cut-off so
      switching either shows the right set without an effect to reset it. Held in
      component state only: this is a presentation choice for one printout, not a
@@ -1926,7 +2092,16 @@ export default function DTRSystem({ onBack }) {
   const loadedYears = useRef(new Set());
   const pinRef = useRef(null);
   const timers = useRef({});
-  const firstRun = useRef(true);
+  /* the roster as last synced with storage ({roster, revision}), what is on screen now,
+     and the chain that keeps saves from overlapping */
+  const rosterBase = useRef(null);
+  const rosterNow = useRef([]);
+  const rosterQueue = useRef(Promise.resolve());
+  /* the same three for the shared settings, and the schedule the reconnect merge uses */
+  const cfgBase = useRef(null);
+  const cfgNow = useRef(null);
+  const cfgQueue = useRef(Promise.resolve());
+  const schedNow = useRef(SCHED_DEF);
 
   const bump = () => forceTick((n) => n + 1);
   const sched = cfg.sched || SCHED_DEF;
@@ -1941,13 +2116,127 @@ export default function DTRSystem({ onBack }) {
   const isAdmin = !roster.some((r) => r.id) || !!(actorEmp && actorEmp.role === "admin");
   const canEdit = !viewOnly;
   const say = useCallback((m) => { setToast(m); setTimeout(() => setToast(""), 2800); }, []);
-  const flashSaved = (which) => { setFlash(which); setTimeout(() => setFlash(""), 1400); };
+
+  /* Every roster edit — Settings, My DTR's project site, the Sunday tickbox, a passcode —
+     only changes the list; saveRosterNow is the one place it is written. Saves run one at
+     a time, each diffing what is on screen against the base it last synced. */
+  const saveRosterNow = useCallback(() => {
+    rosterQueue.current = rosterQueue.current.then(async () => {
+      const current = rosterNow.current, base = rosterBase.current;
+      if (!base) return; /* never write a roster this device has not read */
+      const ids = normalizeRoster(current).map((e) => e.id).filter(Boolean);
+      if (new Set(ids).size !== ids.length) { say("Two employees share the same ID"); return; }
+      if (!cloudReady()) {
+        const keep = normalizeRoster(current);
+        lsSet(ROSTER_KEY, keep);
+        markPending(ROSTER_KEY, true);
+        rosterBase.current = { roster: keep, revision: 0 };
+        setSaveState("local");
+        setFlash("roster"); setTimeout(() => setFlash(""), 1400);
+        return;
+      }
+      const res = await saveRosterChanges(base, current, rosterWrite);
+      if (res.state === "no-change") { if (pendingKeys().includes(ROSTER_KEY)) markPending(ROSTER_KEY, false); return; }
+      if (res.state === "saved") {
+        rosterBase.current = res.base;
+        lsSet(ROSTER_BASE_KEY, res.base);
+        lsSet(ROSTER_KEY, res.roster);
+        markPending(ROSTER_KEY, false);
+        await syncDtrProfiles(profileChanges(res.ops, res.roster));
+        /* other devices' changes came in: the screen moves onto the stored list */
+        if (res.merged || res.conflicts.length || res.dropped.length) setRoster((now) => rebaseRoster(res.roster, res.submitted, now));
+        if (res.conflicts.length) {
+          const c = res.conflicts[0];
+          say(`${c.name || "An employee"} was changed on another device first — that version was kept. Check it and edit again if needed.`);
+        } else if (res.dropped.length) {
+          say(`${res.dropped[0].name || "An employee"} was removed on another device, so that change was not saved.`);
+        }
+        setSaveState("synced");
+        setSyncError("");
+        setFlash("roster"); setTimeout(() => setFlash(""), 1400);
+        return;
+      }
+      /* offline, refused, or still colliding after retries: the change waits on this
+         device, and the base stays where it was so the retry merges it the same way */
+      lsSet(ROSTER_KEY, res.submitted);
+      markPending(ROSTER_KEY, true);
+      setSaveState("local");
+      setSyncError(lastCloudError);
+    }).catch((err) => { console.error("DTR roster save failed", err); });
+  }, [say]);
+
+  /* Settings: the one place `dtr:cfg` is written. Only this device's changes, merged
+     into the latest stored settings; saves run one at a time. */
+  const saveCfgNow = useCallback(() => {
+    cfgQueue.current = cfgQueue.current.then(async () => {
+      const current = cfgNow.current, base = cfgBase.current;
+      if (!base || !current) return; /* never write settings this device has not read */
+      if (!cloudReady()) {
+        const value = normalizeSettings(current, DEF);
+        if (JSON.stringify(value) === JSON.stringify(base.value)) return;
+        lsSet(CFG_KEY, value);
+        markPending(CFG_KEY, true);
+        cfgBase.current = { value, revision: 0 };
+        setSaveState("local");
+        setFlash("cfg"); setTimeout(() => setFlash(""), 1400);
+        return;
+      }
+      const res = await saveSettingsChanges(base, current, (payload, rev) => revisionWrite(CFG_KEY, payload, rev, {}), { defaults: DEF });
+      if (res.state === "no-change") {
+        if (pendingKeys().includes(CFG_KEY)) { markPending(CFG_KEY, false); lsRemove(baseKeyOf(CFG_KEY)); }
+        return;
+      }
+      if (res.state === "saved") {
+        cfgBase.current = res.base;
+        lsSet(CFG_KEY, res.value);
+        markPending(CFG_KEY, false);
+        lsRemove(baseKeyOf(CFG_KEY));
+        /* another admin's changes came in: the screen moves onto the stored settings */
+        if (res.merged || res.conflicts.length) setCfg((now) => rebaseSettings(res.value, res.submitted, normalizeSettings(now, DEF)));
+        if (res.conflicts.length) say(describeSettingsConflicts(res.conflicts));
+        setSaveState("synced");
+        setSyncError("");
+        setFlash("cfg"); setTimeout(() => setFlash(""), 1400);
+        return;
+      }
+      /* offline, refused, or still colliding: waits on this device with its base */
+      if (!pendingKeys().includes(CFG_KEY)) lsSet(baseKeyOf(CFG_KEY), base);
+      lsSet(CFG_KEY, res.submitted);
+      markPending(CFG_KEY, true);
+      setSaveState("local");
+      setSyncError(lastCloudError);
+    }).catch((err) => { console.error("DTR settings save failed", err); });
+  }, [say]);
 
   /* ---- anything punched while the cloud was unreachable goes up on reconnect ---- */
   useEffect(() => {
     let alive = true;
     const sync = async () => {
-      await flushPending();
+      const conflicts = [];
+      let setAside = false;
+      await flushPending({
+        finalizeDay: (day) => stampTotals(day, schedNow.current),
+        validateDay: (day) => recordOrderIssue(day, schedNow.current.amStart),
+        /* runs inside the row's lock: the open screen moves onto the merged year before
+           any further edit to that year is saved */
+        onMerged: (r) => {
+          if (r.state === "saved" && loadedYears.current.has(r.key)) {
+            logsRef.current[r.key] = cloneValue(r.value);
+            forceTick((n) => n + 1);
+          } else if (r.state !== "saved") {
+            /* nothing merged here: read the cloud copy afresh the next time it is shown */
+            loadedYears.current.delete(r.key);
+            delete logsRef.current[r.key];
+            forceTick((n) => n + 1);
+          }
+          if (r.conflicts) conflicts.push(...r.conflicts);
+          if (r.state === "set-aside") setAside = true;
+        },
+      });
+      if (conflicts.length) say(describeYearConflicts(conflicts));
+      else if (setAside) say("Offline DTR changes from an older version were kept on this device for review, not uploaded.");
+      if (pendingKeys().includes(ROSTER_KEY) && cloudReady()) { saveRosterNow(); await rosterQueue.current; }
+      if (pendingKeys().includes(CFG_KEY) && cloudReady()) { saveCfgNow(); await cfgQueue.current; }
       if (alive) {
         setSaveState(pendingKeys().length ? "local" : "synced");
         setSyncError(pendingKeys().length ? lastCloudError : "");
@@ -1967,14 +2256,17 @@ export default function DTRSystem({ onBack }) {
       window.removeEventListener("online", sync);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [saveRosterNow, saveCfgNow, say]);
 
   /* ---- boot ---- */
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [r, c, profiles] = await Promise.all([sGet("dtr:roster", []), sGet("dtr:cfg", null), getDtrProfiles()]);
+      const [bootRosterRead, bootCfgRead, profiles] = await Promise.all([loadRosterForBoot(), loadCfgForBoot(DEF), getDtrProfiles()]);
       if (!alive) return;
+      rosterBase.current = bootRosterRead.base;
+      cfgBase.current = bootCfgRead.base;
+      const r = bootRosterRead.list;
       const rr = Array.isArray(r) ? r : [];
       const withRoles = rr.map((e) => ({ ...e, role: e.role === "admin" ? "admin" : "viewer" }));
       /* a roster saved before roles existed still needs one admin, or nobody could reach Settings */
@@ -1994,7 +2286,8 @@ export default function DTRSystem({ onBack }) {
       const savedEmployee = bootRoster.find((e) => e.id && e.id === savedEmployeeId);
       const validSavedView = ["punch", "dtr", "logbook", "settings"].includes(savedView);
       setRoster(bootRoster.length ? bootRoster : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, signatureOnLogbook: false, sundayPeriods: [], role: "admin" }]);
-      setCfg(Object.assign({}, DEF, c || {}));
+      const bootCfg = bootCfgRead.value;
+      setCfg(bootCfg);
       if (savedEmployee && validSavedView) {
         setMe(savedEmployee);
         setActor(null);
@@ -2004,6 +2297,9 @@ export default function DTRSystem({ onBack }) {
         setPunchDate(iso(new Date()));
         setNote("");
         await ensureLog(savedEmployee.id, new Date().getFullYear(), SCHED_DEF);
+        const bootSched = bootCfg.sched || SCHED_DEF;
+        setPunchDate(await landingPunchDate(iso(new Date()), nowHM(), bootSched.amStart,
+          (y) => ensureLog(savedEmployee.id, y, bootSched)));
         setView(savedView);
       } else {
         setView(bootRoster.length ? "lock" : "settings");
@@ -2032,39 +2328,20 @@ export default function DTRSystem({ onBack }) {
   }, [view]);
 
   /* ---- auto-save roster + header ---- */
+  useEffect(() => { rosterNow.current = roster; }, [roster]);
   useEffect(() => {
     if (!ready) return;
     clearTimeout(timers.current.roster);
-    timers.current.roster = setTimeout(async () => {
-        const keep = roster
-        .map((e) => ({ id: (e.id || "").trim(), name: (e.name || "").trim(), position: (e.position || "").trim(), site: (e.site || "").trim(), photo: e.photo || "", signature: e.signature || "", signatureEnabled: e.signatureEnabled === true, signatureOnLogbook: e.signatureOnLogbook === true, signatureX: Number(e.signatureX) || 0, signatureY: Number(e.signatureY) || 0, signatureScale: Number(e.signatureScale) || 1, role: e.role === "admin" ? "admin" : "viewer",
-           /* carried through explicitly: dropping these on an unrelated roster edit would
-              silently unlock every account that had a passcode */
-           pinHash: e.pinHash || "", pinSalt: e.pinSalt || "", pinIter: Number(e.pinIter) || 0,
-           /* same hazard: losing this would quietly hide Sundays somebody had already filled in */
-           sundayPeriods: Array.isArray(e.sundayPeriods) ? e.sundayPeriods.map(String) : [] }))
-        .filter((e) => e.id || e.name);
-      const ids = keep.map((e) => e.id).filter(Boolean);
-      if (new Set(ids).size !== ids.length) { say("Two employees share the same ID"); return; }
-      const state = await sSet("dtr:roster", keep);
-      await saveDtrProfiles(keep);
-      setSaveState(state);
-      setSyncError(state === "local" ? lastCloudError : "");
-      if (state !== "fail") flashSaved("roster");
-    }, 600);
-  }, [roster, ready, say]);
+    timers.current.roster = setTimeout(saveRosterNow, 600);
+  }, [roster, ready, saveRosterNow]);
 
+  useEffect(() => { cfgNow.current = cfg; }, [cfg]);
+  useEffect(() => { schedNow.current = sched; }, [sched]);
   useEffect(() => {
     if (!ready) return;
-    if (firstRun.current) { firstRun.current = false; return; }
     clearTimeout(timers.current.cfg);
-    timers.current.cfg = setTimeout(async () => {
-      const state = await sSet("dtr:cfg", cfg);
-      setSaveState(state);
-      setSyncError(state === "local" ? lastCloudError : "");
-      if (state !== "fail") flashSaved("cfg");
-    }, 500);
-  }, [cfg, ready]);
+    timers.current.cfg = setTimeout(saveCfgNow, 500);
+  }, [cfg, ready, saveCfgNow]);
 
   /* ---- log access ---- */
   /* sched is passed in rather than closed over so this keeps a stable identity and the
@@ -2073,16 +2350,12 @@ export default function DTRSystem({ onBack }) {
     const k = logKey(id, y);
     if (!loadedYears.current.has(k)) {
       const log = await sGet(k, {});
-      /* re-stamp the whole year on load: this is what quietly brings stored totals back in
-         line after an admin edits the work schedule, with no bulk migration */
-      let changed = false;
-      Object.keys(log).forEach((ds) => { if (stampTotals(log[ds], workSched || SCHED_DEF)) changed = true; });
+      /* Re-stamp the year's totals on screen. Loading never writes: the corrected totals
+         reach the cloud with the next real save of this year (every save sends them). */
+      Object.keys(log).forEach((ds) => { stampTotals(log[ds], workSched || SCHED_DEF); });
       logsRef.current[k] = log;
       loadedYears.current.add(k);
       bump();
-      /* no banner for this one: it is a recalculation, not something the user typed. If it
-         cannot reach the cloud it waits in the device copy and the reconnect flush sends it. */
-      if (changed) await sSet(k, log);
     }
     return logsRef.current[k];
   }, []);
@@ -2095,6 +2368,9 @@ export default function DTRSystem({ onBack }) {
        enforced once rather than at each of the dozen places that can start a write */
     if (viewOnly) return false;
     const y = +dateStr.slice(0, 4), k = logKey(id, y);
+    return withRowLock(k, () => writeRecLocked(id, dateStr, mut, source, y, k));
+  };
+  const writeRecLocked = async (id, dateStr, mut, source, y, k) => {
     /* Read the year back before touching it. A write that ran first used to
        create the year as {}, which both satisfied the load check and got upserted
        over the stored year — that is how a logbook edit wiped somebody's year.
@@ -2103,6 +2379,7 @@ export default function DTRSystem({ onBack }) {
     logsRef.current[k] = logsRef.current[k] || {};
     logsRef.current[k][dateStr] = logsRef.current[k][dateStr] || {};
     const day = logsRef.current[k][dateStr];
+    const unchanged = cloneValue(day);
     /* how a time got there is worth keeping: the logbook has to say whether a
        punch was stamped by the clock or typed in afterwards. Diffing here beats
        asking all eight callers to remember to say so. */
@@ -2117,8 +2394,11 @@ export default function DTRSystem({ onBack }) {
     });
     stampTotals(logsRef.current[k][dateStr], sched);
     bump();
+    /* re-saving what is already there (a note synced on opening a date, a time retyped
+       as it was) sends nothing */
+    if (JSON.stringify(dayContent(day)) === JSON.stringify(dayContent(unchanged))) return true;
 
-    let state = await sSet(k, logsRef.current[k], { revisionChecked: true });
+    let state = await sSet(k, logsRef.current[k]);
     /* Somebody else advanced the row while this edit was being made. Take their
        copy, replay this edit onto it, and try again — never overwrite. */
     for (let attempt = 0; state === "conflict" && attempt < 3; attempt++) {
@@ -2129,7 +2409,7 @@ export default function DTRSystem({ onBack }) {
       mut(logsRef.current[k][dateStr]);
       stampTotals(logsRef.current[k][dateStr], sched);
       bump();
-      state = await sSet(k, logsRef.current[k], { revisionChecked: true });
+      state = await sSet(k, logsRef.current[k]);
     }
     if (state === "conflict") {
       say("Someone else changed this record — reopen it and try again");
@@ -2149,13 +2429,15 @@ export default function DTRSystem({ onBack }) {
 
   async function openEmp(emp, readOnly, byActor) {
     await ensureLog(emp.id, new Date().getFullYear(), sched);
+    const landing = readOnly ? iso(new Date())
+      : await landingPunchDate(iso(new Date()), nowHM(), sched.amStart, (y) => ensureLog(emp.id, y, sched));
     setMe(emp);
     setViewOnly(!!readOnly);
     setActor(readOnly ? (byActor || actorEmp) : null);
     setPerStart(iso(periodOf(new Date()).s));
     setSite(emp.site || "");
-    setPunchDate(iso(new Date()));
-    setNote(recFor(emp.id, iso(new Date())).note || "");
+    setPunchDate(landing);
+    setNote(recFor(emp.id, landing).note || "");
     setLockMsg("");
     setPin("");
     setStage("id");
@@ -2210,7 +2492,12 @@ export default function DTRSystem({ onBack }) {
   const viewDate = punchDate || todayStr;
   const isToday = viewDate === todayStr;
   const rec = me ? recFor(me.id, viewDate) : {};
-  const nextSlot = SLOTS.find((s) => !rec[s.k]);
+  /* After midnight, yesterday's unfinished overtime keeps its live punch until the next
+     AM start, and that punch closes it on yesterday's record rather than opening today. */
+  const closingOvernightOt = !!me && !viewOnly
+    && openOvernightOtDate(todayStr, (ds) => (ds === viewDate ? rec : {}), nowHM(), sched.amStart) === viewDate;
+  const livePunch = isToday || closingOvernightOt;
+  const nextSlot = nextPunchSlot(rec, closingOvernightOt);
   const editDefaultTime = (slot) => ({
     amIn: sched.amStart,
     amOut: sched.amEnd,
@@ -2221,7 +2508,7 @@ export default function DTRSystem({ onBack }) {
   async function punch(slot) {
     if ((slot.k === "pmOut" || slot.k === "otOut") && !note.trim()) { say("Write your accomplishment first"); return; }
     const stamp = nowHM();
-    const issue = orderIssue(rec, slot.k, stamp);
+    const issue = orderIssue(rec, slot.k, stamp, sched.amStart);
     if (issue) { say(issue); return; }
     await writeRec(me.id, viewDate, (r) => { r[slot.k] = stamp; r.note = note; }, "punch");
     say(`${slot.label} recorded — ${disp(stamp, true)}`);
@@ -2261,6 +2548,18 @@ export default function DTRSystem({ onBack }) {
     setRoster((p) => p.map((e) => (e.id === me.id ? apply(e) : e)));
     setMe((m) => (m && m.id === me.id ? apply(m) : m));
     setActor((a) => (a && a.id === me.id ? apply(a) : a));
+  };
+
+  /* The project site on My DTR is also the employee's logbook department, so it is kept
+     on their roster entry — only their own, only when it actually changed, and never
+     from a read-only view of somebody else's DTR. A site a colleague already uses is
+     saved in their spelling, so one department is not listed under two. */
+  const saveMySite = (value) => {
+    if (!me || viewOnly) return;
+    const next = canonicalSite(value, roster, me.id);
+    if ((liveMe.site || "") === next) return;
+    setSite(next);
+    setRoster((p) => p.map((e) => (e.id === me.id ? { ...e, site: next } : e)));
   };
 
   const savePinFor = (id, fields) => {
@@ -2324,7 +2623,7 @@ export default function DTRSystem({ onBack }) {
     const t = parseTime(val, null, slot.k);
     if (t === null) { say("Could not read that time"); return; }
     const candidate = { ...recFor(me.id, dateStr), [slot.k]: t };
-    const issue = recordOrderIssue(candidate);
+    const issue = recordOrderIssue(candidate, sched.amStart, slot.k);
     if (issue) { say(issue); return; }
     if ((slot.k === "pmOut" || slot.k === "otOut") && !note.trim()) {
       say("Write your accomplishment first"); return;
@@ -2343,6 +2642,31 @@ export default function DTRSystem({ onBack }) {
     storedLogYears(me.id).then((ys) => { if (alive) setLogYears(ys); });
     return () => { alive = false; };
   }, [me]);
+
+  /* The period list marks the cut-offs this employee has entries in. Stored years are
+     fetched once per employee, read-only; years already open here are taken from memory,
+     so a punch made now marks its period without another fetch. */
+  const [entryPeriods, setEntryPeriods] = useState({ id: null, starts: new Set() });
+  const storedPayloads = useRef({ key: "", years: {} });
+  useEffect(() => {
+    if (!me) return undefined;
+    let alive = true;
+    (async () => {
+      const cacheKey = `${me.id}|${logYears.join(",")}`;
+      if (storedPayloads.current.key !== cacheKey) {
+        const years = await storedLogPayloads(me.id, logYears);
+        if (!alive) return;
+        storedPayloads.current = { key: cacheKey, years };
+      }
+      const byYear = { ...storedPayloads.current.years };
+      loadedYears.current.forEach((k) => {
+        const y = Number(k.slice(logKey(me.id, "").length));
+        if (k === logKey(me.id, y) && logsRef.current[k]) byYear[y] = logsRef.current[k];
+      });
+      if (alive) setEntryPeriods({ id: me.id, starts: periodStartsWithEntries(Object.values(byYear)) });
+    })();
+    return () => { alive = false; };
+  }, [me, logYears, tickN]);
 
   const periods = (() => {
     const now = new Date();
@@ -2417,7 +2741,7 @@ export default function DTRSystem({ onBack }) {
   /* ---- staff logbook ----
      The department's shared weekly sheet. Monday to Sunday because the printed
      form has seven day columns, even though the inclusive date it carries
-     describes the Monday-to-Saturday working week. */
+     covers the same Monday to Sunday. */
   const logbookMonday = (() => { const a = weekStart.split("-").map(Number); return new Date(a[0], a[1] - 1, a[2]); })();
   const logbookDays = weekDates(logbookMonday);
   /* Everyone's week, not just the signed-in employee's: ensureLog is otherwise
@@ -2453,10 +2777,19 @@ export default function DTRSystem({ onBack }) {
     .map((x) => x.emp);
   /* the paper form holds six employees; past that it carries on to another page */
   const LOGBOOK_PER_PAGE = 6;
-  const logbookPages = logbookStaff.length
-    ? Array.from({ length: Math.ceil(logbookStaff.length / LOGBOOK_PER_PAGE) },
-        (_, i) => logbookStaff.slice(i * LOGBOOK_PER_PAGE, (i + 1) * LOGBOOK_PER_PAGE))
-    : [[]];
+  /* One logbook per department, and the department is each employee's project site.
+     It opens on the signed-in employee's own site; "all" prints every department on
+     its own pages, each numbered from 1. */
+  const LOGBOOK_ALL = "*";
+  const logbookGroups = groupStaffBySite(logbookStaff);
+  const ownLogbookGroup = logbookGroups.find((g) => g.key === siteKey(liveMe && liveMe.site));
+  const logbookChoice = logbookDeptKey === LOGBOOK_ALL || logbookGroups.some((g) => g.key === logbookDeptKey)
+    ? logbookDeptKey
+    : (ownLogbookGroup || logbookGroups[0] || { key: LOGBOOK_ALL }).key;
+  const logbookSections = (logbookGroups.length ? logbookGroups : [{ key: NO_SITE_KEY, label: "", staff: [] }])
+    .filter((g) => logbookChoice === LOGBOOK_ALL || g.key === logbookChoice)
+    .map((g) => ({ ...g, pages: pagesOf(g.staff, LOGBOOK_PER_PAGE) }));
+  const logbookDeptLabel = logbookChoice === LOGBOOK_ALL ? "" : (logbookSections[0] ? logbookSections[0].label : "");
   /* ---- the blank sheet's page range ----
      Both ends are editable, so the batch can read 1 to 5 or start part way down
      the pad at 2 to 5. From falls back to 1 and To never sits below From, so a
@@ -2482,17 +2815,17 @@ export default function DTRSystem({ onBack }) {
   const ownsLogRow = (empId) => !!me && !viewOnly && empId === me.id;
   const setLogTime = async (empId, dateStr, slotKey, raw, mer) => {
     if (!ownsLogRow(empId)) { say("You can only edit your own row"); return false; }
-    const t = raw.trim() ? parseTime(raw, mer, slotKey) : "";
-    if (t === null) { say("Could not read that time"); return false; }
     await ensureLog(empId, +dateStr.slice(0, 4), sched);
     const rec0 = recFor(empId, dateStr);
+    const t = raw.trim() ? parseTime(raw, mer, slotKey, rec0.otIn) : "";
+    if (t === null) { say("Could not read that time"); return false; }
     /* Nothing typed, nothing to write. Blurring a cell that only looked empty
        because its record had not loaded must never delete the stored time. */
     if ((rec0[slotKey] || "") === (t || "")) return true;
     /* the same ordering rails the DTR grid applies: a punch cannot fall before the
        one before it or after the one after it */
     if (t) {
-      const issue = orderIssue(rec0, slotKey, t);
+      const issue = orderIssue(rec0, slotKey, t, sched.amStart);
       if (issue) { say(issue); return false; }
     }
     await writeRec(empId, dateStr, (r) => { if (t) r[slotKey] = t; else delete r[slotKey]; });
@@ -2517,8 +2850,8 @@ export default function DTRSystem({ onBack }) {
      last filled page already prints — numbered, but with no ID, no name, no
      times and no totals. The header, department, INCLUSIVE DATE and the
      Monday-to-Sunday column dates come from the chosen week either way. */
-  const renderLogbookSheet = (page, pi, pageCount) => (
-    <div className="sheet logbook shadow" key={"pg" + pi}
+  const renderLogbookSheet = (page, pi, pageCount, dept, deptKey = "") => (
+    <div className="sheet logbook shadow" key={"pg" + deptKey + ":" + pi}
       style={{ "--paper-width": "297mm", "--paper-height": "210mm" }}>
       <table className="hdr">
         <tbody>
@@ -2536,7 +2869,7 @@ export default function DTRSystem({ onBack }) {
       <table className="flds">
         <tbody>
           <tr>
-            <td className="fk">DEPARTMENT</td><td className="fv"><span className="ul">{cfg.logbookDept || DEF.logbookDept}</span></td>
+            <td className="fk">DEPARTMENT</td><td className="fv"><span className="ul">{dept}</span></td>
             <td className="gap" />
             <td className="fk" style={{ width: "26mm" }}>PAGE NO</td><td className="fv"><span className="ul">{pi + 1} of {pageCount}</span></td>
           </tr>
@@ -2638,10 +2971,10 @@ export default function DTRSystem({ onBack }) {
                   });
                 })}
                 {bi === 0 && <>
-                  <td rowSpan={3} className="ctot">{daysWorked || ""}</td>
-                  <td rowSpan={3} className="ctot">{otTotal ? fmtDur(otTotal) : ""}</td>
+                  <td rowSpan={3} className="ctot">{logbookOmit.days ? "" : (daysWorked || "")}</td>
+                  <td rowSpan={3} className="ctot">{logbookOmit.ot || !otTotal ? "" : fmtDur(otTotal)}</td>
                   <td rowSpan={3} className="csig">
-                    {emp.signature && emp.signatureOnLogbook === true
+                    {emp.signature && emp.signatureOnLogbook === true && !logbookOmit.sig
                       ? <img className="lgsig" src={emp.signature} alt="" /> : ""}
                   </td>
                 </>}
@@ -2724,7 +3057,15 @@ export default function DTRSystem({ onBack }) {
     try { window.print(); } catch (e) { say("Printing is blocked here — use Download copy"); }
   }
 
-  const doPrintLogbook = () => printInPopup(logbookRef.current, logbookPageStyles(), LOGBOOK_TITLE);
+  const doPrintLogbook = () => setLogbookPrintAsk(true);
+  /* The chosen columns are emptied on the sheet itself for the moment it is printed
+     (the fallback print uses the live page, not a copy), then put straight back. */
+  const printLogbookNow = () => {
+    setLogbookPrintAsk(false);
+    flushSync(() => setLogbookOmit({ days: !logbookPrintCols.days, ot: !logbookPrintCols.ot, sig: !logbookPrintCols.sig }));
+    try { printInPopup(logbookRef.current, logbookPageStyles(), LOGBOOK_TITLE); }
+    finally { setLogbookOmit({ days: false, ot: false, sig: false }); }
+  };
   /* The same week on sheets nobody is on yet — for filling in by hand. The hidden
      container already holds exactly the pages in the chosen range, because that
      range is derived during render, so there is nothing to prepare here. */
@@ -3053,13 +3394,19 @@ export default function DTRSystem({ onBack }) {
             )}
             <div className="act">
               <div>
-                {!isToday && !rec.leave && !rec.holiday && (
+                {closingOvernightOt && (
+                  <div className="pastnote">
+                    <strong>Overtime from {new Date(viewDate + "T00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} is still open</strong>
+                    OT in was {disp(rec.otIn, true)}. End it before {disp(sched.amStart, true)} and it stays on that day's DTR. Tap <em>Today</em> above to punch today instead.
+                  </div>
+                )}
+                {!livePunch && !rec.leave && !rec.holiday && (
                   <div className="pastnote">
                     <strong>Back-filling {new Date(viewDate + "T00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</strong>
                     The live punch button is off for past dates. Use <em>set</em> or <em>edit</em> on each slot above, or the button below, and type the time you actually worked.
                   </div>
                 )}
-                {!rec.leave && !rec.holiday && isToday && (nextSlot ? (
+                {!rec.leave && !rec.holiday && livePunch && (nextSlot ? (
                   <button className={"big" + (nextSlot.k === "pmOut" || nextSlot.k === "otOut" ? " warn" : "")} onClick={() => punch(nextSlot)}>
                     {nextSlot.btn}<small>{nextSlot.sub}</small>
                   </button>
@@ -3071,7 +3418,7 @@ export default function DTRSystem({ onBack }) {
                     Enter {nextSlot.label} manually
                   </button>
                 )}
-                {!rec.leave && !rec.holiday && !nextSlot && !isToday && (
+                {!rec.leave && !rec.holiday && !nextSlot && !livePunch && (
                   <div className="hint" style={{ marginBottom: 10 }}>All six punches are filled for this date.</div>
                 )}
                 {!rec.leave && !rec.holiday && isToday && nextSlot && nextSlot.k === "otIn" && (
@@ -3122,17 +3469,23 @@ export default function DTRSystem({ onBack }) {
               <div className="ctl">
                 <div>
                   <span className="lbl">Payroll period</span>
-                  <select value={perStart} onChange={(e) => setPerStart(e.target.value)}>
+                  <select value={perStart} onChange={(e) => setPerStart(e.target.value)} title="● marks a period with entries">
                     {periodGroups.map((g) => (
                       <optgroup key={g.year} label={String(g.year)}>
-                        {g.items.map((p) => <option key={iso(p.s)} value={iso(p.s)}>{periodLabel(p)}</option>)}
+                        {g.items.map((p) => (
+                          <option key={iso(p.s)} value={iso(p.s)}>
+                            {entryPeriods.id === me.id && entryPeriods.starts.has(iso(p.s)) ? "● " : ""}{periodLabel(p)}
+                          </option>
+                        ))}
                       </optgroup>
                     ))}
                   </select>
                 </div>
                 <div>
                   <span className="lbl">Project site</span>
-                  <input value={site} onChange={(e) => setSite(e.target.value)} placeholder="Project site" />
+                  <input value={site} onChange={(e) => setSite(e.target.value)} placeholder="Project site"
+                    onBlur={(e) => saveMySite(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
                 </div>
                 <div>
                   <span className="lbl">Paper size</span>
@@ -3254,11 +3607,11 @@ export default function DTRSystem({ onBack }) {
                                   if (!canEdit) return;
                                   const reset = () => { e.target.value = r[s.k] ? disp(r[s.k], true) : ""; };
                                   const raw = e.target.value.trim();
-                                  const t = raw ? parseTime(raw, s.mer, s.k) : "";
+                                  const t = raw ? parseTime(raw, s.mer, s.k, r.otIn) : "";
                                   if (t === null) { say("Could not read that time"); reset(); return; }
                                   if ((r[s.k] || "") === (t || "")) return;
                                   if (t) {
-                                    const issue = orderIssue(r, s.k, t);
+                                    const issue = orderIssue(r, s.k, t, sched.amStart);
                                     if (issue) { say(issue); reset(); return; }
                                   }
                                   writeRec(me.id, ds, (rr) => { if (t) rr[s.k] = t; else delete rr[s.k]; });
@@ -3337,12 +3690,24 @@ export default function DTRSystem({ onBack }) {
                   <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(addDays(logbookMonday, -7)))}>Previous week</button>
                   <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(addDays(logbookMonday, 7)))}>Next week</button>
                   <button className="btn ghost" disabled={!isAdmin} onClick={() => setWeekStart(iso(mondayOf(new Date())))}>This week</button>
+                  <div>
+                    <span className="lbl">Department</span>
+                    <select value={logbookChoice} onChange={(e) => setLogbookDeptKey(e.target.value)}>
+                      {logbookGroups.map((g) => (
+                        <option key={g.key} value={g.key}>
+                          {g.key === NO_SITE_KEY ? "No project site" : g.label} ({g.staff.length})
+                        </option>
+                      ))}
+                      {logbookGroups.length > 1 && <option value={LOGBOOK_ALL}>All departments — separate pages</option>}
+                    </select>
+                  </div>
                   <button className="btn ghost" onClick={doPrintLogbook}>Print logbook</button>
                   <button className="btn ghost" aria-expanded={blankOpen}
                     onClick={() => setBlankOpen((v) => !v)}>Print blank sheet</button>
                 </div>
                 <p className="hint">
-                  Every signed-in employee can enter times here; the department, logo and week are admin-only.
+                  Every signed-in employee can enter times here; the logo and week are admin-only. Each department
+                  is a project site: staff are grouped by the project site on their DTR, one logbook per site.
                   A time the clock stamped prints plain, one typed in prints italic, one changed afterwards prints italic
                   with a dot. Entries recorded before this was added carry no mark.
                   <br />
@@ -3383,7 +3748,7 @@ export default function DTRSystem({ onBack }) {
               </div>
 
               <div className="sheetwrap" ref={logbookRef}>
-                {logbookPages.map((page, pi) => renderLogbookSheet(page, pi, logbookPages.length))}
+                {logbookSections.map((sec) => sec.pages.map((page, pi) => renderLogbookSheet(page, pi, sec.pages.length, sec.label, sec.key)))}
               </div>
 
               {/* The blank sheet stays mounted but off the page: it exists only to be
@@ -3396,7 +3761,7 @@ export default function DTRSystem({ onBack }) {
                       rule sees in the shared renderer. Passing each page's own number
                       gives every sheet its PAGE NO and its continuing NO column. */}
                   {/* eslint-disable-next-line react-hooks/refs */}
-                  {blankPageNos.map((no) => renderLogbookSheet([], no - 1, blankRange.to))}
+                  {blankPageNos.map((no) => renderLogbookSheet([], no - 1, blankRange.to, logbookDeptLabel))}
                 </div>
               </div>
             </>
@@ -3513,8 +3878,6 @@ export default function DTRSystem({ onBack }) {
                     <input value={cfg.co} placeholder={DEF.co} onChange={(e) => setCfg((p) => ({ ...p, co: e.target.value }))} /></div>
                   <div><span className="lbl">Department</span>
                     <input value={cfg.dept} placeholder={DEF.dept} onChange={(e) => setCfg((p) => ({ ...p, dept: e.target.value }))} /></div>
-                  <div><span className="lbl">Logbook department</span>
-                    <input value={cfg.logbookDept ?? ""} placeholder={DEF.logbookDept} onChange={(e) => setCfg((p) => ({ ...p, logbookDept: e.target.value }))} /></div>
                   <div style={{ gridColumn: "1/-1" }}><span className="lbl">Form title</span>
                     <input value={cfg.title} placeholder={DEF.title} onChange={(e) => setCfg((p) => ({ ...p, title: e.target.value }))} /></div>
                 </div>
@@ -3699,6 +4062,34 @@ export default function DTRSystem({ onBack }) {
             />
             <div className="row">
               <button className="del" onClick={() => applyEdit("", true)}>Clear time</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {logbookPrintAsk && (
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setLogbookPrintAsk(false); }}>
+          <div className="box">
+            <h3>Print logbook</h3>
+            <p style={{ marginBottom: 12 }}>
+              Include these on the printout? Choose <strong>No</strong> to leave that column empty for
+              filling in by hand. Nothing recorded is changed.
+            </p>
+            {[["days", "Total days worked"], ["ot", "Total overtime worked"], ["sig", "Employee signature"]].map(([k, label]) => (
+              <div key={k} className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span>{label}</span>
+                <span style={{ display: "flex", gap: 6 }} role="radiogroup" aria-label={label}>
+                  {[[true, "Yes"], [false, "No"]].map(([v, text]) => (
+                    <button key={text} type="button" role="radio" aria-checked={logbookPrintCols[k] === v}
+                      className={logbookPrintCols[k] === v ? "pri" : ""}
+                      onClick={() => setLogbookPrintCols((c) => ({ ...c, [k]: v }))}>{text}</button>
+                  ))}
+                </span>
+              </div>
+            ))}
+            <div className="row">
+              <button onClick={() => setLogbookPrintAsk(false)}>Cancel</button>
+              <button className="pri" onClick={printLogbookNow}>Print</button>
             </div>
           </div>
         </div>
