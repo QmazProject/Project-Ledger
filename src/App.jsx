@@ -3,6 +3,7 @@ import AuthGate from "./auth/AuthGate";
 import ProjectLedger from "./ProjectLedger";
 import PwaSplash from "./PwaSplash";
 import { recordLedgerReactCommit, startLedgerTiming } from "./lib/ledgerStartup";
+import { DTR_HOME, isDtrPath } from "./lib/dtrRoutes";
 
 async function loadDtrSystem() {
   const finish = startLedgerTiming("feature.dtr_chunk");
@@ -60,18 +61,23 @@ function isStandalonePwa() {
 function App() {
   const [DTRSystem, setDtrSystem] = useState(() => createLazyDtr());
   const [dtrAttempt, setDtrAttempt] = useState(0);
-  const [dtrOpen, setDtrOpen] = useState(() => {
-    try { return window.sessionStorage.getItem("forlive.workspace") === "dtr"; }
-    catch { return false; }
-  });
+  /* The address decides the workspace: /dtr/… is the DTR, everything else the ledger.
+     The DTR keeps its own page in the address; here only entering and leaving it. */
+  const [dtrOpen, setDtrOpen] = useState(() => isDtrPath(window.location.pathname));
   const openDtr = () => {
-    try { window.sessionStorage.setItem("forlive.workspace", "dtr"); } catch { /* unavailable */ }
+    if (!isDtrPath(window.location.pathname)) window.history.pushState(null, "", DTR_HOME);
     setDtrOpen(true);
   };
   const closeDtr = () => {
-    try { window.sessionStorage.setItem("forlive.workspace", "ledger"); } catch { /* unavailable */ }
+    window.history.pushState(null, "", "/");
     setDtrOpen(false);
   };
+  /* Back / Forward across the boundary: from /dtr/punch back to /login, or forward again */
+  useEffect(() => {
+    const onPop = () => setDtrOpen(isDtrPath(window.location.pathname));
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
   const retryDtr = () => {
     setDtrSystem(createLazyDtr());
     setDtrAttempt((attempt) => attempt + 1);

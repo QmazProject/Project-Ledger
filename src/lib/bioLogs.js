@@ -223,38 +223,60 @@ export const deviceSerialOf = (fileName) => {
 
 const tapText = (t) => `${disp(t.time, true)}`;
 
-/* The taps of one duty date, in time order, into AM in .. OT out. */
+/* The taps of one duty date, in time order, into AM in .. OT out.
+
+   A plain Out (check out) is the end of the day: the PM out. It is the AM out only as
+   the lunch break — before PM start, or when the employee is back on an In before the
+   day's end, so a schedule whose PM start sits at noon can't turn lunch into PM out.
+   It is the OT out only when an In after the PM out (or an OT in) started overtime;
+   OT out otherwise comes from the device's own OT out tap. When the day has more than
+   one Out, the last one is the PM out. */
 function placeDay(list, sched) {
   const noon = toMin(sched.amEnd), pmStart = toMin(sched.pmStart), pmEnd = toMin(sched.pmEnd);
-  const slots = {}, notes = [];
+  const slots = {}, notes = [], pastMidnight = [];
   let last = null;
-  list.forEach(({ t, m, moved }) => {
+  list.forEach(({ t, m, moved }, i) => {
     let k;
     if (last && last.kind === t.kind && m - last.m <= DOUBLE_TAP_MINUTES) k = last.k;
     else if (t.kind === "otIn") k = "otIn";
     else if (t.kind === "otOut") k = "otOut";
     else if (t.kind === "in") k = slots.pmOut || m >= pmEnd ? "otIn" : (slots.amOut || m >= noon ? "pmIn" : "amIn");
-    else k = moved || slots.pmOut || slots.otIn ? "otOut" : (m >= pmStart ? "pmOut" : "amOut");
+    else if (slots.otIn) k = "otOut";
+    else {
+      const back = list.slice(i + 1).find((x) => x.t.kind !== "out");
+      const lunch = !moved && !slots.amOut && !slots.pmIn
+        && (m < pmStart || (!!back && back.t.kind === "in" && back.m < pmEnd));
+      k = lunch ? "amOut" : "pmOut";
+    }
 
     const doubled = last && last.k === k && last.kind === t.kind && m - last.m <= DOUBLE_TAP_MINUTES;
     if (slots[k] && !doubled) {
-      notes.push(`extra tap ${tapText(t)} (${KIND_LABEL[t.kind]})`);
-      return;
+      if (k !== "pmOut") {
+        notes.push(`extra tap ${tapText(t)} (${KIND_LABEL[t.kind]})`);
+        return;
+      }
+      notes.push(`earlier Out ${disp(slots.pmOut, true)}; the last Out is the PM out`);
     }
     if (doubled) notes.push(`double tap ${disp(slots[k], true)} / ${tapText(t)}`);
-    else if (t.kind === "out" && k === "otOut") notes.push(`tapped Out at ${tapText(t)}, used as OT out`);
-    if (moved && !doubled) notes.push(`${SLOT_LABEL[k]} tapped after midnight (${shortDate(t.date)}, ${tapText(t)})`);
+    if (moved && !doubled) {
+      notes.push(k === "otOut"
+        ? `${SLOT_LABEL[k]} tapped after midnight (${shortDate(t.date)}, ${tapText(t)})`
+        : `Out tapped after midnight (${shortDate(t.date)}, ${tapText(t)}). Only OT out can go past midnight in the DTR — type your OT in and OT out yourself.`);
+    }
+    if (moved && k !== "otOut" && !pastMidnight.includes(k)) pastMidnight.push(k);
     slots[k] = t.time;
     last = { k, m, kind: t.kind };
   });
   if (slots.otOut && !slots.otIn) notes.push("No OT in on the bio log. Type your OT in yourself.");
-  return { slots, notes, taps: list.map((x) => x.t) };
+  return { slots, notes, taps: list.map((x) => x.t), pastMidnight };
 }
 
 /* One employee's taps -> the period's days. `period` is { start, end } as ISO dates.
    An Out or OT out between midnight and the AM start, with no In before it that
-   morning, closes the previous day — the same overnight rule the DTR applies — and
-   always lands as OT out, since only overtime runs past midnight. */
+   morning, closes the previous day — the same overnight rule the DTR applies. An OT
+   out lands in OT out. A plain Out lands in PM out like any other check out, but the
+   DTR keeps only overtime past midnight, so that PM out is listed in `pastMidnight`:
+   shown, never taken. */
 export function placeTaps(taps, sched, period) {
   const amStart = toMin(sched.amStart);
   /* the same minute twice is one tap; an OT tap beats a plain one at that minute */
@@ -311,8 +333,11 @@ export function compareSlots(rec, bioSlots) {
   });
   return out;
 }
-/* the boxes "use bio logs" would change: a different time, or one the DTR lacks */
-export const replaceableSlots = (status) => SLOT_KEYS.filter((k) => status[k] === "diff" || status[k] === "bioOnly");
+/* the boxes "use bio logs" would change: a different time, or one the DTR lacks. A box
+   the placed day (`placed`) tapped after midnight, other than OT out, is left out: the
+   DTR can't keep it there. */
+export const replaceableSlots = (status, placed) => SLOT_KEYS.filter((k) => (status[k] === "diff" || status[k] === "bioOnly")
+  && !(placed && placed.pastMidnight && placed.pastMidnight.includes(k)));
 
 /* How much of the period the file reaches. `fileTaps` is every tap in the file (its
    dates are what it covers); `employeeTaps` is this employee's. */

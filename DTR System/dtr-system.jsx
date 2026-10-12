@@ -19,6 +19,7 @@ import { normalizeRoster, saveRosterChanges, rebaseRoster, profileChanges } from
 import { mergeQueuedYear, dayContent, describeYearConflicts } from "../src/lib/dtrYearSync";
 import { queuedBase } from "../src/lib/mergeSave";
 import { normalizeSettings, saveSettingsChanges, rebaseSettings, describeSettingsConflicts } from "../src/lib/settingsSync";
+import { isDtrPath, dtrRouteOf, dtrPathOf, dtrTitleOf, dtrScreenFor } from "../src/lib/dtrRoutes";
 
 /* ============================ constants ============================ */
 const MON = ["January","February","March","April","May","June","July","August","September","October","November","December"];
@@ -661,7 +662,7 @@ const DTR_ATTACHMENTS_BUCKET = "dtr-attachments";
 const ATTACHMENT_TYPES = ["Gate Pass", "SOR", "OTR", "Medical", "Leave form", "Other"];
 const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 const ATTACHMENT_MIMES = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
-const DTR_SESSION_VIEW = "dtr.session.view";
+/* who is signed in, in this browser tab only; which page they are on is in the address */
 const DTR_SESSION_EMPLOYEE = "dtr.session.employee";
 
 /* Every value is mirrored on the device before it is sent up, so a punch survives a
@@ -1137,6 +1138,20 @@ async function makePin(pin) {
   return { pinSalt, pinHash, pinIter: PIN_ITER };
 }
 const hasPin = (e) => !!(e && e.pinHash && e.pinSalt);
+
+/* A passcode is not a website password, but a type="password" box tells the browser it
+   is one: Chrome offers to save it and, since a short number code is on every breach
+   list, warns "found in a data breach" after each sign-in. Where the browser can draw a
+   text box as dots (-webkit-text-security), passcode boxes are text drawn as dots, so the
+   password manager leaves them alone; anywhere else they stay password boxes, so the
+   digits are never shown. Copying out of the dotted box is blocked like a password box. */
+/* globalThis: in this file `CSS` is the stylesheet string below, not the browser's CSS API */
+const MASK_AS_TEXT = !!globalThis.CSS?.supports?.("-webkit-text-security", "disc");
+const noCopy = (e) => e.preventDefault();
+const passcodeBox = (className = "") => (MASK_AS_TEXT
+  ? { type: "text", className: `${className} masked`.trim(), autoComplete: "off", autoCorrect: "off", autoCapitalize: "off", spellCheck: false, onCopy: noCopy, onCut: noCopy }
+  : { type: "password", className: className || undefined, autoComplete: "off" });
+
 async function verifyPin(pin, emp) {
   if (!hasPin(emp)) return false;
   const got = await derivePin(pin, emp.pinSalt, Number(emp.pinIter) || PIN_ITER);
@@ -1250,12 +1265,22 @@ const CSS = `
 .qm .saved{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--signal);font-weight:600;opacity:0;transition:opacity .25s}
 .qm .saved.on{opacity:1}
 
-.qm .lock{display:grid;grid-template-columns:1fr 300px;min-height:430px;padding:0}
-@media(max-width:760px){.qm .lock{grid-template-columns:1fr}}
+.qm .lock{display:grid;grid-template-columns:1fr 300px;grid-template-rows:auto 1fr auto;min-height:430px;padding:0}
+@media(max-width:760px){.qm .lock{grid-template-columns:1fr;grid-template-rows:auto}}
+.qm .lockHead{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px 14px;flex-wrap:wrap;padding:14px 30px;background:var(--ink);color:#fff}
+.qm .lockHead h2{font-family:var(--disp);font-size:clamp(22px,3.4vw,30px);font-weight:700;letter-spacing:.04em;line-height:1;margin:0}
+.qm .lockHead .ver{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--hivis);border:1px solid var(--hivis);padding:3px 7px}
+.qm .lockFoot{grid-column:1/-1;border-top:1.5px solid var(--ink);padding:10px 30px;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;color:var(--ink-soft);text-align:center}
+@media(max-width:520px){.qm .lockHead,.qm .lockFoot{padding-left:14px;padding-right:14px}}
 .qm .lockL{padding:34px 30px;display:flex;gap:26px;align-items:center}
 .qm .lockText{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center}
 .qm .lockPhoto{flex:none;width:149px}
 .qm .lockPhoto .frame{width:149px;height:182px;border:1.5px solid var(--ink);background:#fff;display:grid;place-items:center;overflow:hidden;transition:border-color .2s}
+.qm .lockPhoto .frame.photo{border-color:var(--signal);outline:2px solid var(--signal);outline-offset:5px;animation:lockRingIn .6s cubic-bezier(.34,1.56,.64,1) both}
+.qm .lockPhoto .frame.photo img{animation:lockPhotoIn .5s cubic-bezier(.2,.8,.2,1) both}
+@keyframes lockRingIn{from{outline-color:transparent;outline-offset:0}to{outline-color:var(--signal);outline-offset:5px}}
+@keyframes lockPhotoIn{from{opacity:0;transform:scale(1.08)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.qm .lockPhoto .frame.photo,.qm .lockPhoto .frame.photo img{animation:none}}
 .qm .lockPhoto .frame img{width:100%;height:100%;object-fit:cover;display:block}
 .qm .lockPhoto .frame.empty{border-style:dashed;border-color:var(--zinc-dk)}
 .qm .lockPhoto .frame .ph{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--zinc-dk);text-align:center;white-space:pre-line;line-height:1.6}
@@ -1267,6 +1292,7 @@ const CSS = `
 .qm .lockText h1{font-family:var(--disp);font-size:clamp(30px,5vw,50px);font-weight:700;line-height:.95;text-transform:uppercase;margin:0 0 14px}
 .qm .pinbox{font-family:var(--mono);font-weight:700;font-size:38px;letter-spacing:.22em;border:none;border-bottom:3px solid var(--ink);background:none;width:100%;padding:6px 0 8px;color:var(--ink)}
 .qm .pinbox::placeholder{color:var(--zinc-dk)}
+.qm .masked{-webkit-text-security:disc}
 .qm .whois{margin-top:14px;min-height:52px;font-size:14px}
 .qm .whois strong{font-family:var(--disp);font-size:24px;font-weight:700;text-transform:uppercase;display:block;line-height:1.1;color:var(--signal)}
 .qm .whois span{color:var(--ink-soft);font-size:12.5px}
@@ -2071,12 +2097,12 @@ function PasscodeForm({ emp, mode, onSave, say }) {
     <div className="grid3" style={{ alignItems: "end" }}>
       {needsCurrent && (
         <div><span className="lbl">Current passcode</span>
-          <input type="password" inputMode="numeric" autoComplete="current-password" value={cur} onChange={(e) => setCur(e.target.value)} /></div>
+          <input {...passcodeBox()} inputMode="numeric" aria-label="Current passcode" value={cur} onChange={(e) => setCur(e.target.value)} /></div>
       )}
       <div><span className="lbl">New passcode</span>
-        <input type="password" inputMode="numeric" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} /></div>
+        <input {...passcodeBox()} inputMode="numeric" aria-label="New passcode" value={next} onChange={(e) => setNext(e.target.value)} /></div>
       <div><span className="lbl">Repeat it</span>
-        <input type="password" inputMode="numeric" autoComplete="new-password" value={again} onChange={(e) => setAgain(e.target.value)}
+        <input {...passcodeBox()} inputMode="numeric" aria-label="Repeat new passcode" value={again} onChange={(e) => setAgain(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") submit(); }} /></div>
       <div><button className="btn" disabled={busy} onClick={submit}>{busy ? "Saving…" : (hasPin(emp) ? "Change passcode" : "Set passcode")}</button></div>
     </div>
@@ -2156,6 +2182,12 @@ export default function DTRSystem({ onBack }) {
   const [bioTicks, setBioTicks] = useState({});
   const [bioHistoryOpen, setBioHistoryOpen] = useState(false);
   const [bioPreview, setBioPreview] = useState(null);
+  /* employees who chose to hide the bio lines and marks on this device. Screen only, and
+     kept per employee so one person's choice doesn't follow the next sign-in. */
+  const [bioHiddenIds, setBioHiddenIds] = useState(() => {
+    try { const v = JSON.parse(localStorage.getItem("dtr-bio-hidden") || "[]"); return Array.isArray(v) ? v : []; }
+    catch { return []; }
+  });
   /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
   const [saveState, setSaveState] = useState("synced");
   const [clock, setClock] = useState(new Date());
@@ -2360,18 +2392,15 @@ export default function DTRSystem({ onBack }) {
       if (bootRoster.length && !bootRoster.some((e) => e.role === "admin")) {
         bootRoster[Math.max(0, bootRoster.findIndex((e) => e.id === ADMIN_ID))].role = "admin";
       }
-      const savedView = (() => {
-        try { return window.sessionStorage.getItem(DTR_SESSION_VIEW) || ""; } catch { return ""; }
-      })();
       const savedEmployeeId = (() => {
         try { return window.sessionStorage.getItem(DTR_SESSION_EMPLOYEE) || ""; } catch { return ""; }
       })();
       const savedEmployee = bootRoster.find((e) => e.id && e.id === savedEmployeeId);
-      const validSavedView = ["punch", "dtr", "logbook", "settings"].includes(savedView);
+      const nobodySetUp = !bootRoster.some((e) => e.id);
       setRoster(bootRoster.length ? bootRoster : [{ id: "", name: "", position: "", site: "", photo: "", signature: "", signatureEnabled: false, signatureOnLogbook: false, sundayPeriods: [], role: "admin" }]);
       const bootCfg = bootCfgRead.value;
       setCfg(bootCfg);
-      if (savedEmployee && validSavedView) {
+      if (savedEmployee) {
         setMe(savedEmployee);
         setActor(null);
         setViewOnly(false);
@@ -2383,24 +2412,73 @@ export default function DTRSystem({ onBack }) {
         const bootSched = bootCfg.sched || SCHED_DEF;
         setPunchDate(await landingPunchDate(iso(new Date()), nowHM(), bootSched.amStart,
           (y) => ensureLog(savedEmployee.id, y, bootSched)));
-        setView(savedView);
+        /* read after the awaits: Back / Forward may have moved the address meanwhile */
+        setView(dtrScreenFor(dtrRouteOf(window.location.pathname),
+          { signedIn: true, viewOnly: false, isAdmin: nobodySetUp || savedEmployee.role === "admin" }));
       } else {
-        setView(bootRoster.length ? "lock" : "settings");
+        setView(bootRoster.length
+          ? dtrScreenFor(dtrRouteOf(window.location.pathname), { signedIn: false, viewOnly: false, isAdmin: nobodySetUp })
+          : "settings");
       }
       setReady(true);
     })();
     return () => { alive = false; };
   }, []);
 
-  /* Keep the current DTR workspace and employee in this tab across refreshes. */
+  /* Keep the signed-in employee in this tab across refreshes; the address keeps the page.
+     While an admin reads someone else's DTR the admin is the one signed in, so a refresh
+     brings the admin back — never a sign-in as the employee they were reading. */
+  const sessionEmpId = actorEmp?.id || "";
   useEffect(() => {
     if (!ready) return;
     try {
-      window.sessionStorage.setItem(DTR_SESSION_VIEW, view);
-      if (me?.id) window.sessionStorage.setItem(DTR_SESSION_EMPLOYEE, me.id);
+      if (sessionEmpId) window.sessionStorage.setItem(DTR_SESSION_EMPLOYEE, sessionEmpId);
       else window.sessionStorage.removeItem(DTR_SESSION_EMPLOYEE);
     } catch { /* session storage may be unavailable */ }
-  }, [view, me, ready]);
+  }, [sessionEmpId, ready]);
+
+  useEffect(() => {
+    const before = document.title;
+    return () => { document.title = before; };
+  }, []);
+
+  /* The address follows the page. A tab click adds a step to the browser history, so Back
+     and Forward walk the tabs; signing in or out replaces the step instead, so Back after
+     signing out finds the sign-in page rather than somebody's DTR. */
+  const routedSignedIn = useRef(null);
+  useEffect(() => {
+    if (!ready) return;
+    document.title = dtrTitleOf(view, viewOnly);
+    const replace = routedSignedIn.current !== !!me;
+    routedSignedIn.current = !!me;
+    const path = dtrPathOf(view, viewOnly);
+    if (window.location.pathname === path) return;
+    window.history[replace ? "replaceState" : "pushState"](null, "", path);
+  }, [view, viewOnly, me, ready]);
+
+  /* Back / Forward inside the DTR. An address only asks for a page: it is checked like a
+     tab click and corrected in place when it asks for one this visitor may not see. A
+     pop-up open at that moment closes as if Cancel were pressed and the page stays —
+     except a bio upload still saving, which stays open as it does for a click outside it.
+     Leaving /dtr altogether is App's to handle. */
+  useEffect(() => {
+    const onPop = () => {
+      if (!ready || !isDtrPath(window.location.pathname)) return;
+      if (editing || confirm || logbookPrintAsk || bioHistoryOpen || bioPreview || attachmentOpenDate || bioOpen) {
+        window.history.pushState(null, "", dtrPathOf(view, viewOnly));
+        if (bioOpen && bioBusy) return;
+        setEditing(null); setConfirm(null); setLogbookPrintAsk(false); setBioHistoryOpen(false);
+        setBioPreview(null); setAttachmentOpenDate(""); setBioOpen(false);
+        return;
+      }
+      const next = dtrScreenFor(dtrRouteOf(window.location.pathname), { signedIn: !!me, viewOnly, isAdmin });
+      const path = dtrPathOf(next, viewOnly);
+      if (window.location.pathname !== path) window.history.replaceState(null, "", path);
+      setView(next);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [ready, view, viewOnly, me, isAdmin, editing, confirm, logbookPrintAsk, bioHistoryOpen, bioPreview, attachmentOpenDate, bioOpen, bioBusy]);
 
   useEffect(() => { const t = setInterval(() => setClock(new Date()), 1000); return () => clearInterval(t); }, []);
 
@@ -2565,7 +2643,7 @@ export default function DTRSystem({ onBack }) {
 
   function backToId() { setStage("id"); setPending(null); setPin(""); setLockMsg(""); }
   function signOut() {
-    try { window.sessionStorage.removeItem(DTR_SESSION_EMPLOYEE); window.sessionStorage.setItem(DTR_SESSION_VIEW, "lock"); } catch { /* unavailable */ }
+    try { window.sessionStorage.removeItem(DTR_SESSION_EMPLOYEE); } catch { /* unavailable */ }
     setMe(null); setViewOnly(false); setPin(""); setLockMsg(""); setStage("id"); setPending(null); setView("lock");
   }
 
@@ -2841,13 +2919,29 @@ export default function DTRSystem({ onBack }) {
     const blocked = r.leave ? "leave" : r.holiday ? "holiday" : "";
     if (!inFile || (!bd && !blocked && !SLOTS.some((s) => r[s.k]))) return null;
     const status = compareSlots(blocked ? {} : r, bd ? bd.slots : {});
-    return { bd, status, can: blocked ? [] : replaceableSlots(status), blocked, kept: bioKeptHere.includes(ds) };
+    return { bd, status, can: blocked ? [] : replaceableSlots(status, bd), blocked, kept: bioKeptHere.includes(ds) };
   };
   const bioRows = {};
-  days.forEach((d) => { const ds = iso(d); const row = bioCompareDay(ds, recFor(me ? me.id : "", ds)); if (row) bioRows[ds] = row; });
+  /* dates shown with a time already taken from bio logs, marked under its box */
+  const bioMarkDays = [];
+  days.forEach((d) => {
+    const ds = iso(d), r = recFor(me ? me.id : "", ds);
+    const row = bioCompareDay(ds, r);
+    if (row) bioRows[ds] = row;
+    if (r.src && SLOTS.some((s) => r.src[s.k] === "bio")) bioMarkDays.push(ds);
+  });
   const bioMismatched = Object.keys(bioRows).filter((ds) => bioRows[ds].can.length && !bioRows[ds].kept);
   /* bio taps on a date the DTR is not showing — a Sunday this cut-off has not turned on */
   const bioHiddenDays = Object.keys(bioPlaced.days).filter((ds) => !days.some((d) => iso(d) === ds));
+  const bioMarksHere = !!me && bioMarkDays.length > 0;
+  /* "Hide bio" takes the bio lines and marks off the preview; nothing is cleared or changed */
+  const bioHidden = !!me && bioHiddenIds.includes(me.id);
+  const showBio = (show) => {
+    if (!me) return;
+    const next = bioHiddenIds.filter((id) => id !== me.id).concat(show ? [] : [me.id]);
+    setBioHiddenIds(next);
+    try { localStorage.setItem("dtr-bio-hidden", JSON.stringify(next)); } catch { /* unavailable */ }
+  };
 
   useEffect(() => {
     if (!me || view !== "dtr") return undefined;
@@ -3032,7 +3126,7 @@ export default function DTRSystem({ onBack }) {
       <tr className="biorow noprint">
         <td className="biolbl">BIO</td>
         {SLOTS.map((s) => (
-          <td key={s.k} className={"bio-" + (status[s.k] || "none")} title={status[s.k] ? `${s.label}: ${BIO_STATUS_TEXT[status[s.k]]}` : undefined}>
+          <td key={s.k} className={"bio-" + (status[s.k] || "none")} title={status[s.k] ? `${s.label}: ${BIO_STATUS_TEXT[status[s.k]]}${bd && bd.pastMidnight.includes(s.k) ? " (after midnight — can't be used)" : ""}` : undefined}>
             {bd && bd.slots[s.k] ? disp(bd.slots[s.k], true) : status[s.k] === "dtrOnly" ? "—" : ""}
             {acting && !kept && can.includes(s.k) && (
               <input type="checkbox" className="biotick" checked={ticks.includes(s.k)}
@@ -3603,13 +3697,17 @@ export default function DTRSystem({ onBack }) {
         {/* ---------- LOCK ---------- */}
         {view === "lock" && (
           <div className="card lock">
+            <div className="lockHead">
+              <h2>QM BUILDERS DTR RECORD</h2>
+              <span className="ver">Version 1</span>
+            </div>
             <div className="lockL">
               <div className="lockText">
                 <div className="eyebrow">{clock.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</div>
                 <h1>{stage === "pin" ? <>Enter your<br />passcode</> : <>Enter your<br />ID number</>}</h1>
                 <input
-                  ref={pinRef} className="pinbox" inputMode="numeric" autoComplete="off" autoFocus placeholder="----" maxLength={8}
-                  type={stage === "pin" ? "password" : "text"}
+                  ref={pinRef} inputMode="numeric" autoFocus placeholder="----" maxLength={8}
+                  {...(stage === "pin" ? passcodeBox("pinbox") : { type: "text", className: "pinbox", autoComplete: "off" })}
                   aria-label={stage === "pin" ? "Passcode" : "ID number"} value={pin}
                   onChange={(e) => { setPin(e.target.value); setLockMsg(""); }}
                   onKeyDown={(e) => { if (e.key === "Enter" || e.key === "NumpadEnter") signIn(); }}
@@ -3628,7 +3726,9 @@ export default function DTRSystem({ onBack }) {
                 )}
               </div>
               <div className="lockPhoto">
-                <div className={"frame" + (match && match.photo ? "" : " empty")}>
+                {/* keyed by ID so the ring and photo animate in again whenever a different
+                    ID is recognised, but not when the same person moves on to the passcode */}
+                <div key={match ? match.id : ""} className={"frame" + (match && match.photo ? " photo" : " empty")}>
                   {match && match.photo
                     ? <img src={match.photo} alt={match.name || "Employee"} />
                     : <span className="ph">{match ? "No photo\non file" : "Photo"}</span>}
@@ -3651,6 +3751,7 @@ export default function DTRSystem({ onBack }) {
                 ))}
               </div>
             </div>
+            <div className="lockFoot">© Digitalization Team 2026</div>
           </div>
         )}
 
@@ -3848,6 +3949,11 @@ export default function DTRSystem({ onBack }) {
                 )}
                 {attachments.length > 0 && <button className="btn ghost" onClick={() => printDtrAttachments(attachments, `DTR attachments — ${periodLabel(period)}`, attachmentPaperSize)}>Print attachments ({attachments.length})</button>}
                 <button className="btn ghost" onClick={() => { setBioMsg(""); setBioOpen(true); }}>Upload Bio Logs</button>
+                {(bioActive || bioMarksHere) && (
+                  <button className="btn ghost" aria-pressed={!bioHidden} onClick={() => showBio(bioHidden)}>
+                    {bioHidden ? "Preview with bio" : "Hide bio"}
+                  </button>
+                )}
               </div>
               {pdfWarning && <div role="alert" className="pastnote" style={{ marginTop: 10, marginBottom: 0 }}>{pdfWarning}</div>}
               <p className="hint">
@@ -3855,7 +3961,20 @@ export default function DTRSystem({ onBack }) {
                 send it as-is. <strong>Print from browser</strong> is an alternative that may be blocked, since this page runs inside a
                 restricted frame; the PDF download always works. Any cell below can be corrected before you export.
               </p>
-              {bioActive && (
+              {bioActive && bioHidden && (
+                <div className="biobar" role="status">
+                  <div className="biotext">
+                    <strong>Bio logs hidden</strong>
+                    {" — "}{bioActive.fileName || "bio log"}, {bioActive.source === "draft" ? "not saved" : `saved ${bioWhen(bioActive.at)}`}.
+                    {" "}The preview shows only your DTR entries. Nothing was cleared or changed.
+                  </div>
+                  <div className="biobtns">
+                    {canEdit && bioActive.source === "draft" && <button className="btn sm" disabled={bioBusy} onClick={onBioSave}>Save</button>}
+                    <button className="btn sm" onClick={() => showBio(true)}>Preview with bio</button>
+                  </div>
+                </div>
+              )}
+              {bioActive && !bioHidden && (
                 <div className="biobar" role="status">
                   <div className="biotext">
                     <strong>Bio logs · {bioActive.source === "draft" ? "not saved" : `saved ${bioWhen(bioActive.at)}`}</strong>
@@ -3974,7 +4093,7 @@ export default function DTRSystem({ onBack }) {
                               <td /><td />
                             </>
                           ) : SLOTS.map((s) => (
-                            <td key={s.k} className={r.src && r.src[s.k] === "bio" ? "hasbio" : undefined}>
+                            <td key={s.k} className={!bioHidden && r.src && r.src[s.k] === "bio" ? "hasbio" : undefined}>
                               <input
                                 key={ds + s.k + (r[s.k] || "")}
                                 defaultValue={r[s.k] ? disp(r[s.k], true) : ""}
@@ -4003,7 +4122,7 @@ export default function DTRSystem({ onBack }) {
                                 }}
                               />
                               {/* screen only: where a bio time came from, and what it replaced */}
-                              {r.src && r.src[s.k] === "bio" && (
+                              {!bioHidden && r.src && r.src[s.k] === "bio" && (
                                 <span className="biowas noprint"
                                   title={r.bioWas && r.bioWas[s.k] ? `Taken from the bio log; it was ${disp(r.bioWas[s.k], true)} before` : "Taken from the bio log"}>
                                   {r.bioWas && r.bioWas[s.k] ? `was ${disp(r.bioWas[s.k], true)}` : "from bio"}
@@ -4025,7 +4144,7 @@ export default function DTRSystem({ onBack }) {
                             >{r.note || ""}</div>
                           </td>
                         </tr>
-                        {bioRows[ds] && renderBioRow(ds, bioRows[ds])}
+                        {!bioHidden && bioRows[ds] && renderBioRow(ds, bioRows[ds])}
                         </Fragment>
                       );
                     })}

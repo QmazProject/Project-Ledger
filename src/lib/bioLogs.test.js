@@ -125,25 +125,59 @@ test("overtime: OT out is taken, OT in is never invented", () => {
   assert.deepEqual(late.slots, { amIn: "08:07", pmOut: "17:15", otIn: "18:00", otOut: "21:10" }, "an In after PM out is OT in");
 });
 
-test("an Out after PM out is used as OT out, and says so", () => {
+test("a check out is never OT out: a second Out replaces the PM out, and the first is noted", () => {
   const d = placed(dat(
     line("1234", "2026-09-15", "8:07", 0), line("1234", "2026-09-15", "17:15", 1), line("1234", "2026-09-15", "18:10", 1),
   ))["2026-09-15"];
-  assert.deepEqual(d.slots, { amIn: "08:07", pmOut: "17:15", otOut: "18:10" });
-  assert.deepEqual(d.notes, ["tapped Out at 6:10 PM, used as OT out", "No OT in on the bio log. Type your OT in yourself."]);
+  assert.deepEqual(d.slots, { amIn: "08:07", pmOut: "18:10" });
+  assert.deepEqual(d.notes, ["earlier Out 5:15 PM; the last Out is the PM out"]);
 });
 
-test("an Out or OT out after midnight closes the previous day as OT out", () => {
+test("someone who only taps In and Out gets AM out at lunch and PM out at night, whatever the schedule", () => {
+  // the pattern from a real cut-off: lunch a little after noon, one check out at night
+  const taps = dat(
+    line("1234", "2026-09-28", "7:53", 0), line("1234", "2026-09-28", "12:06", 1),
+    line("1234", "2026-09-28", "12:18", 0), line("1234", "2026-09-28", "22:04", 1), line("1234", "2026-09-28", "22:04", 1),
+  );
+  const now = { start: "2026-09-28", end: "2026-10-12" };
+  const want = { amIn: "07:53", amOut: "12:06", pmIn: "12:18", pmOut: "22:04" };
+  assert.deepEqual(placed(taps, "1234", now)["2026-09-28"].slots, want);
+  const noonPm = { ...SCHED, pmStart: "12:00" };
+  const d = placeTaps(tapsForEmployee(read(taps).taps, "1234"), noonPm, now).days["2026-09-28"];
+  assert.deepEqual(d.slots, want, "a PM start at noon doesn't turn lunch into PM out");
+  // a double-tapped lunch Out is still lunch
+  const twice = placeTaps(tapsForEmployee(read(dat(
+    line("1234", "2026-09-28", "7:53", 0), line("1234", "2026-09-28", "12:06", 1), line("1234", "2026-09-28", "12:07", 1),
+    line("1234", "2026-09-28", "12:18", 0), line("1234", "2026-09-28", "17:03", 1),
+  )).taps, "1234"), noonPm, now).days["2026-09-28"];
+  assert.deepEqual(twice.slots, { amIn: "07:53", amOut: "12:07", pmIn: "12:18", pmOut: "17:03" });
+  // leaving early and coming back only after hours is not lunch: that In starts overtime
+  const back = placed(dat(
+    line("1234", "2026-09-28", "7:53", 0), line("1234", "2026-09-28", "16:30", 1),
+    line("1234", "2026-09-28", "18:00", 0), line("1234", "2026-09-28", "21:00", 1),
+  ), "1234", now)["2026-09-28"];
+  assert.deepEqual(back.slots, { amIn: "07:53", pmOut: "16:30", otIn: "18:00", otOut: "21:00" });
+});
+
+test("after midnight: an OT out closes the previous day as OT out, an Out as a PM out that can't be taken", () => {
   const days = placed(dat(
     line("1234", "2026-09-15", "7:33", 0),
     line("1234", "2026-09-16", "2:08", 5),
-    line("1234", "2026-09-16", "7:41", 0),
-    line("1234", "2026-09-17", "0:45", 1),
+    line("1234", "2026-09-16", "7:41", 0), line("1234", "2026-09-16", "12:04", 1), line("1234", "2026-09-16", "12:20", 0),
+    line("1234", "2026-09-17", "0:03", 1), line("1234", "2026-09-17", "0:03", 1),
   ));
   assert.equal(days["2026-09-15"].slots.otOut, "02:08");
   assert.ok(days["2026-09-15"].notes.includes("OT out tapped after midnight (Sep 16, 2:08 AM)"));
-  assert.deepEqual(days["2026-09-16"].slots, { amIn: "07:41", otOut: "00:45" });
+  assert.deepEqual(days["2026-09-15"].pastMidnight, [], "OT out may run past midnight");
+  const d = days["2026-09-16"];
+  assert.deepEqual(d.slots, { amIn: "07:41", amOut: "12:04", pmIn: "12:20", pmOut: "00:03" });
+  assert.deepEqual(d.pastMidnight, ["pmOut"]);
+  assert.deepEqual(d.notes, ["Out tapped after midnight (Sep 17, 12:03 AM). Only OT out can go past midnight in the DTR — type your OT in and OT out yourself."]);
   assert.equal(days["2026-09-17"], undefined);
+  // shown against the DTR, but never offered: the DTR can't keep a PM out past midnight
+  const status = compareSlots({ amIn: "07:41", amOut: "12:04", pmIn: "12:30", pmOut: "17:00", otIn: "18:00", otOut: "00:03" }, d.slots);
+  assert.equal(status.pmOut, "diff");
+  assert.deepEqual(replaceableSlots(status, d), ["pmIn"]);
   // an Out early in the morning after that morning's In stays on its own day
   assert.deepEqual(placed(dat(line("1234", "2026-09-15", "7:30", 0), line("1234", "2026-09-15", "7:58", 1)))["2026-09-15"].slots,
     { amIn: "07:30", amOut: "07:58" });
