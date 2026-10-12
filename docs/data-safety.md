@@ -135,6 +135,33 @@ revision the change was built on. Nothing sends a device's whole copy blind any 
 - **No writes on load.** Loading a year re-stamps totals on screen only; a save that
   changes nothing is not sent.
 
+### Bio logs — a suggestion until the employee takes it (2026-10-12)
+
+My DTR's **Upload Bio Logs** reads a biometric (ZKTeco) export in the browser and sets
+it beside the DTR. It adds one path that writes DTR records, and one new table.
+
+- **Reading never writes.** The file is parsed in the browser (`src/lib/bioLogs.js`);
+  only the signed-in employee's taps are kept and the file itself is never stored. The
+  comparison is screen-only (`.noprint`): neither the printed sheet nor the PDF carries it.
+- **Taking bio times is the only DTR write**, and only for the signed-in employee's own
+  days (`viewOnly` — an admin reading someone's DTR — can compare but never write). Each
+  day is checked against its freshly read record first (`bioApplyIssue`: times in order,
+  PM out needs an accomplishment, not a leave or holiday day), then goes through
+  `writeRec` with source `"bio"` — read first, revision-checked, replayed on conflict.
+  The value a bio time replaced is kept on the day as `bioWas`; the box is marked `bio`
+  (`stampSources`, `src/lib/dtrTime.js`), which the logbook prints underlined.
+- **Every bio replacement traces to a saved upload.** When the cloud is configured, an
+  unsaved upload is saved before any time is taken from it; if that save fails, no time
+  is changed.
+- **`public.dtr_bio_logs` is append-only** (`supabase/migrations/20261012000000_dtr_bio_logs.sql`).
+  One row is one employee's taps for one payroll period. Saving inserts; "Clear" marks
+  the newest row cleared (server-stamped) and is the only update a row allows; there is
+  no delete. The table never touches `dtr_storage_dtr`. Store: `src/lib/bioLogStore.js`.
+  Verification: `supabase/verification/20261012_dtr_bio_logs_verification.sql`.
+- Like the other DTR tables, it is readable with the app's public key (the DTR checks
+  passcodes in the browser), which is why a row holds one person's taps for one period
+  and never the device file.
+
 ## 4. Recovery runbook
 
 If DTR or logbook data looks wrong or missing:
@@ -210,4 +237,7 @@ Specific traps this codebase has already fallen into:
 - `src/lib/dtrStore.js`, `src/lib/dtrStore.test.js`
 - `supabase/migrations/20260908000000_dtr_storage_safety.sql`
 - `supabase/verification/20260908_dtr_storage_safety_verification.sql`
-- `DTR System/dtr-system.jsx` — `ensureLog`, `writeRec`, `loadedYears`
+- `DTR System/dtr-system.jsx` — `ensureLog`, `writeRec`, `loadedYears`, `bioUseDays`
+- `src/lib/bioLogs.js`, `src/lib/bioLogStore.js` (and their tests)
+- `supabase/migrations/20261012000000_dtr_bio_logs.sql`
+- `supabase/verification/20261012_dtr_bio_logs_verification.sql`

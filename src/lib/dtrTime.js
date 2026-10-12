@@ -116,6 +116,32 @@ export async function landingPunchDate(todayIso, nowHm, amStart, loadYear) {
 export const nextPunchSlot = (rec, closingOvernightOt) =>
   (closingOvernightOt ? SLOTS.find((s) => s.k === "otOut") : SLOTS.find((s) => !rec[s.k]));
 
+/* Every PM out needs that day's accomplishment, whichever screen records it: the one
+   saved on the date, or `typedNote`, still being typed for it on the punch screen.
+   Clearing a PM out needs nothing. */
+export const pmOutNeedsAccomplishment = (key, t, rec, typedNote) =>
+  key === "pmOut" && !!t
+  && !String((rec && rec.note) || "").trim() && !String(typedNote || "").trim();
+
+/* How each time got there, after a save changed `day` from `before` (its six times,
+   in SLOTS order): stamped by the clock ("punch"), typed in ("manual"), changed
+   afterwards ("edited"), or taken from the bio log ("bio") — bio stays bio even when it
+   replaces a time, since the old value is kept beside it as `bioWas`. A box changed
+   any other way drops its `bioWas`; a cleared box drops its mark. */
+export function stampSources(day, before, source) {
+  SLOTS.forEach((sl, i) => {
+    const now = day[sl.k] || "";
+    if (now === (before[i] || "")) return;
+    if (source !== "bio" && day.bioWas && sl.k in day.bioWas) {
+      delete day.bioWas[sl.k];
+      if (!Object.keys(day.bioWas).length) delete day.bioWas;
+    }
+    if (!now) { if (day.src) delete day.src[sl.k]; return; }
+    day.src = day.src || {};
+    day.src[sl.k] = source === "bio" ? "bio" : (before[i] ? "edited" : source);
+  });
+}
+
 /* ---- payroll periods ---- */
 
 /* payroll periods run 28 -> 12 and 13 -> 27 */

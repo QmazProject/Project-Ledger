@@ -35,6 +35,26 @@ export const pagesOf = (members, perPage) => (members.length
   ? Array.from({ length: Math.ceil(members.length / perPage) }, (_, i) => members.slice(i * perPage, (i + 1) * perPage))
   : [[]]);
 
+/* A typed page range for a printout. Both ends are editable, so a batch can read 1 to 5
+   or start part way down the pad at 2 to 5. From falls back to 1 and To never sits below
+   From, so a half-typed or empty field still describes a printable range rather than
+   nothing. `max` is what stops a mistyped 999 from opening a popup holding 999 landscape
+   sheets; `asked` is the To that was typed, before that cap. */
+export function pageRangeOf(rawFrom, rawTo, max) {
+  const asPage = (raw, fallback) => {
+    const n = Math.floor(Number(raw));
+    return Number.isFinite(n) && n >= 1 ? Math.min(n, 999) : fallback;
+  };
+  const from = asPage(rawFrom, 1);
+  const to = Math.max(from, asPage(rawTo, from));
+  return { from, to: Math.min(to, from + max - 1), asked: to };
+}
+
+/* The sheets a department prints for pages `from`..`to`: its own page where it has one,
+   and an empty page — the blank sheet — for every number past its last. */
+export const pagesInRange = (pages, from, to) =>
+  Array.from({ length: to - from + 1 }, (_, i) => ({ no: from + i, staff: pages[from + i - 1] || [] }));
+
 /* The site an employee is saved under when they type one: a site colleagues already
    use is taken in the spelling that department is listed under, so one department is
    not listed twice. */

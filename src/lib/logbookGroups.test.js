@@ -2,7 +2,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { NO_SITE_KEY, siteKey, groupStaffBySite, pagesOf } from "./logbookGroups.js";
+import { NO_SITE_KEY, siteKey, groupStaffBySite, pagesOf, pageRangeOf, pagesInRange } from "./logbookGroups.js";
 
 const emp = (id, site) => ({ id, site });
 
@@ -40,4 +40,26 @@ test("each department pages on its own, six to a sheet", () => {
   assert.deepEqual(pagesOf(seven, 6).map((p) => p.length), [6, 1]);
   assert.deepEqual(pagesOf([], 6), [[]], "an empty department still prints one blank sheet");
   assert.deepEqual(groupStaffBySite([]), []);
+});
+
+test("a typed page range always describes something printable, capped per batch", () => {
+  assert.deepEqual(pageRangeOf("1", "5", 30), { from: 1, to: 5, asked: 5 });
+  assert.deepEqual(pageRangeOf("2", "5", 30), { from: 2, to: 5, asked: 5 }, "can start part way down the pad");
+  assert.deepEqual(pageRangeOf("", "", 30), { from: 1, to: 1, asked: 1 }, "empty fields fall back to page 1");
+  assert.deepEqual(pageRangeOf("4", "2", 30), { from: 4, to: 4, asked: 4 }, "To never sits below From");
+  assert.deepEqual(pageRangeOf("0", "-3", 30), { from: 1, to: 1, asked: 1 });
+  assert.deepEqual(pageRangeOf("2.9", "abc", 30), { from: 2, to: 2, asked: 2 });
+  assert.deepEqual(pageRangeOf("1", "999", 30), { from: 1, to: 30, asked: 999 }, "a mistyped 999 is capped");
+});
+
+test("a page range prints the department's own pages, then blank sheets past its last", () => {
+  const seven = Array.from({ length: 7 }, (_, i) => emp(String(i), "A"));
+  const pages = pagesOf(seven, 6);
+  const out = pagesInRange(pages, 1, 5);
+  assert.deepEqual(out.map((p) => p.no), [1, 2, 3, 4, 5]);
+  assert.deepEqual(out.map((p) => p.staff.length), [6, 1, 0, 0, 0]);
+  assert.equal(out[1].staff[0].id, "6", "page 2 carries on with the seventh employee");
+  assert.deepEqual(pagesInRange(pages, 2, 3).map((p) => [p.no, p.staff.length]), [[2, 1], [3, 0]]);
+  assert.deepEqual(pagesInRange(pagesOf([], 6), 1, 2).map((p) => p.staff.length), [0, 0],
+    "a department with nobody prints blank sheets only");
 });

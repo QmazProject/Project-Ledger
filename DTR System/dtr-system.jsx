@@ -6,8 +6,15 @@ import "@ncdai/react-wheel-picker/style.css";
 import {
   SLOTS, toMin, disp, parseTime, orderIssue, recordOrderIssue, otMinutes,
   openOvernightOtDate, nextPunchSlot, landingPunchDate, periodOf, periodStartsWithEntries,
+  pmOutNeedsAccomplishment, stampSources,
 } from "../src/lib/dtrTime";
-import { NO_SITE_KEY, siteKey, groupStaffBySite, pagesOf, canonicalSite } from "../src/lib/logbookGroups";
+import {
+  BIO_MAX_BYTES, rowsFromText, rowsFromWorkbook, readBioRows, tapsForEmployee, bioIdClashes, placeTaps,
+  tapsToKeep, compareSlots, replaceableSlots, bioCoverage, coverageOfRange, coverageMessage, applyBioTimes,
+  bioApplyIssue, bioDownloadText, deviceSerialOf,
+} from "../src/lib/bioLogs";
+import { createBioLogStore, bioRowFor, activeBioUpload, BIO_NOT_SET_UP } from "../src/lib/bioLogStore";
+import { NO_SITE_KEY, siteKey, groupStaffBySite, pagesOf, canonicalSite, pageRangeOf, pagesInRange } from "../src/lib/logbookGroups";
 import { normalizeRoster, saveRosterChanges, rebaseRoster, profileChanges } from "../src/lib/rosterSync";
 import { mergeQueuedYear, dayContent, describeYearConflicts } from "../src/lib/dtrYearSync";
 import { queuedBase } from "../src/lib/mergeSave";
@@ -1022,6 +1029,21 @@ async function removeDtrAttachment(item) {
   if (item.storage_path) await supabase.storage.from(DTR_ATTACHMENTS_BUCKET).remove([item.storage_path]);
 }
 
+/* ---- bio logs ----
+   The Excel reader is fetched only when someone picks an Excel export, so it never
+   slows the DTR's first load; saved uploads exist only where the cloud does. */
+let xlsxLoading = null;
+const loadXlsx = () => {
+  if (!xlsxLoading) xlsxLoading = import("xlsx").catch((e) => { xlsxLoading = null; throw e; });
+  return xlsxLoading;
+};
+const bioLogStore = () => (cloudReady() ? createBioLogStore(supabase) : null);
+const bioDay = (ds) => { const [, m, d] = ds.split("-").map(Number); return `${MON[m - 1].slice(0, 3)} ${d}`; };
+const bioWhen = (ts) => {
+  const t = new Date(ts);
+  return Number.isNaN(t.getTime()) ? "" : t.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+};
+
 function mergeDtrProfiles(roster, profiles) {
   if (!Array.isArray(profiles)) return roster;
   const byId = new Map(profiles.filter((p) => p && p.employee_id).map((p) => [String(p.employee_id), p]));
@@ -1386,7 +1408,7 @@ const CSS = `
 .qm .bootScreen{min-height:240px;display:grid;place-items:center;border:1.5px solid var(--zinc-dk);background:#fff;color:var(--ink-soft);font-family:var(--disp);font-size:17px;letter-spacing:.08em;text-transform:uppercase}
 /* waiting to sync is not an error: the punch is safe, it just has not travelled yet */
 .qm .banner.warn{background:var(--hivis);color:var(--ink)}
-.qm .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:26px;z-index:60;background:var(--ink);color:#fff;padding:13px 22px;border-left:5px solid var(--hivis);font-family:var(--disp);font-size:19px;letter-spacing:.06em;text-transform:uppercase;box-shadow:0 8px 26px rgba(18,35,58,.3);max-width:88vw}
+.qm .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:26px;z-index:80;pointer-events:none;background:var(--ink);color:#fff;padding:13px 22px;border-left:5px solid var(--hivis);font-family:var(--disp);font-size:19px;letter-spacing:.06em;text-transform:uppercase;box-shadow:0 8px 26px rgba(18,35,58,.3);max-width:88vw}
 .qm .modal{position:fixed;inset:0;background:rgba(18,35,58,.55);display:grid;place-items:center;z-index:70;padding:20px}
 .qm .modal .box{background:#fff;border:1.5px solid var(--ink);padding:24px;width:min(380px,100%)}
 .qm .modal h3{font-family:var(--disp);font-size:22px;font-weight:700;text-transform:uppercase;margin:0 0 4px}
@@ -1396,6 +1418,43 @@ const CSS = `
 .qm .modal .row button{flex:1;padding:11px;font-family:var(--disp);font-size:16px;letter-spacing:.08em;text-transform:uppercase;border:1.5px solid var(--ink);background:#fff;color:var(--ink)}
 .qm .modal .row button.pri{background:var(--ink);color:#fff}
 .qm .modal .row button.del{border-color:var(--rust);color:var(--rust)}
+/* ---- bio logs: on screen only, never on the printed sheet or the PDF ---- */
+.qm .modal input.biofile{font:13px var(--body);font-weight:400;border:1.5px dashed var(--zinc-dk);padding:12px;width:100%;box-sizing:border-box}
+.qm .bioerr{color:var(--rust);font-weight:600;margin:10px 0 0}
+.qm .biobar{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:space-between;margin-top:14px;padding:12px 14px;border:1.5px solid var(--ink);border-left:5px solid var(--hivis);background:#FFFBF0;font-size:13px;line-height:1.5;color:var(--ink)}
+.qm .biobar .biotext{flex:1 1 360px}
+.qm .biobar .bionote{display:block;color:var(--ink-soft);margin-top:4px}
+.qm .biobar .biobtns{display:flex;gap:8px;flex-wrap:wrap}
+.qm .biolegend{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.qm .biolegend i{font-style:normal;font-size:11px;padding:1px 7px;border:1px solid var(--zinc-dk)}
+.qm .biolink{background:none;border:none;padding:0;color:var(--ink);text-decoration:underline;font:inherit;cursor:pointer}
+.qm .bio-match{background:#E3F4E8;color:#1E6B3A}
+.qm .bio-diff{background:#FBE3E1;color:#9B2C22}
+.qm .bio-bioOnly{background:#FFF1BF;color:#6E5200}
+.qm .bio-dtrOnly{background:#ECEEF1;color:#5B6573}
+.qm .sheet .dtr tr.biorow td{font-size:6.6pt;line-height:1.3;padding:1px 2px;vertical-align:top;background:#F7F9FC;color:var(--ink-soft);border-top-style:dashed}
+.qm .sheet .dtr tr.biorow td.biolbl{font-weight:700;letter-spacing:.1em;color:var(--ink);vertical-align:middle}
+.qm .sheet .dtr tr.biorow td.bio-match{background:#E3F4E8;color:#1E6B3A}
+.qm .sheet .dtr tr.biorow td.bio-diff{background:#FBE3E1;color:#9B2C22;font-weight:700}
+.qm .sheet .dtr tr.biorow td.bio-bioOnly{background:#FFF1BF;color:#6E5200;font-weight:700}
+.qm .sheet .dtr tr.biorow td.bio-dtrOnly{background:#ECEEF1;color:#5B6573}
+.qm .sheet .dtr tr.biorow input.biotick{width:auto;height:auto;min-height:0;margin:0 0 0 3px;vertical-align:-1px;accent-color:var(--ink)}
+.qm .sheet .dtr tr.biorow td.bionotes{text-align:left;padding:2px 1.6mm}
+.qm .sheet .dtr tr.biorow td.bionotes span{display:block}
+.qm .sheet .dtr tr.biorow .bioacts{display:flex;gap:3px;flex-wrap:wrap;margin-top:2px}
+.qm .sheet .dtr tr.biorow button{font:600 6.6pt var(--body);padding:1px 5px;border:1px solid var(--ink);background:#fff;color:var(--ink);cursor:pointer}
+.qm .sheet .dtr tr.biorow button:disabled{opacity:.4;cursor:default}
+.qm .sheet .dtr td.hasbio{position:relative}
+.qm .sheet .dtr .biowas{position:absolute;left:1px;right:1px;bottom:0;font-size:4.8pt;line-height:1.1;color:#1E6B3A;text-align:center;pointer-events:none;white-space:nowrap;overflow:hidden}
+.qm .modal .box.biohist{width:min(680px,100%);max-height:88vh;overflow:auto}
+.qm .biolist{list-style:none;margin:0;padding:0}
+.qm .biolist li{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center;padding:9px 0;border-top:1px solid var(--zinc-dk);font-size:13px}
+.qm .biolist .biolistbtns{display:flex;gap:6px}
+.qm .biolist .biolistbtns button{padding:6px 10px;font:600 12px var(--body);border:1.5px solid var(--ink);background:#fff;color:var(--ink);cursor:pointer}
+.qm .bioprevwrap{overflow-x:auto}
+.qm .bioprev{border-collapse:collapse;width:100%;font-size:12px}
+.qm .bioprev th,.qm .bioprev td{border:1px solid var(--zinc-dk);padding:4px 6px;text-align:center;white-space:nowrap}
+.qm .bioprev th{background:#F2F4F6;font-weight:600}
 .qm .attachmentBox{width:min(680px,100%);max-height:min(90vh,760px);overflow:auto}
 .qm .attachmentModalHead{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}
 .qm .attachmentModalHead h3{margin-bottom:5px}
@@ -1624,6 +1683,11 @@ const SHEET_CSS = `
 .sheet .lg td.edited input{font-style:italic}
 .sheet .lg td.edited::after{content:"";position:absolute;right:0.6mm;top:0.6mm;width:1mm;height:1mm;border-radius:50%;background:#12233A}
 .sheet .lg td.edited{position:relative}
+/* On paper every time is plain text: a box becomes a span when the sheet is printed,
+   and somebody else's time is a span already — so the marks name the span too. */
+.sheet .lg td.manual > span,.sheet .lg td.edited > span{font-style:italic}
+/* taken from the bio log: underlined, on screen and on paper */
+.sheet .lg td.bio input,.sheet .lg td.bio > span{text-decoration:underline}
 
 /* pinned to the bottom of the sheet box; the sheet's bottom padding, on screen and in
    the printed rules alike, reserves a strip below the signatures so a sheet that runs
@@ -2037,6 +2101,12 @@ export default function DTRSystem({ onBack }) {
   const [logbookPrintAsk, setLogbookPrintAsk] = useState(false);
   const [logbookPrintCols, setLogbookPrintCols] = useState({ days: true, ot: true, sig: true });
   const [logbookOmit, setLogbookOmit] = useState({ days: false, ot: false, sig: false });
+  /* It also asks which pages: "filled" (each department's pages that have staff) or
+     "range" (pages From..To, topped up with blank sheets past the last employee). */
+  const [logbookPrintMode, setLogbookPrintMode] = useState("filled");
+  const [logbookFrom, setLogbookFrom] = useState("1");
+  const [logbookTo, setLogbookTo] = useState("5");
+  const [logbookPrintingRange, setLogbookPrintingRange] = useState(false);
   /* Padding rows the user has chosen to clear, keyed by employee and cut-off so
      switching either shows the right set without an effect to reset it. Held in
      component state only: this is a presentation choice for one printout, not a
@@ -2073,6 +2143,19 @@ export default function DTRSystem({ onBack }) {
   const [attachments, setAttachments] = useState([]);
   const [attachmentOpenDate, setAttachmentOpenDate] = useState("");
   const [attachmentPaperSize, setAttachmentPaperSize] = useState("LEGAL");
+  /* ---- bio logs ----
+     An upload read here and not yet saved, per employee and period (`id|periodStart`);
+     the saved uploads of the period on screen, newest first; the days the employee
+     chose to keep as they are; the boxes ticked for "use ticked". */
+  const [bioOpen, setBioOpen] = useState(false);
+  const [bioMsg, setBioMsg] = useState("");
+  const [bioBusy, setBioBusy] = useState(false);
+  const [bioDrafts, setBioDrafts] = useState({});
+  const [bioSaved, setBioSaved] = useState({ key: "", items: [], state: "idle", error: "" });
+  const [bioKept, setBioKept] = useState({});
+  const [bioTicks, setBioTicks] = useState({});
+  const [bioHistoryOpen, setBioHistoryOpen] = useState(false);
+  const [bioPreview, setBioPreview] = useState(null);
   /* "synced" | "local" (kept on this device, waiting for the cloud) | "fail" (nowhere) */
   const [saveState, setSaveState] = useState("synced");
   const [clock, setClock] = useState(new Date());
@@ -2385,13 +2468,7 @@ export default function DTRSystem({ onBack }) {
        asking all eight callers to remember to say so. */
     const before = SLOTS.map((sl) => day[sl.k] || "");
     mut(day);
-    SLOTS.forEach((sl, i) => {
-      const now = day[sl.k] || "";
-      if (now === before[i]) return;
-      if (!now) { if (day.src) delete day.src[sl.k]; return; }
-      day.src = day.src || {};
-      day.src[sl.k] = before[i] ? "edited" : source;
-    });
+    stampSources(day, before, source);
     stampTotals(logsRef.current[k][dateStr], sched);
     bump();
     /* re-saving what is already there (a note synced on opening a date, a time retyped
@@ -2406,7 +2483,12 @@ export default function DTRSystem({ onBack }) {
       delete logsRef.current[k];
       await ensureLog(id, y, sched);
       logsRef.current[k][dateStr] = logsRef.current[k][dateStr] || {};
-      mut(logsRef.current[k][dateStr]);
+      /* the replayed edit is marked like the first try was, or a retried save would
+         lose how its times got there */
+      const fresh = logsRef.current[k][dateStr];
+      const freshBefore = SLOTS.map((sl) => fresh[sl.k] || "");
+      mut(fresh);
+      stampSources(fresh, freshBefore, source);
       stampTotals(logsRef.current[k][dateStr], sched);
       bump();
       state = await sSet(k, logsRef.current[k]);
@@ -2727,6 +2809,257 @@ export default function DTRSystem({ onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, view, perStart]);
 
+  /* ---- bio logs: the comparison under each date ----
+     What is compared is the upload read here and not saved yet, else the newest saved
+     upload of this period unless it was cleared. Nothing here writes a DTR record
+     until the employee takes bio times into a day (bioUseDays). */
+  const bioPeriod = { start: iso(period.s), end: iso(period.e) };
+  const bioKey = `${me ? me.id : ""}|${bioPeriod.start}`;
+  const bioDraft = bioDrafts[bioKey] || null;
+  const bioSavedHere = bioSaved.key === bioKey ? bioSaved.items : [];
+  const bioActiveSaved = activeBioUpload(bioSavedHere);
+  const bioActive = bioDraft
+    ? { source: "draft", fileName: bioDraft.fileName, taps: bioDraft.taps, range: bioDraft.range }
+    : bioActiveSaved
+    ? {
+        source: "saved", id: bioActiveSaved.id, at: bioActiveSaved.created_at, fileName: bioActiveSaved.file_name,
+        taps: Array.isArray(bioActiveSaved.taps) ? bioActiveSaved.taps : [],
+        range: bioActiveSaved.file_first ? { first: bioActiveSaved.file_first, last: bioActiveSaved.file_last } : null,
+      }
+    : null;
+  const bioPlaced = bioActive ? placeTaps(bioActive.taps, sched, bioPeriod) : { days: {}, beforePeriod: [] };
+  const bioCoverText = bioActive && bioActive.range
+    ? coverageMessage(coverageOfRange(bioActive.range, bioActive.taps.length > 0, bioPeriod), bioPeriod, me ? me.id : "")
+    : "";
+  const bioKeptHere = bioKept[bioKey] || [];
+  /* one date's comparison, or null when that date gets no bio line: outside what the
+     file covers, or nothing on either side */
+  const bioCompareDay = (ds, r) => {
+    if (!bioActive) return null;
+    const bd = bioPlaced.days[ds] || null;
+    const inFile = bioActive.range ? ds >= bioActive.range.first && ds <= bioActive.range.last : !!bd;
+    const blocked = r.leave ? "leave" : r.holiday ? "holiday" : "";
+    if (!inFile || (!bd && !blocked && !SLOTS.some((s) => r[s.k]))) return null;
+    const status = compareSlots(blocked ? {} : r, bd ? bd.slots : {});
+    return { bd, status, can: blocked ? [] : replaceableSlots(status), blocked, kept: bioKeptHere.includes(ds) };
+  };
+  const bioRows = {};
+  days.forEach((d) => { const ds = iso(d); const row = bioCompareDay(ds, recFor(me ? me.id : "", ds)); if (row) bioRows[ds] = row; });
+  const bioMismatched = Object.keys(bioRows).filter((ds) => bioRows[ds].can.length && !bioRows[ds].kept);
+  /* bio taps on a date the DTR is not showing — a Sunday this cut-off has not turned on */
+  const bioHiddenDays = Object.keys(bioPlaced.days).filter((ds) => !days.some((d) => iso(d) === ds));
+
+  useEffect(() => {
+    if (!me || view !== "dtr") return undefined;
+    const key = `${me.id}|${iso(period.s)}`;
+    const store = bioLogStore();
+    if (!store) { setBioSaved({ key, items: [], state: "off", error: "" }); return undefined; }
+    let alive = true;
+    store.list(me.id, { start: iso(period.s), end: iso(period.e) }).then((res) => { if (alive) setBioSaved({ key, ...res }); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me, view, perStart]);
+
+  /* Reads the chosen file here, in the browser, keeping only this employee's taps for
+     the period on screen. It is shown at once and kept in memory until it is saved. */
+  async function bioUpload(file) {
+    if (!file || !me) return;
+    setBioMsg("");
+    if (file.size > BIO_MAX_BYTES) { setBioMsg("That file is over 10 MB. Bio log exports are much smaller — check you picked the right file."); return; }
+    const clash = bioIdClashes(roster, me.id);
+    if (clash.length) { setBioMsg(`ID ${me.id} and ID ${clash[0].id} read as the same number on the device. Fix the IDs in Settings first.`); return; }
+    setBioBusy(true);
+    try {
+      const rows = /\.xlsx?$/i.test(file.name)
+        ? rowsFromWorkbook(await loadXlsx(), new Uint8Array(await file.arrayBuffer()))
+        : rowsFromText(await file.text());
+      const read = readBioRows(rows);
+      if (read.error === "mixed-dates") { setBioMsg("This file mixes month/day and day/month dates, so it can't be read safely."); return; }
+      const mine = tapsForEmployee(read.taps, me.id);
+      const cov = bioCoverage(read.taps, mine, bioPeriod);
+      if (cov.state !== "full" && cov.state !== "partial") { setBioMsg(coverageMessage(cov, bioPeriod, me.id)); return; }
+      const taps = tapsToKeep(mine, bioPeriod, sched);
+      setBioDrafts((d) => ({ ...d, [bioKey]: { fileName: file.name, deviceSerial: deviceSerialOf(file.name), range: cov.range, taps } }));
+      setBioKept((k) => ({ ...k, [bioKey]: [] }));
+      setBioTicks({});
+      setBioOpen(false);
+      say(`Bio logs read: ${taps.length} tap${taps.length === 1 ? "" : "s"} for ID ${me.id}`);
+    } catch (e) {
+      setBioMsg(`Could not read that file${e && e.message ? ` (${e.message})` : ""}.`);
+    } finally {
+      setBioBusy(false);
+    }
+  }
+
+  /* the unsaved upload becomes the newest saved one for this period */
+  async function bioSaveDraft() {
+    const draft = bioDrafts[bioKey];
+    if (!draft || !me || viewOnly) return null;
+    const store = bioLogStore();
+    if (!store) throw new Error("Saving bio logs needs the cloud, and this device is working offline-only.");
+    const saved = await store.save(bioRowFor({
+      employee: me, actor: me, period: bioPeriod, fileName: draft.fileName,
+      deviceSerial: draft.deviceSerial, range: draft.range, taps: draft.taps,
+    }));
+    setBioSaved((s) => ({ key: bioKey, items: [saved, ...(s.key === bioKey ? s.items : [])], state: "ok", error: "" }));
+    setBioDrafts((d) => { const next = { ...d }; delete next[bioKey]; return next; });
+    return saved;
+  }
+  async function onBioSave() {
+    setBioBusy(true);
+    try { await bioSaveDraft(); say("Bio logs saved for this cut-off"); }
+    catch (e) { say(e.message || "Could not save the bio logs"); }
+    finally { setBioBusy(false); }
+  }
+
+  /* Clear hides the comparison: an unsaved upload is dropped, a saved one is marked
+     cleared and stays in history. DTR times are not touched either way. */
+  function onBioClear() {
+    if (!bioActive || viewOnly) return;
+    const saved = bioActive.source === "saved";
+    setConfirm({
+      title: "Clear bio logs?",
+      body: saved
+        ? "The comparison for this cut-off disappears. The upload stays in History, marked cleared. Your DTR times don't change."
+        : "This upload hasn't been saved, so it's simply dropped. Your DTR times don't change.",
+      yes: "Clear",
+      onYes: async () => {
+        setConfirm(null);
+        if (!saved) { setBioDrafts((d) => { const next = { ...d }; delete next[bioKey]; return next; }); return; }
+        const store = bioLogStore();
+        if (!store) { say("Clearing saved bio logs needs the cloud"); return; }
+        setBioBusy(true);
+        try {
+          const cleared = await store.clear(bioActive.id, me);
+          setBioSaved((s) => (s.key === bioKey ? { ...s, items: s.items.map((it) => (it.id === cleared.id ? cleared : it)) } : s));
+          say("Bio logs cleared for this cut-off");
+        } catch (e) { say(e.message || "Could not clear the bio logs"); }
+        finally { setBioBusy(false); }
+      },
+    });
+  }
+
+  const bioKeep = (ds, keep) => setBioKept((k) => {
+    const held = (k[bioKey] || []).filter((x) => x !== ds);
+    return { ...k, [bioKey]: keep ? [...held, ds] : held };
+  });
+  const bioTick = (ds, slotKey, on) => setBioTicks((t) => {
+    const held = (t[ds] || []).filter((x) => x !== slotKey);
+    return { ...t, [ds]: on ? [...held, slotKey] : held };
+  });
+
+  /* Takes bio times into days: `list` is [{ ds, keys }]. An unsaved upload is saved
+     first, so every replaced time traces back to a saved file. Each day is checked
+     against its freshly read record (order, accomplishment, leave) and goes through
+     writeRec — read first, revision-checked, never an overwrite. */
+  async function bioUseDays(list) {
+    if (viewOnly || !me || !list.length || !bioActive) return;
+    setBioBusy(true);
+    const placedDays = bioPlaced.days;
+    try {
+      if (bioDrafts[bioKey] && bioLogStore()) {
+        try { await bioSaveDraft(); }
+        catch (e) { say(`No times were changed — the upload couldn't be saved first: ${e.message}`); return; }
+      }
+      let used = 0;
+      const skipped = [];
+      for (const { ds, keys } of list) {
+        await ensureLog(me.id, +ds.slice(0, 4), sched);
+        const slots = placedDays[ds] ? placedDays[ds].slots : {};
+        const issue = bioApplyIssue(recFor(me.id, ds), slots, keys, sched, ds === viewDate ? note : "");
+        if (issue) { skipped.push({ ds, issue }); continue; }
+        if (await writeRec(me.id, ds, (r) => { applyBioTimes(r, slots, keys); }, "bio")) used++;
+        else skipped.push({ ds, issue: "it could not be saved" });
+      }
+      setBioTicks((t) => { const next = { ...t }; list.forEach(({ ds }) => { delete next[ds]; }); return next; });
+      if (list.length === 1 && skipped.length) say(skipped[0].issue);
+      else if (list.length === 1) say(`Bio times used for ${bioDay(list[0].ds)}`);
+      else say(`Bio times used on ${used} day${used === 1 ? "" : "s"}${skipped.length ? `; skipped ${skipped.map((s) => bioDay(s.ds)).join(", ")}` : ""}`);
+    } finally {
+      setBioBusy(false);
+    }
+  }
+
+  /* "use for all": every mismatched day, listed with what changes before anything does */
+  function onBioUseAll() {
+    const plan = [], skipped = [];
+    bioMismatched.forEach((ds) => {
+      const r = recFor(me.id, ds), keys = bioRows[ds].can, slots = bioRows[ds].bd ? bioRows[ds].bd.slots : {};
+      const issue = bioApplyIssue(r, slots, keys, sched, ds === viewDate ? note : "");
+      if (issue) { skipped.push({ ds, issue }); return; }
+      plan.push({ ds, keys, text: keys.map((k) => `${SLOTS.find((s) => s.k === k).label} ${r[k] ? disp(r[k], true) : "(empty)"} → ${disp(slots[k], true)}`).join(", ") });
+    });
+    setConfirm({
+      title: `Use bio logs for ${plan.length} day${plan.length === 1 ? "" : "s"}?`,
+      body: (
+        <span style={{ display: "block", maxHeight: "50vh", overflow: "auto" }}>
+          {plan.map((p) => <span key={p.ds} style={{ display: "block", marginBottom: 4 }}><strong>{bioDay(p.ds)}:</strong> {p.text}</span>)}
+          {skipped.length > 0 && <span style={{ display: "block", marginTop: 8 }}><strong>Skipped:</strong></span>}
+          {skipped.map((s) => <span key={s.ds} style={{ display: "block" }}>{bioDay(s.ds)} — {s.issue}</span>)}
+          {!plan.length && <span style={{ display: "block", marginTop: 8 }}>Nothing can be replaced right now.</span>}
+        </span>
+      ),
+      yes: plan.length ? "Replace" : "OK",
+      onYes: () => { setConfirm(null); if (plan.length) bioUseDays(plan.map(({ ds, keys }) => ({ ds, keys }))); },
+    });
+  }
+
+  /* a saved upload's taps, in the device's own layout */
+  function bioDownload(item) {
+    if (!item || !me) return;
+    const blob = new Blob([bioDownloadText(Array.isArray(item.taps) ? item.taps : [])], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = String(item.created_at || "").replace(/[^0-9]/g, "").slice(0, 12);
+    a.href = url;
+    a.download = `${me.id}_bio_${item.payroll_start || bioPeriod.start}_${item.payroll_end || bioPeriod.end}${stamp ? `_${stamp}` : ""}.dat`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  /* The bio line under a date: the bio times in the six boxes, coloured against the DTR,
+     the notes that explain them, and what the employee can do. Screen only — the
+     printed sheet and the PDF never carry it. */
+  const BIO_STATUS_TEXT = { match: "matches your entry", diff: "different from your entry", bioOnly: "only on the bio log", dtrOnly: "only on your DTR" };
+  const renderBioRow = (ds, row) => {
+    const { bd, status, can, blocked, kept } = row;
+    const ticks = (bioTicks[ds] || []).filter((k) => can.includes(k));
+    const notes = [...(blocked ? [`Marked ${blocked}. Cancel ${blocked} to use bio logs.`] : []), ...(bd ? bd.notes : ["No bio taps on this day."])];
+    const acting = canEdit && !blocked && can.length > 0;
+    return (
+      <tr className="biorow noprint">
+        <td className="biolbl">BIO</td>
+        {SLOTS.map((s) => (
+          <td key={s.k} className={"bio-" + (status[s.k] || "none")} title={status[s.k] ? `${s.label}: ${BIO_STATUS_TEXT[status[s.k]]}` : undefined}>
+            {bd && bd.slots[s.k] ? disp(bd.slots[s.k], true) : status[s.k] === "dtrOnly" ? "—" : ""}
+            {acting && !kept && can.includes(s.k) && (
+              <input type="checkbox" className="biotick" checked={ticks.includes(s.k)}
+                aria-label={`Use the bio ${s.label} for ${bioDay(ds)}`}
+                onChange={(e) => bioTick(ds, s.k, e.target.checked)} />
+            )}
+          </td>
+        ))}
+        <td colSpan={2} />
+        <td className="bionotes">
+          {notes.map((n, i) => <span key={i}>{n}</span>)}
+          {acting && (kept ? (
+            <span>Kept as is · <button type="button" onClick={() => bioKeep(ds, false)}>Undo</button></span>
+          ) : (
+            <span className="bioacts">
+              <button type="button" disabled={bioBusy} onClick={() => bioUseDays([{ ds, keys: can }])}>Use day</button>
+              <button type="button" disabled={bioBusy || !ticks.length} onClick={() => bioUseDays([{ ds, keys: ticks }])}>
+                Use ticked{ticks.length ? ` (${ticks.length})` : ""}
+              </button>
+              <button type="button" onClick={() => bioKeep(ds, true)}>Keep</button>
+            </span>
+          ))}
+        </td>
+      </tr>
+    );
+  };
+
   /* The DTR always rules 21 body rows, so a short cut-off is padded out with blank
      ones. Clearing a padding row blanks its rules but keeps its height — anything
      that actually removed the row would pull the signature block up. */
@@ -2790,24 +3123,21 @@ export default function DTRSystem({ onBack }) {
     .filter((g) => logbookChoice === LOGBOOK_ALL || g.key === logbookChoice)
     .map((g) => ({ ...g, pages: pagesOf(g.staff, LOGBOOK_PER_PAGE) }));
   const logbookDeptLabel = logbookChoice === LOGBOOK_ALL ? "" : (logbookSections[0] ? logbookSections[0].label : "");
-  /* ---- the blank sheet's page range ----
-     Both ends are editable, so the batch can read 1 to 5 or start part way down
-     the pad at 2 to 5. From falls back to 1 and To never sits below From, so a
-     half-typed or empty field still describes a printable range rather than
-     nothing. The cap is what stops a mistyped 999 from opening a popup holding
-     999 landscape sheets. */
+  /* ---- the blank sheet's page range (see pageRangeOf) ---- */
   const BLANK_MAX_SHEETS = 30;
-  const blankRange = (() => {
-    const asPage = (raw, fallback) => {
-      const n = Math.floor(Number(raw));
-      return Number.isFinite(n) && n >= 1 ? Math.min(n, 999) : fallback;
-    };
-    const from = asPage(blankFrom, 1);
-    const to = Math.max(from, asPage(blankTo, from));
-    return { from, to: Math.min(to, from + BLANK_MAX_SHEETS - 1), asked: to };
-  })();
+  const blankRange = pageRangeOf(blankFrom, blankTo, BLANK_MAX_SHEETS);
   const blankPageNos = Array.from(
     { length: blankRange.to - blankRange.from + 1 }, (_, i) => blankRange.from + i);
+  /* ---- the filled logbook's page range ----
+     Read the same way and under the same cap, per department. A page with staff that
+     falls outside the range is named in the print dialog, since it will not print. */
+  const logbookRange = pageRangeOf(logbookFrom, logbookTo, BLANK_MAX_SHEETS);
+  const logbookFilledCount = logbookSections.reduce((n, sec) => n + sec.pages.length, 0);
+  const logbookLeftOut = logbookSections.flatMap((sec) => sec.pages
+    .map((page, i) => ({ no: i + 1, dept: sec.key === NO_SITE_KEY ? "No project site" : sec.label, staffed: page.length > 0 }))
+    .filter((p) => p.staffed && (p.no < logbookRange.from || p.no > logbookRange.to)));
+  const logbookPrintTitle = logbookPrintMode === "range"
+    ? `${LOGBOOK_TITLE} (PAGES ${logbookRange.from}-${logbookRange.to})` : LOGBOOK_TITLE;
 
   /* The logbook is a shared sheet, but every row belongs to one person. Ownership is
      checked here rather than only in the markup, so it holds even if a cell were ever
@@ -2827,6 +3157,10 @@ export default function DTRSystem({ onBack }) {
     if (t) {
       const issue = orderIssue(rec0, slotKey, t, sched.amStart);
       if (issue) { say(issue); return false; }
+    }
+    /* the logbook has no accomplishment box, so it points to the screens that do */
+    if (pmOutNeedsAccomplishment(slotKey, t, rec0, dateStr === viewDate ? note : "")) {
+      say("Write your accomplishment in Punch or My DTR first"); return false;
     }
     await writeRec(empId, dateStr, (r) => { if (t) r[slotKey] = t; else delete r[slotKey]; });
     return true;
@@ -3058,13 +3392,17 @@ export default function DTRSystem({ onBack }) {
   }
 
   const doPrintLogbook = () => setLogbookPrintAsk(true);
-  /* The chosen columns are emptied on the sheet itself for the moment it is printed
-     (the fallback print uses the live page, not a copy), then put straight back. */
+  /* The chosen columns are emptied, and a chosen page range laid out, on the sheet itself
+     for the moment it is printed (the fallback print uses the live page, not a copy),
+     then put straight back. */
   const printLogbookNow = () => {
     setLogbookPrintAsk(false);
-    flushSync(() => setLogbookOmit({ days: !logbookPrintCols.days, ot: !logbookPrintCols.ot, sig: !logbookPrintCols.sig }));
-    try { printInPopup(logbookRef.current, logbookPageStyles(), LOGBOOK_TITLE); }
-    finally { setLogbookOmit({ days: false, ot: false, sig: false }); }
+    flushSync(() => {
+      setLogbookOmit({ days: !logbookPrintCols.days, ot: !logbookPrintCols.ot, sig: !logbookPrintCols.sig });
+      setLogbookPrintingRange(logbookPrintMode === "range");
+    });
+    try { printInPopup(logbookRef.current, logbookPageStyles(), logbookPrintTitle); }
+    finally { setLogbookOmit({ days: false, ot: false, sig: false }); setLogbookPrintingRange(false); }
   };
   /* The same week on sheets nobody is on yet — for filling in by hand. The hidden
      container already holds exactly the pages in the chosen range, because that
@@ -3509,6 +3847,7 @@ export default function DTRSystem({ onBack }) {
                   </button>
                 )}
                 {attachments.length > 0 && <button className="btn ghost" onClick={() => printDtrAttachments(attachments, `DTR attachments — ${periodLabel(period)}`, attachmentPaperSize)}>Print attachments ({attachments.length})</button>}
+                <button className="btn ghost" onClick={() => { setBioMsg(""); setBioOpen(true); }}>Upload Bio Logs</button>
               </div>
               {pdfWarning && <div role="alert" className="pastnote" style={{ marginTop: 10, marginBottom: 0 }}>{pdfWarning}</div>}
               <p className="hint">
@@ -3516,6 +3855,48 @@ export default function DTRSystem({ onBack }) {
                 send it as-is. <strong>Print from browser</strong> is an alternative that may be blocked, since this page runs inside a
                 restricted frame; the PDF download always works. Any cell below can be corrected before you export.
               </p>
+              {bioActive && (
+                <div className="biobar" role="status">
+                  <div className="biotext">
+                    <strong>Bio logs · {bioActive.source === "draft" ? "not saved" : `saved ${bioWhen(bioActive.at)}`}</strong>
+                    {" — "}{bioActive.fileName || "bio log"}. {bioCoverText}{" "}
+                    {bioMismatched.length
+                      ? `${bioMismatched.length} day${bioMismatched.length === 1 ? "" : "s"} don't match.`
+                      : "Everything shown matches or was kept as is."}
+                    {bioHiddenDays.length > 0 && (
+                      <span className="bionote">
+                        Bio logs have taps on {bioHiddenDays.map((ds) => `${new Date(ds + "T00:00").toLocaleDateString(undefined, { weekday: "long" })} ${bioDay(ds)}`).join(", ")},
+                        which {bioHiddenDays.length === 1 ? "isn't" : "aren't"} on this DTR (turn Sunday on for this cut-off in Settings).
+                      </span>
+                    )}
+                    {bioPlaced.beforePeriod.length > 0 && (
+                      <span className="bionote">
+                        {bioPlaced.beforePeriod.length} tap{bioPlaced.beforePeriod.length === 1 ? "" : "s"} early on {bioDay(bioPeriod.start)} close the day before this cut-off, so {bioPlaced.beforePeriod.length === 1 ? "it isn't" : "they aren't"} used here.
+                      </span>
+                    )}
+                    {viewOnly && <span className="bionote">Compare only — this is {me.name || `ID ${me.id}`}'s DTR, so nothing is saved and no times change.</span>}
+                    <span className="biolegend">
+                      <i className="bio-match">match</i><i className="bio-diff">different</i><i className="bio-bioOnly">only on bio</i><i className="bio-dtrOnly">only on DTR</i>
+                    </span>
+                  </div>
+                  <div className="biobtns">
+                    {canEdit && bioActive.source === "draft" && <button className="btn sm" disabled={bioBusy} onClick={onBioSave}>Save</button>}
+                    <button className="btn ghost sm" onClick={() => setBioHistoryOpen(true)}>History ({bioSavedHere.length})</button>
+                    {canEdit && <button className="btn ghost sm" disabled={bioBusy} onClick={onBioClear}>Clear</button>}
+                    {canEdit && bioMismatched.length > 0 && (
+                      <button className="btn sm" disabled={bioBusy} onClick={onBioUseAll}>
+                        Use bio logs for all {bioMismatched.length} mismatched day{bioMismatched.length === 1 ? "" : "s"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+              {!bioActive && bioSavedHere.length > 0 && (
+                <p className="hint">
+                  Bio logs for this cut-off were cleared.{" "}
+                  <button type="button" className="biolink" onClick={() => setBioHistoryOpen(true)}>History ({bioSavedHere.length})</button>
+                </p>
+              )}
             </div>
 
             <div className="sheetwrap">
@@ -3579,7 +3960,8 @@ export default function DTRSystem({ onBack }) {
                       const dm = dayMinutes(r, sched), om = otMinutes(r);
                       dTot += dm; oTot += om;
                       return (
-                        <tr key={ds}>
+                        <Fragment key={ds}>
+                        <tr>
                           <td className="dt dtrDateCell" onClick={() => setAttachmentOpenDate(ds)} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setAttachmentOpenDate(ds); } }} aria-label={`Supporting documents for ${ds}`}>
                             {MON[d.getMonth()].slice(0, 3)} {d.getDate()}
                             <button type="button" className={`dtrAttachmentTrigger${dateAttachments.length ? " has" : ""}`} onClick={() => setAttachmentOpenDate(ds)} aria-label={`Supporting documents for ${ds}`} title="Add or manage supporting documents">
@@ -3592,7 +3974,7 @@ export default function DTRSystem({ onBack }) {
                               <td /><td />
                             </>
                           ) : SLOTS.map((s) => (
-                            <td key={s.k}>
+                            <td key={s.k} className={r.src && r.src[s.k] === "bio" ? "hasbio" : undefined}>
                               <input
                                 key={ds + s.k + (r[s.k] || "")}
                                 defaultValue={r[s.k] ? disp(r[s.k], true) : ""}
@@ -3614,9 +3996,19 @@ export default function DTRSystem({ onBack }) {
                                     const issue = orderIssue(r, s.k, t, sched.amStart);
                                     if (issue) { say(issue); reset(); return; }
                                   }
+                                  if (pmOutNeedsAccomplishment(s.k, t, recFor(me.id, ds), ds === viewDate ? note : "")) {
+                                    say("Write your accomplishment first"); reset(); return;
+                                  }
                                   writeRec(me.id, ds, (rr) => { if (t) rr[s.k] = t; else delete rr[s.k]; });
                                 }}
                               />
+                              {/* screen only: where a bio time came from, and what it replaced */}
+                              {r.src && r.src[s.k] === "bio" && (
+                                <span className="biowas noprint"
+                                  title={r.bioWas && r.bioWas[s.k] ? `Taken from the bio log; it was ${disp(r.bioWas[s.k], true)} before` : "Taken from the bio log"}>
+                                  {r.bioWas && r.bioWas[s.k] ? `was ${disp(r.bioWas[s.k], true)}` : "from bio"}
+                                </span>
+                              )}
                             </td>
                           ))}
                           <td className="num">{dm ? fmtDay(dm, schedCap(sched)) : ""}</td>
@@ -3633,6 +4025,8 @@ export default function DTRSystem({ onBack }) {
                             >{r.note || ""}</div>
                           </td>
                         </tr>
+                        {bioRows[ds] && renderBioRow(ds, bioRows[ds])}
+                        </Fragment>
                       );
                     })}
                     {Array.from({ length: Math.max(0, 21 - days.length) }).map((_, i) => (
@@ -3709,11 +4103,14 @@ export default function DTRSystem({ onBack }) {
                   Every signed-in employee can enter times here; the logo and week are admin-only. Each department
                   is a project site: staff are grouped by the project site on their DTR, one logbook per site.
                   A time the clock stamped prints plain, one typed in prints italic, one changed afterwards prints italic
-                  with a dot. Entries recorded before this was added carry no mark.
+                  with a dot, and one taken from the bio log prints underlined. Entries recorded before this was added carry no mark.
                   <br />
                   <strong>Print blank sheet</strong> gives empty sheets for the week shown — same inclusive date
                   and Monday-to-Sunday dates, six numbered rows each, but no names, times or totals — to fill in by
                   hand. Set the page range to print a batch, starting wherever the pad already reaches.
+                  <br />
+                  <strong>Print logbook</strong> prints just the pages with employees, or a page range such as 1 to 5
+                  — pages past the last employee print empty, like the blank sheet.
                 </p>
 
                 {blankOpen && (
@@ -3748,7 +4145,10 @@ export default function DTRSystem({ onBack }) {
               </div>
 
               <div className="sheetwrap" ref={logbookRef}>
-                {logbookSections.map((sec) => sec.pages.map((page, pi) => renderLogbookSheet(page, pi, sec.pages.length, sec.label, sec.key)))}
+                {logbookSections.map((sec) => (logbookPrintingRange
+                  ? pagesInRange(sec.pages, logbookRange.from, logbookRange.to)
+                    .map((pg) => renderLogbookSheet(pg.staff, pg.no - 1, logbookRange.to, sec.label, sec.key))
+                  : sec.pages.map((page, pi) => renderLogbookSheet(page, pi, sec.pages.length, sec.label, sec.key))))}
               </div>
 
               {/* The blank sheet stays mounted but off the page: it exists only to be
@@ -4067,10 +4467,156 @@ export default function DTRSystem({ onBack }) {
         </div>
       )}
 
+      {bioOpen && me && (
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget && !bioBusy) setBioOpen(false); }}>
+          <div className="box">
+            <h3>Upload Bio Logs</h3>
+            <p style={{ marginBottom: 8 }}>
+              Upload the bio logs for the present cut-off: <strong>{periodLabel(periodOf(new Date()))}</strong>.
+            </p>
+            {iso(periodOf(new Date()).s) !== bioPeriod.start && (
+              <p style={{ marginBottom: 8 }}>
+                You're viewing <strong>{periodLabel(period)}</strong>. The file is checked against that cut-off.
+              </p>
+            )}
+            {viewOnly && (
+              <p style={{ marginBottom: 8 }}>
+                Compare only: this is {me.name || `ID ${me.id}`}'s DTR. Nothing is saved and no times change.
+              </p>
+            )}
+            <p style={{ marginBottom: 12 }}>
+              Only the taps for ID {me.id} are kept; everyone else in the file is ignored, and the file itself is not stored.
+            </p>
+            <label>
+              <span className="lbl">Bio log file (.dat, .txt, .csv, .xls, .xlsx)</span>
+              <input type="file" className="biofile" accept=".dat,.txt,.csv,.xls,.xlsx,text/plain,text/csv" disabled={bioBusy}
+                onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; bioUpload(f); }} />
+            </label>
+            {bioBusy && <p style={{ marginTop: 10 }}>Reading…</p>}
+            {bioMsg && <p role="alert" className="bioerr">{bioMsg}</p>}
+            <div className="row">
+              <button onClick={() => setBioOpen(false)} disabled={bioBusy}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {bioHistoryOpen && me && (
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setBioHistoryOpen(false); }}>
+          <div className="box biohist">
+            <h3>Bio log history</h3>
+            <p style={{ marginBottom: 12 }}>{periodLabel(period)} · newest first. Looking or downloading changes nothing.</p>
+            {bioSaved.state === "not-set-up" && <p className="bioerr">{BIO_NOT_SET_UP}</p>}
+            {bioSaved.state === "off" && <p>Saved bio logs need the cloud, and this device is working offline-only.</p>}
+            {bioSaved.state === "error" && <p className="bioerr">Couldn't load saved bio logs{bioSaved.error ? `: ${bioSaved.error}` : ""}.</p>}
+            {bioSavedHere.length === 0 ? (
+              <p>No saved uploads for this cut-off yet.</p>
+            ) : (
+              <ul className="biolist">
+                {bioSavedHere.map((it, i) => {
+                  const taps = Array.isArray(it.taps) ? it.taps : [];
+                  const daysCovered = Object.keys(placeTaps(taps, sched, bioPeriod).days).length;
+                  return (
+                    <li key={it.id}>
+                      <div>
+                        <strong>{bioWhen(it.created_at)}</strong> · {it.file_name || "bio log"} · {taps.length} taps · {daysCovered} day{daysCovered === 1 ? "" : "s"}
+                        {i === 0 && !it.cleared_at && !bioDraft ? " · compared now" : ""}
+                        {it.cleared_at ? ` · cleared ${bioWhen(it.cleared_at)}` : ""}
+                        {it.uploaded_by_name ? ` · by ${it.uploaded_by_name}` : ""}
+                      </div>
+                      <div className="biolistbtns">
+                        <button type="button" onClick={() => setBioPreview(it)}>Preview</button>
+                        <button type="button" onClick={() => bioDownload(it)}>Download</button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <div className="row">
+              <button onClick={() => setBioHistoryOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {bioPreview && me && (
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setBioPreview(null); }}>
+          <div className="box biohist">
+            <h3>Preview upload</h3>
+            <p style={{ marginBottom: 12 }}>{bioWhen(bioPreview.created_at)} · {bioPreview.file_name || "bio log"}. Look only — nothing here changes your DTR.</p>
+            <div className="bioprevwrap">
+              <table className="bioprev">
+                <thead><tr><th>Date</th>{SLOTS.map((s) => <th key={s.k}>{s.label}</th>)}</tr></thead>
+                <tbody>
+                  {Object.entries(placeTaps(Array.isArray(bioPreview.taps) ? bioPreview.taps : [], sched, bioPeriod).days).map(([ds, v]) => (
+                    <tr key={ds}>
+                      <td>{bioDay(ds)}</td>
+                      {SLOTS.map((s) => <td key={s.k}>{v.slots[s.k] ? disp(v.slots[s.k], true) : ""}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="row">
+              <button onClick={() => bioDownload(bioPreview)}>Download</button>
+              <button onClick={() => setBioPreview(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {logbookPrintAsk && (
         <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setLogbookPrintAsk(false); }}>
           <div className="box">
             <h3>Print logbook</h3>
+            <span className="lbl" style={{ marginTop: 12 }}>Pages</span>
+            <div className="row" style={{ marginTop: 0 }} role="radiogroup" aria-label="Pages to print">
+              {[["filled", "Filled pages only"], ["range", "Page range"]].map(([v, text]) => (
+                <button key={v} type="button" role="radio" aria-checked={logbookPrintMode === v}
+                  className={logbookPrintMode === v ? "pri" : ""}
+                  onClick={() => setLogbookPrintMode(v)}>{text}</button>
+              ))}
+            </div>
+            {logbookPrintMode === "filled" ? (
+              <p style={{ margin: "8px 0 16px" }}>
+                Only the pages with employees: {logbookFilledCount} page{logbookFilledCount === 1 ? "" : "s"}
+                {logbookChoice === LOGBOOK_ALL ? " across all departments" : ""}.
+              </p>
+            ) : (
+              <>
+                <div style={{ display: "flex", gap: 14, marginTop: 12 }}>
+                  <label style={{ flex: 1 }}>
+                    <span className="lbl">From page</span>
+                    <input type="number" min="1" max="999" inputMode="numeric" value={logbookFrom}
+                      aria-label="Logbook from page" onChange={(e) => setLogbookFrom(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); printLogbookNow(); } }} />
+                  </label>
+                  <label style={{ flex: 1 }}>
+                    <span className="lbl">To page</span>
+                    <input type="number" min="1" max="999" inputMode="numeric" value={logbookTo}
+                      aria-label="Logbook to page" onChange={(e) => setLogbookTo(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); printLogbookNow(); } }} />
+                  </label>
+                </div>
+                <p style={{ margin: "8px 0 16px" }}>
+                  Pages {logbookRange.from}&ndash;{logbookRange.to}
+                  {logbookChoice === LOGBOOK_ALL ? " for each department" : ""}, numbered{" "}
+                  <strong>{logbookRange.from} of {logbookRange.to}</strong>
+                  {logbookRange.to > logbookRange.from && <> through <strong>{logbookRange.to} of {logbookRange.to}</strong></>}.
+                  Pages with no employees print empty, like the blank sheet.
+                  {logbookRange.asked > logbookRange.to
+                    && ` Capped at ${BLANK_MAX_SHEETS} sheets a batch — print the rest in a second run.`}
+                  {logbookLeftOut.length > 0 && (
+                    <strong style={{ display: "block", marginTop: 6, color: "var(--rust)" }}>
+                      Outside this range, so not printed:{" "}
+                      {logbookLeftOut.map((p) => (logbookChoice === LOGBOOK_ALL ? `${p.dept} page ${p.no}` : `page ${p.no}`)).join(", ")}
+                      {" "}— {logbookLeftOut.length === 1 ? "it has" : "they have"} employees on {logbookLeftOut.length === 1 ? "it" : "them"}.
+                    </strong>
+                  )}
+                </p>
+              </>
+            )}
             <p style={{ marginBottom: 12 }}>
               Include these on the printout? Choose <strong>No</strong> to leave that column empty for
               filling in by hand. Nothing recorded is changed.

@@ -27,3 +27,6 @@ dist-ssr
 .ai/codeledger/*.db
 .ai/codeledger/*.db-shm
 .ai/codeledger/*.db-wal
+
+# Real bio logs from the device hold every employee's attendance: never commit them
+DTR System/bio logs sample/

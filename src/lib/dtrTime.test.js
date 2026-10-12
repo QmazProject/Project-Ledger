@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import {
   otMinutes, otOutIsNextDay, orderIssue, recordOrderIssue, parseTime,
   openOvernightOtDate, nextPunchSlot, previousIsoDate, landingPunchDate,
-  periodOf, dayHasEntries, periodStartsWithEntries,
+  periodOf, dayHasEntries, periodStartsWithEntries, pmOutNeedsAccomplishment, stampSources,
 } from "./dtrTime.js";
 import { createRecordStore, logKey } from "./dtrStore.js";
 
@@ -225,4 +225,42 @@ test("period markers come from filled-in days in any year's row", () => {
   const y2027 = { "2027-01-05": { leave: true } }; // Dec 28, 2026 - Jan 12, 2027
   const starts = periodStartsWithEntries([y2026, y2027, undefined]);
   assert.deepEqual([...starts].sort(), ["2026-09-13", "2026-12-28"]);
+});
+
+test("every PM out needs the day's accomplishment, saved or still being typed", () => {
+  const punched = { amIn: "08:00", amOut: "12:00", pmIn: "13:00" };
+  assert.equal(pmOutNeedsAccomplishment("pmOut", "17:00", punched, ""), true);
+  assert.equal(pmOutNeedsAccomplishment("pmOut", "17:00", { ...punched, note: "   \n" }, " "), true);
+  assert.equal(pmOutNeedsAccomplishment("pmOut", "17:00", undefined, undefined), true);
+  // written in My DTR (saved on the date) or on the punch screen (still being typed)
+  assert.equal(pmOutNeedsAccomplishment("pmOut", "17:00", { ...punched, note: "Poured slab" }, ""), false);
+  assert.equal(pmOutNeedsAccomplishment("pmOut", "17:00", punched, "Poured slab"), false);
+  // clearing a PM out, and every other slot, are not held back
+  assert.equal(pmOutNeedsAccomplishment("pmOut", "", punched, ""), false);
+  ["amIn", "amOut", "pmIn", "otIn", "otOut"].forEach((k) =>
+    assert.equal(pmOutNeedsAccomplishment(k, "17:00", punched, ""), false, k));
+});
+
+test("each changed time is marked with how it got there", () => {
+  const before = (d) => ["amIn", "amOut", "pmIn", "pmOut", "otIn", "otOut"].map((k) => d[k] || "");
+  // a clock punch into an empty box, then a typed correction of it
+  const day = {};
+  let b = before(day); day.amIn = "07:58"; stampSources(day, b, "punch");
+  assert.deepEqual(day.src, { amIn: "punch" });
+  b = before(day); day.amIn = "08:00"; stampSources(day, b, "manual");
+  assert.deepEqual(day.src, { amIn: "edited" });
+  // typed into an empty box
+  b = before(day); day.amOut = "12:00"; stampSources(day, b, "manual");
+  assert.equal(day.src.amOut, "manual");
+  // bio stays bio even when it replaces a time; untouched boxes keep their marks
+  b = before(day); day.amIn = "07:51"; day.bioWas = { amIn: "08:00" }; stampSources(day, b, "bio");
+  assert.deepEqual(day.src, { amIn: "bio", amOut: "manual" });
+  assert.deepEqual(day.bioWas, { amIn: "08:00" });
+  // a later hand edit of that box makes it "edited" and drops the bio trail
+  b = before(day); day.amIn = "07:55"; stampSources(day, b, "manual");
+  assert.equal(day.src.amIn, "edited");
+  assert.equal(day.bioWas, undefined);
+  // clearing a box drops its mark
+  b = before(day); delete day.amOut; stampSources(day, b, "manual");
+  assert.deepEqual(day.src, { amIn: "edited" });
 });
